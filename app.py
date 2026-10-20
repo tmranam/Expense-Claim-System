@@ -304,7 +304,8 @@ else:
     for i in range(int(total_receipts_input)):
         st.markdown(f"#### 📄 Receipt Section Item #{i+1}")
         
-        r_col1, r_col2, r_col3, r_col4 = st.columns()
+        # --- FIXED ST.COLUMNS PARAMETER ---
+        r_col1, r_col2, r_col3, r_col4 = st.columns([2, 2, 1, 1])
 
         with r_col1:
             uploaded_file = st.file_uploader(
