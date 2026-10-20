@@ -42,10 +42,17 @@ def load_admin_settings():
         try:
             with open(CONFIG_FILE, "r") as f:
                 data = json.load(f)
-                if "regional_majlis" not in data:
+                
+                # --- FIXED CRITICAL FALLBACK STRUCTURE CHECKS ---
+                # This guarantees that if you have an old file on disk, it won't trigger a KeyError
+                if "regions" not in data or not data["regions"]:
+                    data["regions"] = DEFAULT_CONFIG["regions"]
+                if "regional_majlis" not in data or not data["regional_majlis"]:
                     data["regional_majlis"] = DEFAULT_CONFIG["regional_majlis"]
                 if "admin_password" not in data:
                     data["admin_password"] = DEFAULT_CONFIG["admin_password"]
+                if "emails" not in data:
+                    data["emails"] = DEFAULT_CONFIG["emails"]
                 return data
         except Exception:
             return DEFAULT_CONFIG
