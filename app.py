@@ -56,24 +56,28 @@ if 'admin_lists' not in st.session_state:
 def parse_receipt_image(uploaded_file):
     """Scans receipt content instantly using lightweight, throttle-safe Tesseract."""
     try:
+        # Load and safely resize the uploaded file asset image
         image = Image.open(uploaded_file)
+        image.thumbnail((1200, 1200))
         
-        # 1. Preprocess to grayscale to maximize text contrast for Tesseract
+        # 1. ENHANCED CONTRAST PREPROCESSING
+        # Convert to Grayscale, then apply a binary cutoff matrix to force 
+        # text characters to crisp absolute black and backgrounds to pure white.
         gray_image = image.convert("L")
+        optimized_image = gray_image.point(lambda x: 0 if x < 140 else 255, '1')
         
-        # 2. Downscale safely to manage memory limits
-        gray_image.thumbnail((1000, 1000))
+        # 2. OPTIMIZED ENGINE CONFIGURATION
+        # Mode 11 instructs Tesseract to actively look for sparse numeric matrices and disjointed numbers
+        custom_config = r'--psm 11'
+        full_text = pytesseract.image_to_string(optimized_image, config=custom_config).lower()
         
-        # 3. Fast extraction using Page Segmentation Mode 6 (Single text block parsing)
-        custom_config = r'--psm 6'
-        full_text = pytesseract.image_to_string(gray_image, config=custom_config).lower()
-        
-        # Clean up text layout (remove spaces breaking apart dots inside numbers)
+        # Clean spacing layout bugs separating dollar structures
         cleaned_text = re.sub(r'(?<=\d)\s+(?=\d)', '', full_text)
         
-        # 4. Extract numerical sequences matching currency formats (e.g., 14.50, 120.00)
+        # 3. EXTRACTION PATTERNS FOR VALUES
         found_amounts = []
-        raw_matches = re.findall(r'\d+[\.,]\d{2}', cleaned_text)
+        # Matches patterns like 12.50, $145.00, or raw 45.10
+        raw_matches = re.findall(r'\b\d+[\.,]\d{2}\b', cleaned_text)
         
         for match in raw_matches:
             try:
@@ -82,21 +86,26 @@ def parse_receipt_image(uploaded_file):
             except ValueError:
                 continue
                 
-        # The largest value found on a receipt is safely treated as the Total
+        # The maximum value printed anywhere on a receipt layout is logically the total
         total_amount = max(found_amounts) if found_amounts else 0.0
         
-        # 5. Handle GST Extraction (Standard 10% Australian GST parsing)
+        # 4. FIXED GST CAPTURING ROUTINE
         gst_amount = 0.0
         if "gst" in cleaned_text or "tax" in cleaned_text:
-            gst_matches = re.findall(r'(?:gst|tax)\s*(?:\$?)\s*(\d+[\.,]\d{2})', cleaned_text)
-            # FIXED CRITICAL BUG: Target first string match index layout explicitly
-            if gst_matches and len(gst_matches) > 0:
-                gst_amount = float(gst_matches[0].replace(',', '.'))
+            # Capture numbers following tax indicators
+            gst_numbers = re.findall(r'(?:gst|tax)[^\d]*(\d+[\.,]\d{2})', cleaned_text)
+            if gst_numbers and len(gst_numbers) > 0:
+                try:
+                    # FIXED: Strip text strings cleanly to avoid object exceptions
+                    clean_gst_str = str(gst_numbers[0]).replace(',', '.')
+                    gst_amount = float(clean_gst_str)
+                except ValueError:
+                    gst_amount = round(total_amount / 11, 2)
             else:
-                # If 'GST' text is present but no clean float next to it, apply the math rule (Total / 11)
+                # Math rule fallback (Total divided by 11 handles standard Australian GST)
                 gst_amount = round(total_amount / 11, 2)
         
-        # 6. Formulate item categorization descriptions
+        # 5. ASSIGN CATEGORIES VIA LOGICAL KEYWORDS
         keywords = []
         possible_items = ['uber', 'cafe', 'officeworks', 'bunnings', 'parking', 'fuel', 'stationery', 'food', 'meals', 'woolworths', 'coles']
         for item in possible_items:
@@ -106,8 +115,7 @@ def parse_receipt_image(uploaded_file):
         description = ", ".join(keywords) if keywords else "General Expense Purchases"
         return description, total_amount, gst_amount
     except Exception as e:
-        return "Scan read execution issue", 0.0, 0.0
-
+        return "Scan conversion variance", 0.0, 0.0
 def generate_pdf(filename, data, receipts):
     """Compiles a clean document statement using ReportLab canvas flowables."""
     doc = SimpleDocTemplate(filename, pagesize=letter)
