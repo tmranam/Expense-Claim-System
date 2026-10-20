@@ -40,7 +40,7 @@ DEFAULT_CONFIG = {
     "smtp_server": "://gmail.com",
     "smtp_port": 587,
     "smtp_user": "claimsubmissionmaaa@gmail.com",
-    "smtp_password": ""
+    "smtp_password": "",  # <-- FIXED: Added the missing comma here
     "qaid_mal_name": "Tahir Mahmood Rana",
     "sadr_maa_name": "Abdul Jamil Mubbashar",
     "regional_nazims": {
