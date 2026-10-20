@@ -1,3 +1,6 @@
+# =========================================================================
+# BATCH 1 OF 6: CORE PACKAGES, GLOBAL INFRASTRUCTURE ANCHORS & STATES
+# =========================================================================
 import streamlit as st
 import re
 import json
@@ -79,15 +82,14 @@ def save_admin_settings(config_data):
 # Initialize settings in state
 if 'admin_lists' not in st.session_state:
     st.session_state.admin_lists = load_admin_settings()
-
-# -------------------------------------------------------------------------
-# DUAL-FORMAT OCR ENGINE FOR IMAGE & PDF TRANSLATION PROCESSING
-# -------------------------------------------------------------------------
+# =========================================================================
+# BATCH 2 OF 6: INTELLIGENT OCR ENGINE PIPELINE FOR IMAGES AND PDFS
+# =========================================================================
 def parse_receipt_image_or_pdf(uploaded_file):
     """Processes images or PDFs, returning (description, total, gst, receipt_date, raw_text)."""
     try:
         uploaded_file.seek(0)
-        file_ext = os.path.splitext(uploaded_file.name).lower()
+        file_ext = os.path.splitext(uploaded_file.name)[1].lower()
         raw_text = ""
         
         # Scenario A: Handle direct PDF digital uploads via page vector scanning blocks
@@ -110,6 +112,8 @@ def parse_receipt_image_or_pdf(uploaded_file):
                     for pil_img in converted_images:
                         gray = ImageOps.autocontrast(pil_img.convert("L"))
                         raw_text += pytesseract.image_to_string(gray, config="--psm 6") + "\n"
+            except Exception:
+                pass
             finally:
                 if os.path.exists(temp_pdf_path):
                     os.remove(temp_pdf_path)
@@ -138,7 +142,7 @@ def parse_receipt_image_or_pdf(uploaded_file):
         if "gst" in cleaned_text or "tax" in cleaned_text:
             gst_numbers = re.findall(r'(?:gst|tax)[^\d\n]*(\d+[.,]\d{2})', cleaned_text)
             if gst_numbers:
-                gst_amount = float(gst_numbers.replace(',', '.'))
+                gst_amount = float(gst_numbers[0].replace(',', '.'))
             else:
                 gst_amount = round(total_amount / 11, 2)
 
@@ -156,9 +160,9 @@ def parse_receipt_image_or_pdf(uploaded_file):
         return description, total_amount, gst_amount, detected_date, raw_text
     except Exception as e:
         return "Scan failed", 0.0, 0.0, datetime.today().strftime('%d/%m/%Y'), f"ERROR: {e}"
-# -------------------------------------------------------------------------
-# COMPREHENSIVE DYNAMIC MULTI-PAGE REPORTLAB PDF BUILDER MODULE
-# -------------------------------------------------------------------------
+# =========================================================================
+# BATCH 3 OF 6: OFFICIAL VOUCHER PDF COMPILATION & FILE MERGING ENGINES
+# =========================================================================
 def generate_official_voucher_pdf(filename, data, receipts):
     """Compiles a dynamic multi-page clone matching the Majlis Ansarullah Australia layout."""
     doc = SimpleDocTemplate(filename, pagesize=letter, rightMargin=36, leftMargin=36, topMargin=36, bottomMargin=36)
@@ -249,6 +253,7 @@ def generate_official_voucher_pdf(filename, data, receipts):
     story.append(Paragraph("<b>Comments:</b> Hand written Receipt approved by Sadr Majlis. (Updated: 1-11-19)", cell_style))
     
     doc.build(story)
+
 # -------------------------------------------------------------------------
 # DYNAMIC MULTI-FORMAT APPRENDIX BINDER STITCHING PIPELINE
 # -------------------------------------------------------------------------
@@ -261,12 +266,10 @@ def stitch_files_to_pdf(voucher_pdf_path, uploaded_files_list):
         for idx, u_file in enumerate(uploaded_files_list):
             if u_file is not None:
                 u_file.seek(0)
-                ext = os.path.splitext(u_file.name).lower()
+                ext = os.path.splitext(u_file.name)[1].lower()
                 
-                # Directly merge PDF file submissions
                 if ext == ".pdf":
                     merger.append(u_file)
-                # Convert and append image file submissions
                 else:
                     img = Image.open(u_file)
                     img = ImageOps.exif_transpose(img)
@@ -285,9 +288,9 @@ def stitch_files_to_pdf(voucher_pdf_path, uploaded_files_list):
     except Exception as e:
         st.error(f"⚠️ Appending engine notice: Attachment compilation encountered a restriction vector: {e}")
         return False
-# -------------------------------------------------------------------------
-# DIRECT EMAIL OUTBOUND DISPATCH ENGINE (SMTP)
-# -------------------------------------------------------------------------
+# =========================================================================
+# BATCH 4 OF 6: OUTBOUND NETWORK SMTP EMAIL DISPATCH ENGINE
+# =========================================================================
 def dispatch_real_email(recipient_list, subject_text, body_text, attachment_path, cc_recipient=None):
     """Logs into configured SMTP engine server to transmit automated summary file payloads with optional CC."""
     smtp_info = st.session_state.admin_lists
@@ -336,7 +339,9 @@ def dispatch_real_email(recipient_list, subject_text, body_text, attachment_path
 # -------------------------------------------------------------------------
 st.set_page_config(page_title="Expense Portal (Official MAA Clone)", layout="wide")
 app_mode = st.sidebar.selectbox("Navigate Mode", ["User Claim Portal", "Admin Panel Configuration"])
-
+# =========================================================================
+# BATCH 5 OF 6: SECURE AUTHORITY-FIRST REPOSITIONED ADMIN DASHBOARD
+# =========================================================================
 if app_mode == "Admin Panel Configuration":
     st.title("⚙️ Admin Control Panel")
     pwd_input = st.text_input("Enter Master Admin Access Key Password", type="password")
@@ -346,6 +351,7 @@ if app_mode == "Admin Panel Configuration":
         
         new_pwd = st.text_input("Modify System Admin Password Key", value=st.session_state.admin_lists.get("admin_password", "AdminPassword123"))
         
+        # --- REPOSITIONED TO THE TOP AS REQUESTED ---
         st.markdown("### 👑 Central Executive Authority Configuration (Global Overrides)")
         q_mal = st.text_input("Approved by Qaid Mal - Target Field Assignment Name", value=st.session_state.admin_lists.get("qaid_mal_name", "Tahir Mahmood Rana"))
         s_maa = st.text_input("Approved by Sadr MAA - Target Field Assignment Name", value=st.session_state.admin_lists.get("sadr_maa_name", "Abdul Jamil Mubbashar"))
@@ -405,11 +411,14 @@ if app_mode == "Admin Panel Configuration":
             st.session_state.admin_lists = updated_config
             st.success("Global application schema configuration matrix updated successfully!")
             st.rerun()
+            
+    elif pwd_input != "":
+        st.error("Access Refused: Secure validation key does not match records.")
 # =========================================================================
-# BATCH 6 OF 6: LIVE AGGREGATION, VALIDATION BARRIERS, AND SUBMISSION DISPATCH
+# BATCH 6 OF 6: CALCULATIONS, SAFETY VALIDATIONS, AND FINAL SUBMISSION
 # =========================================================================
 
-    # Continuous background aggregation loops reading live calculated user edits instantly
+    # Real-time state aggregation loops reading live calculated user edits instantly
     calculated_total_claim = sum(r["amount"] for r in receipt_records)
     calculated_total_gst = sum(r["gst"] for r in receipt_records)
     
@@ -432,7 +441,7 @@ if app_mode == "Admin Panel Configuration":
     # Interactive blocking flags initialization parameters
     block_submission = False
 
-    # 1. Verification of line item total amount entries matching claimant expectations
+    # 1. Verification of line item total amount entries matching claimant inputs
     if not is_amount_matching:
         st.error(f"❌ Total Doesn't Match: The sum of your individual row entries (${calculated_total_claim:.2f}) does not match your typed Total Declared Claim Amount (${declared_total_input:.2f}). Please review row values.")
         block_submission = True
