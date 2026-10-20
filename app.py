@@ -113,7 +113,7 @@ def parse_receipt_image(uploaded_file):
         if "gst" in text or "tax" in text:
             gst_numbers = re.findall(r'(?:gst|tax)[^\d\n]*(\d+[.,]\d{2})', text)
             if gst_numbers:
-                gst_amount = float(gst_numbers[0].replace(',', '.'))
+                gst_amount = float(gst_numbers.replace(',', '.'))
             else:
                 gst_amount = round(total_amount / 11, 2)
 
@@ -179,12 +179,12 @@ def generate_pdf(filename, data, receipts):
     ]))
     story.append(t_receipts)
     
-    doc.build(story)
+    doc.build(story)    
 # -------------------------------------------------------------------------
 # DIRECT EMAIL OUTBOUND DISPATCH ENGINE (SMTP)
 # -------------------------------------------------------------------------
-def dispatch_real_email(recipient_list, subject_text, body_text, attachment_path):
-    """Logs into configured SMTP engine server to transmit automated summary file payloads."""
+def dispatch_real_email(recipient_list, subject_text, body_text, attachment_path, cc_recipient=None):
+    """Logs into configured SMTP engine server to transmit automated summary file payloads with optional CC."""
     smtp_info = st.session_state.admin_lists
     
     if not smtp_info.get("smtp_user") or not smtp_info.get("smtp_password"):
@@ -196,6 +196,11 @@ def dispatch_real_email(recipient_list, subject_text, body_text, attachment_path
         msg['From'] = smtp_info["smtp_user"]
         msg['To'] = ", ".join(recipient_list)
         msg['Subject'] = subject_text
+        
+        all_recipients = list(recipient_list)
+        if cc_recipient:
+            msg['Cc'] = cc_recipient
+            all_recipients.append(cc_recipient)
         
         msg.attach(MIMEText(body_text, 'plain'))
         
@@ -214,7 +219,7 @@ def dispatch_real_email(recipient_list, subject_text, body_text, attachment_path
         server = smtplib.SMTP(smtp_info["smtp_server"], smtp_info["smtp_port"])
         server.starttls()
         server.login(smtp_info["smtp_user"], smtp_info["smtp_password"])
-        server.sendmail(smtp_info["smtp_user"], recipient_list, msg.as_string())
+        server.sendmail(smtp_info["smtp_user"], all_recipients, msg.as_string())
         server.quit()
         return True
     except Exception as email_err:
@@ -282,7 +287,7 @@ if app_mode == "Admin Panel Configuration":
         
         st.markdown("---")
         st.markdown("#### 🔐 Outbound live SMTP Server Credentials Gateway")
-        st.caption("Enter the outbound operational account details responsible for distributing system emails.")
+        st.caption("Enter the dedicated system email account details responsible for distributing system emails.")
         
         smtp_srv = st.text_input("SMTP Server Relay Node Hostname", value=st.session_state.admin_lists.get("smtp_server", "://gmail.com"))
         smtp_prt = st.number_input("SMTP Server TLS Port Number", value=int(st.session_state.admin_lists.get("smtp_port", 587)), step=1)
@@ -327,8 +332,7 @@ if app_mode == "Admin Panel Configuration":
             
     elif pwd_input != "":
         st.error("Access Refused: Secure validation key does not match records.")
-        
-    # -------------------------------------------------------------------------
+  # -------------------------------------------------------------------------
 # INTERACTIVE CLAIM FORM LAYOUT PANEL
 # -------------------------------------------------------------------------
 else:
@@ -337,6 +341,7 @@ else:
     col1, col2 = st.columns(2)
     with col1:
         name = st.text_input("Full Employee / Claimant Name")
+        claimant_email = st.text_input("Your Personal/Employee Email Address (For confirmation copy)")
         
         configured_regions = st.session_state.admin_lists["regions"]
         region = st.selectbox("Select Region / National Location", options=configured_regions)
@@ -400,8 +405,8 @@ else:
     st.markdown("---")
 
     if st.button("Finalize and Submit Expense Claims Bundle", type="primary"):
-        if not name or not bsb or not acc_num:
-            st.error("Submission Denied: Profile details, BSB, and Account Numbers must be filled out.")
+        if not name or not bsb or not acc_num or not claimant_email:
+            st.error("Submission Denied: Profile details, Claimant Email, BSB, and Account Numbers must be filled out.")
         else:
             payload = {
                 "name": name, 
@@ -433,13 +438,20 @@ else:
                 body = f"Hello,\n\nA new expense claim statement summary pack has been compiled and submitted by {name} for the '{majlis}' branch of '{region}' region.\n\nPlease find the summary document statement sheet attached below.\n\nBest regards,\nAutomated Expense Portal Gateway"
                 
                 with st.spinner("Transmitting secure PDF files bundle across outbound networks..."):
-                    success = dispatch_real_email(recipient_emails, subject, body, output_filename)
+                    # Dispatches to target list and directly CCs the claimant
+                    success = dispatch_real_email(
+                        recipient_list=recipient_emails, 
+                        subject_text=subject, 
+                        body_text=body, 
+                        attachment_path=output_filename,
+                        cc_recipient=claimant_email.strip()
+                    )
                 
                 if success:
                     routing_type = "Fallback" if is_fallback else "Targeted Match"
-                    st.success(f"📧 Outbound Email Dispatched! ({routing_type}) PDF successfully delivered to: {', '.join(recipient_emails)}")
+                    st.success(f"📧 Outbound Email Dispatched! ({routing_type}) PDF successfully delivered to regional targets and carbon-copied (CC) to claimant: {claimant_email}")
             else:
-                st.warning("⚠️ Email transmission skipped: No email recipients defined in system settings.")
+                st.warning("⚠️ Email transmission skipped: No operational email recipients defined in system settings.")
             
             pdf_bytes = open(output_filename, "rb").read()
             st.download_button(
@@ -447,4 +459,4 @@ else:
                 data=pdf_bytes,
                 file_name=output_filename,
                 mime="application/pdf"
-            )
+            )  
