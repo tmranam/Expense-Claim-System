@@ -30,7 +30,7 @@ DEFAULT_CONFIG = {
         "Region South": ["Youth Majlis South", "Local Chapter B"]
     },
     "emails": ["finance@example.com", "approvals@example.com"],
-    "admin_password": "AdminPassword123"
+    "admin_password": "123"
 }
 
 # -------------------------------------------------------------------------
