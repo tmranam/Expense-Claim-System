@@ -53,69 +53,49 @@ if 'admin_lists' not in st.session_state:
 # -------------------------------------------------------------------------
 # OPTIMIZED OCR PARSER & PDF GENERATOR
 # -------------------------------------------------------------------------
+from PIL import Image, ImageOps
+
 def parse_receipt_image(uploaded_file):
-    """Scans receipt content instantly using lightweight, throttle-safe Tesseract."""
+    """Returns (description, total, gst, raw_text)."""
     try:
-        # Load and safely resize the uploaded file asset image
+        uploaded_file.seek(0)
         image = Image.open(uploaded_file)
-        image.thumbnail((1200, 1200))
-        
-        # 1. ENHANCED CONTRAST PREPROCESSING
-        # Convert to Grayscale, then apply a binary cutoff matrix to force 
-        # text characters to crisp absolute black and backgrounds to pure white.
-        gray_image = image.convert("L")
-        optimized_image = gray_image.point(lambda x: 0 if x < 140 else 255, '1')
-        
-        # 2. OPTIMIZED ENGINE CONFIGURATION
-        # Mode 11 instructs Tesseract to actively look for sparse numeric matrices and disjointed numbers
-        custom_config = r'--psm 11'
-        full_text = pytesseract.image_to_string(optimized_image, config=custom_config).lower()
-        
-        # Clean spacing layout bugs separating dollar structures
-        cleaned_text = re.sub(r'(?<=\d)\s+(?=\d)', '', full_text)
-        
-        # 3. EXTRACTION PATTERNS FOR VALUES
-        found_amounts = []
-        # Matches patterns like 12.50, $145.00, or raw 45.10
-        raw_matches = re.findall(r'\b\d+[\.,]\d{2}\b', cleaned_text)
-        
-        for match in raw_matches:
+        image = ImageOps.exif_transpose(image)   # fixes sideways phone photos
+        image.thumbnail((2000, 2000))
+
+        # Gentle preprocessing: Tesseract binarizes well on its own,
+        # a hard 140 cutoff often wipes out faint receipt text.
+        gray = ImageOps.autocontrast(image.convert("L"))
+
+        raw_text = pytesseract.image_to_string(gray, config="--psm 6").lower()
+
+        # Fix "12 .50" / "12. 50" style breaks, but only on the SAME line
+        text = re.sub(r'(?<=\d)[ \t]*([.,])[ \t]*(?=\d{2}\b)', r'\1', raw_text)
+
+        amounts = []
+        for m in re.findall(r'\b\d+[.,]\d{2}\b', text):
             try:
-                clean_num = match.replace(',', '.')
-                found_amounts.append(float(clean_num))
+                amounts.append(float(m.replace(',', '.')))
             except ValueError:
-                continue
-                
-        # The maximum value printed anywhere on a receipt layout is logically the total
-        total_amount = max(found_amounts) if found_amounts else 0.0
-        
-        # 4. FIXED GST CAPTURING ROUTINE
+                pass
+        total_amount = max(amounts) if amounts else 0.0
+
         gst_amount = 0.0
-        if "gst" in cleaned_text or "tax" in cleaned_text:
-            # Capture numbers following tax indicators
-            gst_numbers = re.findall(r'(?:gst|tax)[^\d]*(\d+[\.,]\d{2})', cleaned_text)
-            if gst_numbers and len(gst_numbers) > 0:
-                try:
-                    # FIXED: Strip text strings cleanly to avoid object exceptions
-                    clean_gst_str = str(gst_numbers[0]).replace(',', '.')
-                    gst_amount = float(clean_gst_str)
-                except ValueError:
-                    gst_amount = round(total_amount / 11, 2)
+        if "gst" in text or "tax" in text:
+            gst_numbers = re.findall(r'(?:gst|tax)[^\d\n]*(\d+[.,]\d{2})', text)
+            if gst_numbers:
+                gst_amount = float(gst_numbers[0].replace(',', '.'))
             else:
-                # Math rule fallback (Total divided by 11 handles standard Australian GST)
                 gst_amount = round(total_amount / 11, 2)
-        
-        # 5. ASSIGN CATEGORIES VIA LOGICAL KEYWORDS
-        keywords = []
-        possible_items = ['uber', 'cafe', 'officeworks', 'bunnings', 'parking', 'fuel', 'stationery', 'food', 'meals', 'woolworths', 'coles']
-        for item in possible_items:
-            if item in cleaned_text:
-                keywords.append(item.title())
-        
+
+        possible_items = ['uber', 'cafe', 'officeworks', 'bunnings', 'parking',
+                          'fuel', 'stationery', 'food', 'meals', 'woolworths', 'coles']
+        keywords = [i.title() for i in possible_items if i in text]
         description = ", ".join(keywords) if keywords else "General Expense Purchases"
-        return description, total_amount, gst_amount
+
+        return description, total_amount, gst_amount, raw_text
     except Exception as e:
-        return "Scan conversion variance", 0.0, 0.0
+        return "Scan failed", 0.0, 0.0, f"ERROR: {e}"
 def generate_pdf(filename, data, receipts):
     """Compiles a clean document statement using ReportLab canvas flowables."""
     doc = SimpleDocTemplate(filename, pagesize=letter)
@@ -219,26 +199,39 @@ else:
     receipt_records = []
     
     for i in range(int(total_receipts_input)):
-        st.markdown(f"#### 📄 Receipt Section Item #{i+1}")
-        r_col1, r_col2, r_col3, r_col4 = st.columns([2, 2, 1, 1])
-        
-        with r_col1:
-            uploaded_file = st.file_uploader(f"Upload Image Asset for Receipt #{i+1}", type=["png", "jpg", "jpeg"], key=f"file_{i}")
-        
-        initial_desc, initial_total, initial_gst = "No file parsed", 0.0, 0.0
-        
-        if uploaded_file is not None:
+    st.markdown(f"#### 📄 Receipt Section Item #{i+1}")
+    r_col1, r_col2, r_col3, r_col4 = st.columns([2, 2, 1, 1])
+
+    with r_col1:
+        uploaded_file = st.file_uploader(
+            f"Upload Image Asset for Receipt #{i+1}",
+            type=["png", "jpg", "jpeg"], key=f"file_{i}"
+        )
+
+    # Scan only when a NEW file arrives, and push results into widget state
+    if uploaded_file is not None:
+        sig = f"{uploaded_file.name}_{uploaded_file.size}"
+        if st.session_state.get(f"sig_{i}") != sig:
             with st.spinner(f"Scanning document #{i+1}..."):
-                initial_desc, initial_total, initial_gst = parse_receipt_image(uploaded_file)
-        
-        with r_col2:
-            desc_val = st.text_input(f"Item Description #{i+1}", value=initial_desc, key=f"desc_{i}")
-        with r_col3:
-            total_val = st.number_input(f"Amount ($) #{i+1}", min_value=0.0, value=float(initial_total), format="%.2f", key=f"amt_{i}")
-        with r_col4:
-            gst_val = st.number_input(f"GST ($) #{i+1}", min_value=0.0, value=float(initial_gst), format="%.2f", key=f"gst_{i}")
-            
-        receipt_records.append({"desc": desc_val, "amount": total_val, "gst": gst_val})
+                d, t, g, raw = parse_receipt_image(uploaded_file)
+            st.session_state[f"desc_{i}"] = d
+            st.session_state[f"amt_{i}"] = float(t)
+            st.session_state[f"gst_{i}"] = float(g)
+            st.session_state[f"ocr_{i}"] = raw
+            st.session_state[f"sig_{i}"] = sig
+
+    with r_col2:
+        desc_val = st.text_input(f"Item Description #{i+1}", key=f"desc_{i}")
+    with r_col3:
+        total_val = st.number_input(f"Amount ($) #{i+1}", min_value=0.0, format="%.2f", key=f"amt_{i}")
+    with r_col4:
+        gst_val = st.number_input(f"GST ($) #{i+1}", min_value=0.0, format="%.2f", key=f"gst_{i}")
+
+    if f"ocr_{i}" in st.session_state:
+        with st.expander(f"Debug: raw OCR text for receipt #{i+1}"):
+            st.text(st.session_state[f"ocr_{i}"])
+
+    receipt_records.append({"desc": desc_val, "amount": total_val, "gst": gst_val})
 
     st.markdown("---")
 
