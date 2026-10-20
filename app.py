@@ -186,50 +186,84 @@ if app_mode == "Admin Panel Configuration":
         
         new_pwd = st.text_input("Modify System Admin Password Key", value=st.session_state.admin_lists.get("admin_password", "AdminPassword123"))
         
-        # 1. Update master configurations for Regions
+        # 1. Master configurations for Regions
         regions_text = st.text_area("Regions Master List Configuration (One entry per line)", value="\n".join(st.session_state.admin_lists["regions"]))
         parsed_regions_list = [line.strip() for line in regions_text.split("\n") if line.strip()]
         
         st.markdown("---")
         st.markdown("#### 🗺️ Regional Majlis Assignment Panel")
-        st.caption("Select a region from your master list below to open its assignment configuration and allocate its respective Majlis entries.")
+        st.caption("Select a region to allocate its respective Majlis entries.")
         
-        # 2. Dynamic dropdown based directly on entered regions above
         selected_admin_region = st.selectbox("Select a region to configure its Majlis", options=parsed_regions_list)
         
-        # Fetch current mapping or fallback to empty array safely if it's a new region
         current_map = st.session_state.admin_lists.get("regional_majlis", {})
         existing_majlis_for_region = current_map.get(selected_admin_region, [])
         
-        # 3. Dynamic layout panel opens for the selected region
-        majlis_text = st.text_area(f"Enter Majlis names for '{selected_admin_region}' (One entry per line)", value="\n".join(existing_majlis_for_region), height=180)
+        majlis_text = st.text_area(f"Enter Majlis names for '{selected_admin_region}' (One entry per line)", value="\n".join(existing_majlis_for_region), height=140)
         parsed_majlis_list = [line.strip() for line in majlis_text.split("\n") if line.strip()]
         
         st.markdown("---")
-        emails_text = st.text_area("Notification Distribution Target Emails (One entry per line)", value="\n".join(st.session_state.admin_lists["emails"]))
-    if st.button("Save System Configuration Schema Matrix", type="primary"):
-            # Update the specific selected key value pair inside the mapping dictionary
+        st.markdown("#### ✉️ Target Email Assignment Matrix")
+        st.caption("Route form notifications dynamically based on user selections.")
+        
+        # Admin selects a specific Region + Majlis to attach custom emails
+        email_region_select = st.selectbox("Step 1: Pick Target Region for Emails", options=parsed_regions_list, key="email_reg")
+        
+        # Safely extract currently loaded majlis items for this region to populate dropdown
+        available_majlis_for_email = parsed_majlis_list if email_region_select == selected_admin_region else current_map.get(email_region_select, [])
+        
+        if available_majlis_for_email:
+            email_majlis_select = st.selectbox(f"Step 2: Pick Target Majlis in '{email_region_select}'", options=available_majlis_for_email)
+            
+            # Key format matching schema logic: "RegionName|MajlisName"
+            routing_key = f"{email_region_select}|{email_majlis_select}"
+            current_routing_map = st.session_state.admin_lists.get("targeted_emails", {})
+            existing_emails = current_routing_map.get(routing_key, [])
+            
+            majlis_emails_text = st.text_area(f"Emails for '{email_majlis_select}' in '{email_region_select}' (One entry per line)", value="\n".join(existing_emails), height=120)
+            parsed_majlis_emails = [line.strip() for line in majlis_emails_text.split("\n") if line.strip()]
+        else:
+            st.warning("Please save your configuration or declare at least one Majlis entry above to map specific emails.")
+            routing_key = None
+            parsed_majlis_emails = []
+
+        st.markdown("---")
+        # Global fallback distribution targets
+        emails_text = st.text_area("Global Fallback Emails (Used if no specific Majlis email is set)", value="\n".join(st.session_state.admin_lists.get("emails", [])))
+        
+        if st.button("Save System Configuration Schema Matrix", type="primary"):
+            # Update the regional majlis mappings
             updated_map = dict(current_map)
             updated_map[selected_admin_region] = parsed_majlis_list
-            
-            # Keep map items clean by purging regions that were completely removed from the text box
             updated_map = {k: v for k, v in updated_map.items() if k in parsed_regions_list}
-            
-            # Fill missing keys for any brand new added regions to avoid dictionary crashes
             for r in parsed_regions_list:
                 if r not in updated_map:
                     updated_map[r] = []
-                    
+            
+            # Update the targeted routing matrix mappings 
+            updated_routing_map = dict(st.session_state.admin_lists.get("targeted_emails", {}))
+            if routing_key:
+                updated_routing_map[routing_key] = parsed_majlis_emails
+                
+            # Clean obsolete keys out of database if region name changes or gets deleted
+            valid_routing_map = {}
+            for key, emails in updated_routing_map.items():
+                if "|" in key:
+                    r_part, m_part = key.split("|", 1)
+                    if r_part in updated_map and m_part in updated_map[r_part]:
+                        valid_routing_map[key] = emails
+
             updated_config = {
                 "regions": parsed_regions_list,
                 "regional_majlis": updated_map,
+                "targeted_emails": valid_routing_map,
                 "emails": [line.strip() for line in emails_text.split("\n") if line.strip()],
                 "admin_password": new_pwd.strip()
             }
             
             save_admin_settings(updated_config)
             st.session_state.admin_lists = updated_config
-            st.success(f"Global configuration written successfully! Assigned {len(parsed_majlis_list)} Majlis entries to '{selected_admin_region}'.")
+            st.success("Global application schema matrix and routing pipelines successfully written!")
             st.rerun()
             
     elif pwd_input != "":
@@ -270,7 +304,7 @@ else:
     for i in range(int(total_receipts_input)):
         st.markdown(f"#### 📄 Receipt Section Item #{i+1}")
         
-        r_col1, r_col2, r_col3, r_col4 = st.columns([2, 2, 1, 1])
+        r_col1, r_col2, r_col3, r_col4 = st.columns()
 
         with r_col1:
             uploaded_file = st.file_uploader(
@@ -323,7 +357,18 @@ else:
             generate_pdf(output_filename, payload, receipt_records)
             st.success("🎉 Claim Bundle Form processed successfully!")
             st.balloons()
-            st.info(f"📧 Simulation Email Sent: PDF dispatched to targets: {', '.join(st.session_state.admin_lists['emails'])}")
+            
+            # DYNAMIC ROUTING RESOLUTION PIPELINE
+            lookup_key = f"{region}|{majlis}"
+            targeted_routing_map = st.session_state.admin_lists.get("targeted_emails", {})
+            
+            # Fetch specifically mapped emails, or default back to global list if empty
+            recipient_emails = targeted_routing_map.get(lookup_key, [])
+            if not recipient_emails:
+                recipient_emails = st.session_state.admin_lists.get("emails", [])
+                st.info(f"📧 Simulation Email Sent: (Fallback Used) PDF dispatched to targets: {', '.join(recipient_emails)}")
+            else:
+                st.info(f"🎯 Simulation Email Sent: (Targeted Match) PDF dispatched to targets: {', '.join(recipient_emails)}")
             
             pdf_bytes = open(output_filename, "rb").read()
             st.download_button(
@@ -332,4 +377,3 @@ else:
                 file_name=output_filename,
                 mime="application/pdf"
             )
- 
