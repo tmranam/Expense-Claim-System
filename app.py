@@ -11,13 +11,16 @@ from email.mime.base import MIMEBase
 from email import encoders
 from PIL import Image, ImageOps
 import pytesseract
-import pypdf
-from pdf2image import convert_from_bytes
 from reportlab.lib.pagesizes import letter
 from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle
 from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
 from reportlab.lib import colors
+import pypdf
+from pdf2image import convert_from_path
 
+# -------------------------------------------------------------------------
+# DEFENSIVE LINUX PATH ANCHORING FOR STREAMLIT CLOUD INFRASTRUCTURE
+# -------------------------------------------------------------------------
 detected_path = shutil.which("tesseract")
 if detected_path:
     pytesseract.pytesseract.tesseract_cmd = detected_path
@@ -26,6 +29,7 @@ else:
 
 CONFIG_FILE = "admin_config.json"
 
+# Relational mapping framework configuration dictionary updated for Majlis Ansarullah Australia
 DEFAULT_CONFIG = {
     "regions": ["National", "Region North", "Region South"],
     "regional_majlis": {
@@ -48,11 +52,17 @@ DEFAULT_CONFIG = {
     }
 }
 
+# -------------------------------------------------------------------------
+# PERSISTENT STORAGE MANAGEMENT FOR FREE STREAMLIT TIER
+# -------------------------------------------------------------------------
 def load_admin_settings():
+    """Loads admin configurations from a local JSON file to survive app sleeping."""
     if os.path.exists(CONFIG_FILE):
         try:
             with open(CONFIG_FILE, "r") as f:
                 data = json.load(f)
+                
+                # --- FIXED CRITICAL FALLBACK STRUCTURE CHECKS ---
                 for key in DEFAULT_CONFIG:
                     if key not in data or not data[key]:
                         data[key] = DEFAULT_CONFIG[key]
@@ -62,89 +72,96 @@ def load_admin_settings():
     return DEFAULT_CONFIG
 
 def save_admin_settings(config_data):
+    """Saves admin updates permanently into the repository environment."""
     with open(CONFIG_FILE, "w") as f:
         json.dump(config_data, f, indent=4)
 
+# Initialize settings in state
 if 'admin_lists' not in st.session_state:
     st.session_state.admin_lists = load_admin_settings()
-
-def parse_receipt_image(uploaded_file):
+# -------------------------------------------------------------------------
+# DUAL-FORMAT OCR ENGINE FOR IMAGE & PDF TRANSLATION PROCESSING
+# -------------------------------------------------------------------------
+def parse_receipt_image_or_pdf(uploaded_file):
+    """Processes images or PDFs, returning (description, total, gst, receipt_date, raw_text)."""
     try:
         uploaded_file.seek(0)
-        file_bytes = uploaded_file.read()
-        file_name_lower = uploaded_file.name.lower()
-        image = None
-
-        if file_name_lower.endswith('.pdf'):
-            try:
-                images_from_pdf = convert_from_bytes(file_bytes, first_page=1, last_page=1)
-                if images_from_pdf:
-                    image = images_from_pdf[0]
-            except Exception:
-                pass
+        file_ext = os.path.splitext(uploaded_file.name)[1].lower()
+        raw_text = ""
+        
+        # Scenario A: Handle direct PDF digital uploads via page vector scanning blocks
+        if file_ext == ".pdf":
+            temp_pdf_path = f"temp_ocr_{uploaded_file.name}"
+            with open(temp_pdf_path, "wb") as temp_f:
+                temp_f.write(uploaded_file.read())
             
-            if image is None:
-                try:
-                    uploaded_file.seek(0)
-                    reader = pypdf.PdfReader(uploaded_file)
-                    extracted_text = ""
-                    for page in reader.pages[:2]:
-                        text_content = page.extract_text()
-                        if text_content:
-                            extracted_text += text_content + "\n"
-                    if extracted_text.strip():
-                        return process_raw_ocr_text(extracted_text.lower())
-                except Exception:
-                    pass
+            try:
+                # Attempt structural digital text reading extraction first
+                reader = pypdf.PdfReader(temp_pdf_path)
+                for page in reader.pages:
+                    text_content = page.extract_text()
+                    if text_content:
+                        raw_text += text_content + "\n"
+                
+                # Fallback to raster image conversion parsing if document is a scanned image container
+                if not raw_text.strip():
+                    converted_images = convert_from_path(temp_pdf_path)
+                    for pil_img in converted_images:
+                        gray = ImageOps.autocontrast(pil_img.convert("L"))
+                        raw_text += pytesseract.image_to_string(gray, config="--psm 6") + "\n"
+            finally:
+                if os.path.exists(temp_pdf_path):
+                    os.remove(temp_pdf_path)
+                    
+        # Scenario B: Handle standard image asset uploads (PNG, JPG, JPEG)
         else:
-            uploaded_file.seek(0)
             image = Image.open(uploaded_file)
+            image = ImageOps.exif_transpose(image)
+            image.thumbnail((2000, 2000))
+            gray = ImageOps.autocontrast(image.convert("L"))
+            raw_text = pytesseract.image_to_string(gray, config="--psm 6")
 
-        if image is None:
-            return "Scan failed", 0.0, 0.0, datetime.today().strftime('%d/%m/%Y'), "ERROR: Unsupported payload format matrix"
+        raw_text_lower = raw_text.lower()
+        cleaned_text = re.sub(r'(?<=\d)[ \t]*([.,])[ \t]*(?=\d{2}\b)', r'\1', raw_text_lower)
 
-        image = ImageOps.exif_transpose(image)
-        image.thumbnail((2000, 2000))
-        gray = ImageOps.autocontrast(image.convert("L"))
-        raw_text = pytesseract.image_to_string(gray, config="--psm 6").lower()
-        return process_raw_ocr_text(raw_text)
+        # Extrapolate numeric balance points
+        amounts = []
+        for m in re.findall(r'\b\d+[.,]\d{2}\b', cleaned_text):
+            try:
+                amounts.append(float(m.replace(',', '.')))
+            except ValueError:
+                pass
+        total_amount = max(amounts) if amounts else 0.0
+
+        gst_amount = 0.0
+        if "gst" in cleaned_text or "tax" in cleaned_text:
+            gst_numbers = re.findall(r'(?:gst|tax)[^\d\n]*(\d+[.,]\d{2})', cleaned_text)
+            if gst_numbers:
+                gst_amount = float(gst_numbers[0].replace(',', '.'))
+            else:
+                gst_amount = round(total_amount / 11, 2)
+
+        # Parse data timestamps matching common layouts
+        detected_date = datetime.today().strftime('%d/%m/%Y')
+        date_patterns = re.findall(r'\b\d{1,2}[/\-]\d{1,2}[/\-]\d{2,4}\b', raw_text)
+        if date_patterns:
+            detected_date = date_patterns[0].replace('-', '/')
+
+        possible_items = ['uber', 'cafe', 'officeworks', 'bunnings', 'parking',
+                          'fuel', 'stationery', 'food', 'meals', 'woolworths', 'coles']
+        keywords = [i.title() for i in possible_items if i in cleaned_text]
+        description = ", ".join(keywords) if keywords else "General Expense Purchases"
+
+        return description, total_amount, gst_amount, detected_date, raw_text
     except Exception as e:
         return "Scan failed", 0.0, 0.0, datetime.today().strftime('%d/%m/%Y'), f"ERROR: {e}"
-
-def process_raw_ocr_text(raw_text):
-    text = re.sub(r'(?<=\d)[ \t]*([.,])[ \t]*(?=\d{2}\b)', r'\1', raw_text)
-    amounts = []
-    for m in re.findall(r'\b\d+[.,]\d{2}\b', text):
-        try:
-            amounts.append(float(m.replace(',', '.')))
-        except ValueError:
-            pass
-    total_amount = max(amounts) if amounts else 0.0
-
-    gst_amount = 0.0
-    if "gst" in text or "tax" in text:
-        gst_numbers = re.findall(r'(?:gst|tax)[^\d\n]*(\d+[.,]\d{2})', text)
-        if gst_numbers:
-            gst_amount = float(gst_numbers[0].replace(',', '.'))
-        else:
-            gst_amount = round(total_amount / 11, 2)
-
-    detected_date = datetime.today().strftime('%d/%m/%Y')
-    date_patterns = re.findall(r'\b\d{1,2}[/\-]\d{1,2}[/\-]\d{2,4}\b', raw_text)
-    if date_patterns:
-        detected_date = date_patterns[0].replace('-', '/')
-
-    possible_items = ['uber', 'cafe', 'officeworks', 'bunnings', 'parking',
-                      'fuel', 'stationery', 'food', 'meals', 'woolworths', 'coles']
-    keywords = [i.title() for i in possible_items if i in text]
-    description = ", ".join(keywords) if keywords else "General Expense Purchases"
-
-    return description, total_amount, gst_amount, detected_date, raw_text
-
+# -------------------------------------------------------------------------
+# COMPREHENSIVE DYNAMIC MULTI-PAGE REPORTLAB PDF BUILDER MODULE
+# -------------------------------------------------------------------------
 def generate_official_voucher_pdf(filename, data, receipts):
+    """Compiles a dynamic multi-page clone matching the Majlis Ansarullah Australia layout."""
     doc = SimpleDocTemplate(filename, pagesize=letter, rightMargin=36, leftMargin=36, topMargin=36, bottomMargin=36)
     story = []
-    styles = getSampleStyleSheet()
     
     header_title_style = ParagraphStyle('HeadTitle', fontName='Helvetica-Bold', fontSize=14, alignment=1, spaceAfter=2)
     header_subtitle_style = ParagraphStyle('HeadSub', fontName='Helvetica-Bold', fontSize=12, alignment=1, spaceAfter=2)
@@ -167,7 +184,7 @@ def generate_official_voucher_pdf(filename, data, receipts):
         [Paragraph("<b>Majlis:</b>", cell_style), Paragraph(data['majlis'], cell_style), Paragraph("<b>Advance Issued:</b>", cell_style), Paragraph("", cell_style)]
     ]
     
-    t_header = Table(header_data, colWidths=[90, 180, 90, 180])
+    t_header = Table(header_data, colWidths=[100, 170, 100, 170])
     t_header.setStyle(TableStyle([
         ('GRID', (0,0), (-1,-1), 1, colors.black),
         ('VALIGN', (0,0), (-1,-1), 'MIDDLE'),
@@ -227,61 +244,56 @@ def generate_official_voucher_pdf(filename, data, receipts):
     
     story.append(Spacer(1, 10))
     story.append(Paragraph("<b>Acknowledgment</b>", header_subtitle_style))
-    story.append(Paragraph(f"I have received cash/cheque payment of $________________ as per details provided above.", cell_style))
-    story.append(Paragraph(f"<b>Comments:</b> Hand written Receipt approved by Sadr Majlis. (Updated: 1-11-19)", cell_style))
+    story.append(Paragraph("I have received cash/cheque payment of $________________ as per details provided above.", cell_style))
+    story.append(Paragraph("<b>Comments:</b> Hand written Receipt approved by Sadr Majlis. (Updated: 1-11-19)", cell_style))
     
     doc.build(story)
-def stitch_receipt_images_to_pdf(voucher_pdf_path, uploaded_files_list):
+
+# -------------------------------------------------------------------------
+# DYNAMIC MULTI-FORMAT APPRENDIX BINDER STITCHING PIPELINE
+# -------------------------------------------------------------------------
+def stitch_files_to_pdf(voucher_pdf_path, uploaded_files_list):
+    """Stitches multi-format attachments directly onto the base voucher sheet."""
     try:
-        import pypdf
         merger = pypdf.PdfMerger()
         merger.append(voucher_pdf_path)
-        
-        has_attachments = False
-        temp_files_to_clean = []
         
         for idx, u_file in enumerate(uploaded_files_list):
             if u_file is not None:
                 u_file.seek(0)
-                file_bytes = u_file.read()
-                file_name_lower = u_file.name.lower()
+                ext = os.path.splitext(u_file.name)[1].lower()
                 
-                if file_name_lower.endswith('.pdf'):
-                    temp_pdf_name = f"temp_attachment_{idx}.pdf"
-                    with open(temp_pdf_name, "wb") as f:
-                        f.write(file_bytes)
-                    merger.append(temp_pdf_name)
-                    temp_files_to_clean.append(temp_pdf_name)
-                    has_attachments = True
+                # Directly merge PDF file submissions
+                if ext == ".pdf":
+                    merger.append(u_file)
+                # Convert and append image file submissions
                 else:
-                    u_file.seek(0)
                     img = Image.open(u_file)
                     img = ImageOps.exif_transpose(img)
                     if img.mode in ("RGBA", "P"):
                         img = img.convert("RGB")
                     
-                    temp_img_pdf = f"temp_img_{idx}.pdf"
-                    img.save(temp_img_pdf, "PDF", resolution=100.0)
-                    merger.append(temp_img_pdf)
-                    temp_files_to_clean.append(temp_img_pdf)
-                    has_attachments = True
-                    
-        if has_attachments:
-            merger.write(voucher_pdf_path)
-            merger.close()
-            
-        for t_file in temp_files_to_clean:
-            if os.path.exists(t_file):
-                os.remove(t_file)
+                    tmp_img_pdf = f"tmp_stitch_{idx}.pdf"
+                    img.save(tmp_img_pdf, "PDF", resolution=100.0)
+                    merger.append(tmp_img_pdf)
+                    if os.path.exists(tmp_img_pdf):
+                        os.remove(tmp_img_pdf)
+                        
+        merger.write(voucher_pdf_path)
+        merger.close()
         return True
-    except Exception as merge_error:
-        st.error(f"⚠️ Attachment consolidation failed: {merge_error}")
+    except Exception as e:
+        st.error(f"⚠️ Appending engine notice: Attachment compilation encountered a restriction vector: {e}")
         return False
-
+# -------------------------------------------------------------------------
+# DIRECT EMAIL OUTBOUND DISPATCH ENGINE (SMTP)
+# -------------------------------------------------------------------------
 def dispatch_real_email(recipient_list, subject_text, body_text, attachment_path, cc_recipient=None):
+    """Logs into configured SMTP engine server to transmit automated summary file payloads with optional CC."""
     smtp_info = st.session_state.admin_lists
+    
     if not smtp_info.get("smtp_user") or not smtp_info.get("smtp_password"):
-        st.error("⚠️ Real Delivery Skipped: Outbound SMTP User Email and Password keys must be configured in Admin configurations.")
+        st.error("⚠️ Real Delivery Skipped: Outbound SMTP User Email and Password keys must be filled out on the Admin Configuration screen.")
         return False
         
     try:
@@ -301,8 +313,12 @@ def dispatch_real_email(recipient_list, subject_text, body_text, attachment_path
             with open(attachment_path, "rb") as attachment:
                 part = MIMEBase("application", "octet-stream")
                 part.set_payload(attachment.read())
+                
             encoders.encode_base64(part)
-            part.add_header("Content-Disposition", f"attachment; filename= {os.path.basename(attachment_path)}")
+            part.add_header(
+                "Content-Disposition",
+                f"attachment; filename= {os.path.basename(attachment_path)}",
+            )
             msg.attach(part)
         
         server = smtplib.SMTP(smtp_info["smtp_server"], smtp_info["smtp_port"])
@@ -312,9 +328,12 @@ def dispatch_real_email(recipient_list, subject_text, body_text, attachment_path
         server.quit()
         return True
     except Exception as email_err:
-        st.error(f"❌ Mail Gateway Failure: {email_err}")
+        st.error(f"❌ Failed to dispatch email via mail network relay servers. Internal Error details: {email_err}")
         return False
 
+# -------------------------------------------------------------------------
+# CORE FRONT-END SELECTION ROUTER
+# -------------------------------------------------------------------------
 st.set_page_config(page_title="Expense Portal (Official MAA Clone)", layout="wide")
 app_mode = st.sidebar.selectbox("Navigate Mode", ["User Claim Portal", "Admin Panel Configuration"])
 
@@ -322,13 +341,14 @@ if app_mode == "Admin Panel Configuration":
     st.title("⚙️ Admin Control Panel")
     pwd_input = st.text_input("Enter Master Admin Access Key Password", type="password")
     
-    if pwd_input == st.session_state.admin_lists.get("admin_password", "123"):
+    if pwd_input == st.session_state.admin_lists.get("admin_password", "AdminPassword123"):
         st.success("Access Verified. Secure Configuration Screen Unlocked.")
-        new_pwd = st.text_input("Modify System Admin Password Key", value=st.session_state.admin_lists.get("admin_password", "123"))
+        
+        new_pwd = st.text_input("Modify System Admin Password Key", value=st.session_state.admin_lists.get("admin_password", "AdminPassword123"))
         
         st.markdown("### 👑 Central Executive Authority Configuration (Global Overrides)")
-        q_mal = st.text_input("Approved by Qaid Mal Name", value=st.session_state.admin_lists.get("qaid_mal_name", "Tahir Mahmood Rana"))
-        s_maa = st.text_input("Approved by Sadr MAA Name", value=st.session_state.admin_lists.get("sadr_maa_name", "Abdul Jamil Mubbashar"))
+        q_mal = st.text_input("Approved by Qaid Mal - Target Field Assignment Name", value=st.session_state.admin_lists.get("qaid_mal_name", "Tahir Mahmood Rana"))
+        s_maa = st.text_input("Approved by Sadr MAA - Target Field Assignment Name", value=st.session_state.admin_lists.get("sadr_maa_name", "Abdul Jamil Mubbashar"))
         
         st.markdown("---")
         regions_text = st.text_area("Regions Master List Configuration (One entry per line)", value="\n".join(st.session_state.admin_lists["regions"]))
@@ -380,16 +400,14 @@ if app_mode == "Admin Panel Configuration":
                 "sadr_maa_name": s_maa.strip(),
                 "regional_nazims": updated_nazims
             }
+            
             save_admin_settings(updated_config)
             st.session_state.admin_lists = updated_config
-            st.success("Global configuration data written safely!")
+            st.success("Global application schema configuration matrix updated successfully!")
             st.rerun()
-    elif pwd_input != "":
-        st.error("Access Refused: Password key does not match records.")
-
-# =========================================================================
-# BLOCK 4 OF 4: USER CLAIMS PORTAL GRID AND DATA INTERACTION LOOP
-# =========================================================================
+# -------------------------------------------------------------------------
+# INTERACTIVE CLAIM FORM LAYOUT PANEL
+# -------------------------------------------------------------------------
 else:
     st.title("📋 Online Expense Claim Submission System")
     
@@ -412,7 +430,7 @@ else:
         
     with col2:
         total_receipts_input = st.number_input("Total Number of Receipts To Claim", min_value=1, max_value=50, value=1, step=1)
-        declared_total_input = st.number_input("Total Declared Claim Amount ($)", min_value=0.0, format="%.2f", help="Type the total amount you are claiming.")
+        declared_total_input = st.number_input("Total Declared Claim Amount ($)", min_value=0.0, format="%.2f")
         
         st.markdown("**🏦 Direct Reimbursement Bank Segment**")
         bsb = st.text_input("Bank BSB Code (e.g., 000-000)", max_chars=7)
@@ -428,7 +446,6 @@ else:
     for i in range(int(total_receipts_input)):
         st.markdown(f"#### 📄 Receipt Section Item #{i+1}")
         
-        # Explicit multi-column grid partition configuration widths mapping
         r_col1, r_col2, r_col3, r_col4, r_col5 = st.columns([2.5, 2.5, 2, 1.5, 1.5])
 
         with r_col1:
@@ -467,11 +484,9 @@ else:
 
         receipt_records.append({"desc": desc_val, "date": date_val, "amount": total_val, "gst": gst_val})
 
-    # State parameter evaluation logic loops
     calculated_total_claim = sum(r["amount"] for r in receipt_records)
     calculated_total_gst = sum(r["gst"] for r in receipt_records)
     
-    # Mathematical balance verification validation script checks
     is_amount_matching = abs(calculated_total_claim - declared_total_input) < 0.01
     missing_receipts_delta = int(total_receipts_input) - uploaded_files_count
 
@@ -487,17 +502,14 @@ else:
     st.markdown("---")
     st.markdown("### 🛡️ System Submission Safety Validation Checks")
 
-    # Interactive blocking flags initialization parameters
     block_submission = False
 
-    # 1. Verification of line item total amount entries matching claimant expectations
     if not is_amount_matching:
         st.error(f"❌ Total Doesn't Match: The sum of your individual row entries (${calculated_total_claim:.2f}) does not match your typed Total Declared Claim Amount (${declared_total_input:.2f}). Please review row values.")
         block_submission = True
     else:
         st.success("✅ Financial balance validation passed: Claim amounts are matching.")
 
-    # 2. Verification of total line item count matched against physically present files
     if missing_receipts_delta > 0:
         st.warning(f"⚠️ {missing_receipts_delta} Receipt Outstanding: You have stated a total count of {total_receipts_input} receipts, but uploaded only {uploaded_files_count} file assets. Please upload remaining attachments.")
         block_submission = True
@@ -509,7 +521,6 @@ else:
 
     st.markdown("---")
 
-    # Dynamic interface enforcement: submit button is deactivated until validation errors are cleared
     if block_submission:
         st.button("Finalize and Submit Expense Claims Bundle", type="primary", disabled=True, help="Please resolve all structural error/warning notifications above to unlock the submit pipeline.")
     else:
@@ -537,17 +548,14 @@ else:
                 
                 output_filename = f"Expense_Voucher_{name.replace(' ', '_')}.pdf"
                 
-                # Step 1: Compile primary formal ReportLab voucher sheet structure
                 generate_official_voucher_pdf(output_filename, payload, receipt_records)
                 
-                # Step 2: Extract uploaded images or PDFs and stitch them as consecutive backend attachment pages
                 with st.spinner("Stitching file assets into multi-page formal PDF binder format..."):
                     stitch_files_to_pdf(output_filename, raw_files_tracker)
                     
                 st.success("🎉 Comprehensive Claim Payment Voucher Pack compiled successfully with attached file pages!")
                 st.balloons()
                 
-                # ROUTING ENGINE: Delivers directly to dynamic Nazim e Ala and CCs claimant
                 target_email = nazim_info.get("email", "")
                 if target_email:
                     recipient_emails = [target_email]
@@ -565,12 +573,13 @@ else:
                     
                     if success:
                         st.success(f"📧 Outbound Email Dispatched! Delivered directly to Nazim e Ala ({target_email}) and carbon-copied (CC) to claimant address: {claimant_email}")
-                    else:
-                        st.warning("⚠️ Email delivery skipped: No Nazim e Ala email address configured for this region in admin settings.")
-                        pdf_bytes = open(output_filename, "rb").read()
-                        st.download_button(
-                        label="📥 Download Official Summary Voucher PDF File",
-                        data=pdf_bytes,
-                        file_name=output_filename,
-                        mime="application/pdf"
-                        )
+                else:
+                    st.warning("⚠️ Email delivery skipped: No Nazim e Ala email address configured for this region in admin settings.")
+                
+                pdf_bytes = open(output_filename, "rb").read()
+                st.download_button(
+                    label="📥 Download Official Summary Voucher PDF File",
+                    data=pdf_bytes,
+                    file_name=output_filename,
+                    mime="application/pdf"
+                )
