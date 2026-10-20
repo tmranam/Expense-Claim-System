@@ -77,7 +77,7 @@ def save_admin_settings(config_data):
 # Initialize settings in state
 if 'admin_lists' not in st.session_state:
     st.session_state.admin_lists = load_admin_settings()
-    # -------------------------------------------------------------------------
+# -------------------------------------------------------------------------
 # OPTIMIZED WORKING OCR ENGINE WITH DATE IDENTIFICATION
 # -------------------------------------------------------------------------
 def parse_receipt_image(uploaded_file):
@@ -147,7 +147,7 @@ def generate_official_voucher_pdf(filename, data, receipts):
     story.append(Paragraph("Expense Payment Voucher", header_subtitle_style))
     story.append(Spacer(1, 10))
     
-    # Block A: Header profiles allocation alignment grid
+    # Block A: Header profiles allocation alignment grid (Total = 540 points)
     header_data = [
         [Paragraph("<b>Payee Name:</b>", cell_style), Paragraph(data['name'], cell_style), Paragraph("<b>Voucher No:</b>", cell_style), Paragraph("", cell_style)],
         [Paragraph("<b>Expense Type:</b>", cell_style), Paragraph(data['expense_type'], cell_style), Paragraph("<b>BSB:</b>", cell_style), Paragraph(data['bsb'], cell_style)],
@@ -156,7 +156,7 @@ def generate_official_voucher_pdf(filename, data, receipts):
         [Paragraph("<b>Majlis:</b>", cell_style), Paragraph(data['majlis'], cell_style), Paragraph("<b>Advance Issued:</b>", cell_style), Paragraph("", cell_style)]
     ]
     
-    t_header = Table(header_data, colWidths=)
+    t_header = Table(header_data, colWidths=[90, 210, 90, 150])  # FIXED
     t_header.setStyle(TableStyle([
         ('GRID', (0,0), (-1,-1), 1, colors.black),
         ('VALIGN', (0,0), (-1,-1), 'MIDDLE'),
@@ -165,7 +165,7 @@ def generate_official_voucher_pdf(filename, data, receipts):
     story.append(t_header)
     story.append(Spacer(1, 15))
     
-    # Block B: Dynamic receipt row allocation matrix expansion loop
+    # Block B: Dynamic receipt row allocation matrix expansion loop (Total = 540 points)
     receipt_table_data = [[Paragraph("<b>#</b>", cell_bold_style), Paragraph("<b>Date</b>", cell_bold_style), Paragraph("<b>Description</b>", cell_bold_style), Paragraph("<b>Total amount</b>", cell_bold_style), Paragraph("<b>GST</b>", cell_bold_style)]]
     
     total_agg_amount = 0.0
@@ -190,7 +190,7 @@ def generate_official_voucher_pdf(filename, data, receipts):
             
     receipt_table_data.append([Paragraph("<b>Total</b>", cell_bold_style), "", "", Paragraph(f"<b>${total_agg_amount:.2f}</b>", cell_bold_style), Paragraph(f"<b>${total_agg_gst:.2f}</b>", cell_bold_style)])
     
-    t_receipts = Table(receipt_table_data, colWidths=)
+    t_receipts = Table(receipt_table_data, colWidths=[30, 80, 250, 90, 90])  # FIXED
     t_receipts.setStyle(TableStyle([
         ('GRID', (0,0), (-1,-1), 1, colors.black),
         ('VALIGN', (0,0), (-1,-1), 'MIDDLE'),
@@ -201,7 +201,7 @@ def generate_official_voucher_pdf(filename, data, receipts):
     story.append(t_receipts)
     story.append(Spacer(1, 15))
     
-    # Block C: Sign-off configuration block elements
+    # Block C: Sign-off configuration block elements (Total = 540 points)
     signoff_data = [
         [Paragraph("<b>Requested by:</b>", cell_bold_style), Paragraph("<b>Reviewed by Nazime A'la:</b>", cell_bold_style)],
         [Paragraph(f"Name: {data['name']}", cell_style), Paragraph(f"Name: {data['nazim_name']}", cell_style)],
@@ -213,7 +213,7 @@ def generate_official_voucher_pdf(filename, data, receipts):
         [Paragraph("Date:", cell_style), Paragraph("Date:", cell_style)],
     ]
     
-    t_signoff = Table(signoff_data, colWidths=)
+    t_signoff = Table(signoff_data, colWidths=[270, 270])  # FIXED
     t_signoff.setStyle(TableStyle([
         ('GRID', (0,0), (-1,-1), 1, colors.black),
         ('BACKGROUND', (0,0), (1,0), colors.lightgrey),
