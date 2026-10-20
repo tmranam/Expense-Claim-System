@@ -3,7 +3,7 @@ import re
 import json
 import os
 import shutil
-from PIL import Image
+from PIL import Image, ImageOps
 import pytesseract
 from reportlab.lib.pagesizes import letter
 from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle
@@ -13,19 +13,24 @@ from reportlab.lib import colors
 # -------------------------------------------------------------------------
 # DEFENSIVE LINUX PATH ANCHORING FOR STREAMLIT CLOUD INFRASTRUCTURE
 # -------------------------------------------------------------------------
-# Search the server architecture directly for the native tesseract install path
 detected_path = shutil.which("tesseract")
 if detected_path:
     pytesseract.pytesseract.tesseract_cmd = detected_path
 else:
-    # Standard fallback path assignment for free tier cloud architecture
     pytesseract.pytesseract.tesseract_cmd = "/usr/bin/tesseract"
 
 CONFIG_FILE = "admin_config.json"
+
+# Relational mapping framework configuration dictionary supporting dynamic dependencies
 DEFAULT_CONFIG = {
-    "regions": ["National", "Region North", "Region South", "Region East", "Region West"],
-    "majlis": ["Head Office", "Finance Dept", "Youth Majlis", "Local Chapter A"],
-    "emails": ["finance@example.com", "approvals@example.com"]
+    "regions": ["National", "Region North", "Region South"],
+    "regional_majlis": {
+        "National": ["Head Office", "Finance Dept"],
+        "Region North": ["Youth Majlis North", "Local Chapter A"],
+        "Region South": ["Youth Majlis South", "Local Chapter B"]
+    },
+    "emails": ["finance@example.com", "approvals@example.com"],
+    "admin_password": "AdminPassword123"
 }
 
 # -------------------------------------------------------------------------
@@ -36,7 +41,12 @@ def load_admin_settings():
     if os.path.exists(CONFIG_FILE):
         try:
             with open(CONFIG_FILE, "r") as f:
-                return json.load(f)
+                data = json.load(f)
+                if "regional_majlis" not in data:
+                    data["regional_majlis"] = DEFAULT_CONFIG["regional_majlis"]
+                if "admin_password" not in data:
+                    data["admin_password"] = DEFAULT_CONFIG["admin_password"]
+                return data
         except Exception:
             return DEFAULT_CONFIG
     return DEFAULT_CONFIG
@@ -51,10 +61,8 @@ if 'admin_lists' not in st.session_state:
     st.session_state.admin_lists = load_admin_settings()
 
 # -------------------------------------------------------------------------
-# OPTIMIZED OCR PARSER & PDF GENERATOR
+# OPTIMIZED WORKING OCR ENGINE LOGIC
 # -------------------------------------------------------------------------
-from PIL import Image, ImageOps
-
 def parse_receipt_image(uploaded_file):
     """Returns (description, total, gst, raw_text)."""
     try:
@@ -63,13 +71,12 @@ def parse_receipt_image(uploaded_file):
         image = ImageOps.exif_transpose(image)   # fixes sideways phone photos
         image.thumbnail((2000, 2000))
 
-        # Gentle preprocessing: Tesseract binarizes well on its own,
-        # a hard 140 cutoff often wipes out faint receipt text.
+        # Gentle preprocessing: Tesseract binarizes well on its own
         gray = ImageOps.autocontrast(image.convert("L"))
 
         raw_text = pytesseract.image_to_string(gray, config="--psm 6").lower()
 
-        # Fix "12 .50" / "12. 50" style breaks, but only on the SAME line
+        # Fix "12 .50" / "12. 50" style breaks on the same line
         text = re.sub(r'(?<=\d)[ \t]*([.,])[ \t]*(?=\d{2}\b)', r'\1', raw_text)
 
         amounts = []
@@ -96,6 +103,7 @@ def parse_receipt_image(uploaded_file):
         return description, total_amount, gst_amount, raw_text
     except Exception as e:
         return "Scan failed", 0.0, 0.0, f"ERROR: {e}"
+
 def generate_pdf(filename, data, receipts):
     """Compiles a clean document statement using ReportLab canvas flowables."""
     doc = SimpleDocTemplate(filename, pagesize=letter)
@@ -150,6 +158,7 @@ def generate_pdf(filename, data, receipts):
     story.append(t_receipts)
     
     doc.build(story)
+
 # -------------------------------------------------------------------------
 # INTERFACE FRONT-END DESIGN
 # -------------------------------------------------------------------------
@@ -158,32 +167,62 @@ st.set_page_config(page_title="Expense Portal (Cloud Ready)", layout="wide")
 # Navigation Sidebar
 app_mode = st.sidebar.selectbox("Navigate Mode", ["User Claim Portal", "Admin Panel Configuration"])
 
+# -------------------------------------------------------------------------
+# PASSWORD-PROTECTED SECURE ADMIN INTERFACE PANEL
+# -------------------------------------------------------------------------
 if app_mode == "Admin Panel Configuration":
     st.title("⚙️ Admin Control Panel")
-    st.info("Settings adjusted here are saved to disk to stay persistent across free server cycles.")
     
-    regions_text = st.text_area("Regions (One entry per line)", value="\n".join(st.session_state.admin_lists["regions"]))
-    majlis_text = st.text_area("Majlis / Offices (One entry per line)", value="\n".join(st.session_state.admin_lists["majlis"]))
-    emails_text = st.text_area("Notification Emails (One entry per line)", value="\n".join(st.session_state.admin_lists["emails"]))
+    pwd_input = st.text_input("Enter Master Admin Access Key Password", type="password")
     
-    if st.button("Save System Lists Updates", type="primary"):
-        updated_config = {
-            "regions": [line.strip() for line in regions_text.split("\n") if line.strip()],
-            "majlis": [line.strip() for line in majlis_text.split("\n") if line.strip()],
-            "emails": [line.strip() for line in emails_text.split("\n") if line.strip()]
-        }
-        save_admin_settings(updated_config)
-        st.session_state.admin_lists = updated_config
-        st.success("Admin updates written permanently to cloud storage successfully!")
-
+    if pwd_input == st.session_state.admin_lists.get("admin_password", "AdminPassword123"):
+        st.success("Access Verified. Secure Configuration Screen Unlocked.")
+        
+        new_pwd = st.text_input("Modify System Admin Password Key", value=st.session_state.admin_lists.get("admin_password", "AdminPassword123"))
+        regions_text = st.text_area("Regions Master List Configuration (One entry per line)", value="\n".join(st.session_state.admin_lists["regions"]))
+        
+        st.markdown("#### 🔄 Relational Majlis Mapping Schema Matrix (JSON Format)")
+        current_map_json = json.dumps(st.session_state.admin_lists["regional_majlis"], indent=4)
+        majlis_json_text = st.text_area("Majlis Relational JSON Schema Payload", value=current_map_json, height=220)
+        
+        emails_text = st.text_area("Notification Distribution Target Emails (One entry per line)", value="\n".join(st.session_state.admin_lists["emails"]))
+        
+        if st.button("Save System Configuration Schema Matrix", type="primary"):
+            try:
+                parsed_majlis_map = json.loads(majlis_json_text)
+                parsed_regions_list = [line.strip() for line in regions_text.split("\n") if line.strip()]
+                
+                updated_config = {
+                    "regions": parsed_regions_list,
+                    "regional_majlis": parsed_majlis_map,
+                    "emails": [line.strip() for line in emails_text.split("\n") if line.strip()],
+                    "admin_password": new_pwd.strip()
+                }
+                
+                save_admin_settings(updated_config)
+                st.session_state.admin_lists = updated_config
+                st.success("Global application schema matrix written to storage successfully!")
+            except json.JSONDecodeError:
+                st.error("JSON Evaluation Error: Failed to compile the Majlis schema. Check key quote marks and trailing commas.")
+    elif pwd_input != "":
+        st.error("Access Refused: Secure validation key does not match records.")
+        # -------------------------------------------------------------------------
+# INTERACTIVE CLAIM FORM LAYOUT PANEL
+# -------------------------------------------------------------------------
 else:
     st.title("📋 Online Expense Claim Submission System")
     
     col1, col2 = st.columns(2)
     with col1:
         name = st.text_input("Full Employee / Claimant Name")
-        region = st.selectbox("Select Region / National Location", options=st.session_state.admin_lists["regions"])
-        majlis = st.selectbox("Select Majlis / Office Destination", options=st.session_state.admin_lists["majlis"])
+        
+        configured_regions = st.session_state.admin_lists["regions"]
+        region = st.selectbox("Select Region / National Location", options=configured_regions)
+        
+        majlis_lookup_map = st.session_state.admin_lists["regional_majlis"]
+        available_majlis_options = majlis_lookup_map.get(region, ["No entries declared under this region boundary"])
+        
+        majlis = st.selectbox("Select Respective Residing Majlis / Office Destination", options=available_majlis_options)
         account = st.text_input("General Ledger / Tracking Account Code")
         
     with col2:
@@ -200,7 +239,7 @@ else:
     
     for i in range(int(total_receipts_input)):
         st.markdown(f"#### 📄 Receipt Section Item #{i+1}")
-        r_col1, r_col2, r_col3, r_col4 = st.columns([2, 2, 1, 1])
+        r_col1, r_col2, r_col3, r_col4 = st.columns()
 
         with r_col1:
             uploaded_file = st.file_uploader(
@@ -208,7 +247,8 @@ else:
                 type=["png", "jpg", "jpeg"], key=f"file_{i}"
             )
 
-        # Scan only when a NEW file arrives, and push results into widget state
+        initial_desc, initial_total, initial_gst = "No file parsed", 0.0, 0.0
+
         if uploaded_file is not None:
             sig = f"{uploaded_file.name}_{uploaded_file.size}"
             if st.session_state.get(f"sig_{i}") != sig:
@@ -262,3 +302,4 @@ else:
                 file_name=output_filename,
                 mime="application/pdf"
             )
+
