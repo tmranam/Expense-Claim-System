@@ -395,7 +395,7 @@ if app_mode == "Admin Panel Configuration":
             st.session_state.admin_lists = updated_config
             st.success("Global application schema configuration matrix updated successfully!")
             st.rerun()
-      # -------------------------------------------------------------------------
+# -------------------------------------------------------------------------
 # INTERACTIVE CLAIM FORM LAYOUT PANEL
 # -------------------------------------------------------------------------
 else:
@@ -434,7 +434,8 @@ else:
     for i in range(int(total_receipts_input)):
         st.markdown(f"#### 📄 Receipt Section Item #{i+1}")
         
-        r_col1, r_col2, r_col3, r_col4, r_col5 = st.columns()
+        # --- FIXED PARAMETER GRID INJECTED BELOW ---
+        r_col1, r_col2, r_col3, r_col4, r_col5 = st.columns([2.5, 2.5, 2, 1.5, 1.5])
 
         with r_col1:
             uploaded_file = st.file_uploader(
@@ -495,10 +496,10 @@ else:
             
             output_filename = f"Expense_Voucher_{name.replace(' ', '_')}.pdf"
             
-            # Step 1: Compile the primary formal ReportLab voucher sheet structure
+            # Step 1: Compile primary formal ReportLab voucher sheet structure
             generate_official_voucher_pdf(output_filename, payload, receipt_records)
             
-            # Step 2: Extract uploaded images and stitch them as consecutive back-end attachments pages
+            # Step 2: Extract uploaded images and stitch them as consecutive backend attachment pages
             with st.spinner("Stitching image assets into multi-page formal PDF binder format..."):
                 stitch_receipt_images_to_pdf(output_filename, raw_files_tracker)
                 
@@ -532,5 +533,4 @@ else:
                 data=pdf_bytes,
                 file_name=output_filename,
                 mime="application/pdf"
-            )      
-    
+            )
