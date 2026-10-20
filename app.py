@@ -77,7 +77,7 @@ def parse_receipt_image(uploaded_file):
         gst_amount = 0.0
         if "gst" in cleaned_text or "tax" in cleaned_text:
             gst_matches = re.findall(r'(?:gst|tax)\s*(?:\$?)\s*(\d+[\.,]\d{2})', cleaned_text)
-            # FIXED: Verify the regex group list actually contains an element before parsing it
+            # FIXED: Safely fetch the first indexed group out of the list
             if gst_matches and len(gst_matches) > 0:
                 gst_amount = float(gst_matches[0].replace(',', '.'))
             else:
@@ -95,6 +95,7 @@ def parse_receipt_image(uploaded_file):
         return description, total_amount, gst_amount
     except Exception as e:
         return "Scan read error", 0.0, 0.0
+
 def generate_pdf(filename, data, receipts):
     """Compiles a clean document statement using ReportLab canvas flowables."""
     doc = SimpleDocTemplate(filename, pagesize=letter)
@@ -149,7 +150,6 @@ def generate_pdf(filename, data, receipts):
     story.append(t_receipts)
     
     doc.build(story)
-
 # -------------------------------------------------------------------------
 # INTERFACE FRONT-END DESIGN
 # -------------------------------------------------------------------------
