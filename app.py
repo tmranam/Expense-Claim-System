@@ -205,7 +205,7 @@ else:
         bsb = st.text_input("Bank BSB Code (e.g., 000-000)", max_chars=7)
         acc_num = st.text_input("Account Number")
 
-    st.markdown("---")
+       st.markdown("---")
     st.subheader("📎 Individual Itemized Receipt Image Ingestion Block")
     
     receipt_records = []
@@ -216,11 +216,9 @@ else:
         
         with r_col1:
             uploaded_file = st.file_uploader(f"Upload Image Asset for Receipt #{i+1}", type=["png", "jpg", "jpeg"], key=f"file_{i}")
-            initial_desc, initial_total, initial_gst = "No file parsed", 0.0, 0.0
-  # Default parameter state
+        
         initial_desc, initial_total, initial_gst = "No file parsed", 0.0, 0.0
         
-        # --- FIXED BLOCK INDENTATION BELOW ---
         if uploaded_file is not None:
             with st.spinner(f"Scanning document #{i+1}..."):
                 initial_desc, initial_total, initial_gst = parse_receipt_image(uploaded_file)
@@ -231,30 +229,34 @@ else:
             total_val = st.number_input(f"Amount ($) #{i+1}", min_value=0.0, value=float(initial_total), format="%.2f", key=f"amt_{i}")
         with r_col4:
             gst_val = st.number_input(f"GST ($) #{i+1}", min_value=0.0, value=float(initial_gst), format="%.2f", key=f"gst_{i}")
-            receipt_records.append({"desc": desc_val, "amount": total_val, "gst": gst_val})
-        if st.button("Finalize and Submit Expense Claims Bundle", type="primary"):
-            if not name or not bsb or not acc_num:
-                st.error("Submission Denied: Profile details, BSB, and Account Numbers must be filled out.")
-            else:
-                payload = {
-                "name": name,
-                "region": region,
-                "majlis": majlis,
+            
+        receipt_records.append({"desc": desc_val, "amount": total_val, "gst": gst_val})
+
+    # --- ONLY ONE FINALIZE BUTTON ALLOWED ---
+    if st.button("Finalize and Submit Expense Claims Bundle", type="primary"):
+        if not name or not bsb or not acc_num:
+            st.error("Submission Denied: Profile details, BSB, and Account Numbers must be filled out.")
+        else:
+            payload = {
+                "name": name, 
+                "region": region, 
+                "majlis": majlis, 
                 "account": account,
-                "total_receipts": total_receipts_input,
+                "total_receipts": total_receipts_input, 
                 "total_amount": total_amount_input,
-                "bsb": bsb,
+                "bsb": bsb, 
                 "acc_num": acc_num
-                }
-output_filename = "Expense_Claim_Statement.pdf"
-generate_pdf(output_filename, payload, receipt_records)
-st.success("🎉 Claim Bundle Form processed successfully!")
-st.balloons()
-st.info(f"📧 Simulation Email Sent: PDF dispatched to targets: {', '.join(st.session_state.admin_lists['emails'])}")
-pdf_bytes = open(output_filename, "rb").read()
-st.download_button(
-label="📥 Download Generated Summary Receipt PDF File",
-data=pdf_bytes,
-file_name=output_filename,
-mime="application/pdf"
-)
+            }
+            output_filename = "Expense_Claim_Statement.pdf"
+            generate_pdf(output_filename, payload, receipt_records)
+            st.success("🎉 Claim Bundle Form processed successfully!")
+            st.balloons()
+            st.info(f"📧 Simulation Email Sent: PDF dispatched to targets: {', '.join(st.session_state.admin_lists['emails'])}")
+            
+            pdf_bytes = open(output_filename, "rb").read()
+            st.download_button(
+                label="📥 Download Generated Summary Receipt PDF File",
+                data=pdf_bytes,
+                file_name=output_filename,
+                mime="application/pdf"
+            )
