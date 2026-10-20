@@ -3,6 +3,11 @@ import re
 import json
 import os
 import shutil
+import smtplib
+from email.mime.multipart import MIMEMultipart
+from email.mime.text import MIMEText
+from email.mime.base import MIMEBase
+from email import encoders
 from PIL import Image, ImageOps
 import pytesseract
 from reportlab.lib.pagesizes import letter
@@ -30,7 +35,11 @@ DEFAULT_CONFIG = {
         "Region South": ["Youth Majlis South", "Local Chapter B"]
     },
     "emails": ["finance@example.com", "approvals@example.com"],
-    "admin_password": "123"
+    "admin_password": "123",
+    "smtp_server": "://gmail.com",
+    "smtp_port": 587,
+    "smtp_user": "your_email@gmail.com",
+    "smtp_password": ""
 }
 
 # -------------------------------------------------------------------------
@@ -52,6 +61,14 @@ def load_admin_settings():
                     data["admin_password"] = DEFAULT_CONFIG["admin_password"]
                 if "emails" not in data:
                     data["emails"] = DEFAULT_CONFIG["emails"]
+                if "smtp_server" not in data:
+                    data["smtp_server"] = DEFAULT_CONFIG["smtp_server"]
+                if "smtp_port" not in data:
+                    data["smtp_port"] = DEFAULT_CONFIG["smtp_port"]
+                if "smtp_user" not in data:
+                    data["smtp_user"] = DEFAULT_CONFIG["smtp_user"]
+                if "smtp_password" not in data:
+                    data["smtp_password"] = DEFAULT_CONFIG["smtp_password"]
                 return data
         except Exception:
             return DEFAULT_CONFIG
@@ -65,7 +82,6 @@ def save_admin_settings(config_data):
 # Initialize settings in state
 if 'admin_lists' not in st.session_state:
     st.session_state.admin_lists = load_admin_settings()
-
 # -------------------------------------------------------------------------
 # OPTIMIZED WORKING OCR ENGINE LOGIC
 # -------------------------------------------------------------------------
@@ -164,13 +180,52 @@ def generate_pdf(filename, data, receipts):
     story.append(t_receipts)
     
     doc.build(story)
+# -------------------------------------------------------------------------
+# DIRECT EMAIL OUTBOUND DISPATCH ENGINE (SMTP)
+# -------------------------------------------------------------------------
+def dispatch_real_email(recipient_list, subject_text, body_text, attachment_path):
+    """Logs into configured SMTP engine server to transmit automated summary file payloads."""
+    smtp_info = st.session_state.admin_lists
+    
+    if not smtp_info.get("smtp_user") or not smtp_info.get("smtp_password"):
+        st.error("⚠️ Real Delivery Skipped: Outbound SMTP User Email and Password keys must be filled out on the Admin Configuration screen.")
+        return False
+        
+    try:
+        msg = MIMEMultipart()
+        msg['From'] = smtp_info["smtp_user"]
+        msg['To'] = ", ".join(recipient_list)
+        msg['Subject'] = subject_text
+        
+        msg.attach(MIMEText(body_text, 'plain'))
+        
+        if os.path.exists(attachment_path):
+            with open(attachment_path, "rb") as attachment:
+                part = MIMEBase("application", "octet-stream")
+                part.set_payload(attachment.read())
+                
+            encoders.encode_base64(part)
+            part.add_header(
+                "Content-Disposition",
+                f"attachment; filename= {os.path.basename(attachment_path)}",
+            )
+            msg.attach(part)
+        
+        server = smtplib.SMTP(smtp_info["smtp_server"], smtp_info["smtp_port"])
+        server.starttls()
+        server.login(smtp_info["smtp_user"], smtp_info["smtp_password"])
+        server.sendmail(smtp_info["smtp_user"], recipient_list, msg.as_string())
+        server.quit()
+        return True
+    except Exception as email_err:
+        st.error(f"❌ Failed to dispatch email via mail network relay servers. Internal Error details: {email_err}")
+        return False
 
 # -------------------------------------------------------------------------
 # INTERFACE FRONT-END DESIGN
 # -------------------------------------------------------------------------
 st.set_page_config(page_title="Expense Portal (Cloud Ready)", layout="wide")
 
-# Navigation Sidebar
 app_mode = st.sidebar.selectbox("Navigate Mode", ["User Claim Portal", "Admin Panel Configuration"])
 
 # -------------------------------------------------------------------------
@@ -186,7 +241,6 @@ if app_mode == "Admin Panel Configuration":
         
         new_pwd = st.text_input("Modify System Admin Password Key", value=st.session_state.admin_lists.get("admin_password", "AdminPassword123"))
         
-        # 1. Master configurations for Regions
         regions_text = st.text_area("Regions Master List Configuration (One entry per line)", value="\n".join(st.session_state.admin_lists["regions"]))
         parsed_regions_list = [line.strip() for line in regions_text.split("\n") if line.strip()]
         
@@ -206,16 +260,12 @@ if app_mode == "Admin Panel Configuration":
         st.markdown("#### ✉️ Target Email Assignment Matrix")
         st.caption("Route form notifications dynamically based on user selections.")
         
-        # Admin selects a specific Region + Majlis to attach custom emails
         email_region_select = st.selectbox("Step 1: Pick Target Region for Emails", options=parsed_regions_list, key="email_reg")
-        
-        # Safely extract currently loaded majlis items for this region to populate dropdown
         available_majlis_for_email = parsed_majlis_list if email_region_select == selected_admin_region else current_map.get(email_region_select, [])
         
         if available_majlis_for_email:
             email_majlis_select = st.selectbox(f"Step 2: Pick Target Majlis in '{email_region_select}'", options=available_majlis_for_email)
             
-            # Key format matching schema logic: "RegionName|MajlisName"
             routing_key = f"{email_region_select}|{email_majlis_select}"
             current_routing_map = st.session_state.admin_lists.get("targeted_emails", {})
             existing_emails = current_routing_map.get(routing_key, [])
@@ -228,11 +278,18 @@ if app_mode == "Admin Panel Configuration":
             parsed_majlis_emails = []
 
         st.markdown("---")
-        # Global fallback distribution targets
         emails_text = st.text_area("Global Fallback Emails (Used if no specific Majlis email is set)", value="\n".join(st.session_state.admin_lists.get("emails", [])))
         
+        st.markdown("---")
+        st.markdown("#### 🔐 Outbound live SMTP Server Credentials Gateway")
+        st.caption("Enter the outbound operational account details responsible for distributing system emails.")
+        
+        smtp_srv = st.text_input("SMTP Server Relay Node Hostname", value=st.session_state.admin_lists.get("smtp_server", "://gmail.com"))
+        smtp_prt = st.number_input("SMTP Server TLS Port Number", value=int(st.session_state.admin_lists.get("smtp_port", 587)), step=1)
+        smtp_usr = st.text_input("Sender User Authentication Email Address ID (e.g., info@yourorg.com)", value=st.session_state.admin_lists.get("smtp_user", ""))
+        smtp_pwd = st.text_input("Sender Account App Password Access Key", value=st.session_state.admin_lists.get("smtp_password", ""), type="password")
+        
         if st.button("Save System Configuration Schema Matrix", type="primary"):
-            # Update the regional majlis mappings
             updated_map = dict(current_map)
             updated_map[selected_admin_region] = parsed_majlis_list
             updated_map = {k: v for k, v in updated_map.items() if k in parsed_regions_list}
@@ -240,12 +297,10 @@ if app_mode == "Admin Panel Configuration":
                 if r not in updated_map:
                     updated_map[r] = []
             
-            # Update the targeted routing matrix mappings 
             updated_routing_map = dict(st.session_state.admin_lists.get("targeted_emails", {}))
             if routing_key:
                 updated_routing_map[routing_key] = parsed_majlis_emails
                 
-            # Clean obsolete keys out of database if region name changes or gets deleted
             valid_routing_map = {}
             for key, emails in updated_routing_map.items():
                 if "|" in key:
@@ -258,17 +313,22 @@ if app_mode == "Admin Panel Configuration":
                 "regional_majlis": updated_map,
                 "targeted_emails": valid_routing_map,
                 "emails": [line.strip() for line in emails_text.split("\n") if line.strip()],
-                "admin_password": new_pwd.strip()
+                "admin_password": new_pwd.strip(),
+                "smtp_server": smtp_srv.strip(),
+                "smtp_port": int(smtp_prt),
+                "smtp_user": smtp_usr.strip(),
+                "smtp_password": smtp_pwd.strip()
             }
             
             save_admin_settings(updated_config)
             st.session_state.admin_lists = updated_config
-            st.success("Global application schema matrix and routing pipelines successfully written!")
+            st.success("Global application schema matrix and mail gateway routing configurations successfully written!")
             st.rerun()
             
     elif pwd_input != "":
         st.error("Access Refused: Secure validation key does not match records.")
-# -------------------------------------------------------------------------
+        
+    # -------------------------------------------------------------------------
 # INTERACTIVE CLAIM FORM LAYOUT PANEL
 # -------------------------------------------------------------------------
 else:
@@ -304,7 +364,6 @@ else:
     for i in range(int(total_receipts_input)):
         st.markdown(f"#### 📄 Receipt Section Item #{i+1}")
         
-        # --- FIXED ST.COLUMNS PARAMETER ---
         r_col1, r_col2, r_col3, r_col4 = st.columns([2, 2, 1, 1])
 
         with r_col1:
@@ -363,13 +422,24 @@ else:
             lookup_key = f"{region}|{majlis}"
             targeted_routing_map = st.session_state.admin_lists.get("targeted_emails", {})
             
-            # Fetch specifically mapped emails, or default back to global list if empty
             recipient_emails = targeted_routing_map.get(lookup_key, [])
+            is_fallback = False
             if not recipient_emails:
                 recipient_emails = st.session_state.admin_lists.get("emails", [])
-                st.info(f"📧 Simulation Email Sent: (Fallback Used) PDF dispatched to targets: {', '.join(recipient_emails)}")
+                is_fallback = True
+                
+            if recipient_emails:
+                subject = f"New Expense Claim Submission - {name} ({region})"
+                body = f"Hello,\n\nA new expense claim statement summary pack has been compiled and submitted by {name} for the '{majlis}' branch of '{region}' region.\n\nPlease find the summary document statement sheet attached below.\n\nBest regards,\nAutomated Expense Portal Gateway"
+                
+                with st.spinner("Transmitting secure PDF files bundle across outbound networks..."):
+                    success = dispatch_real_email(recipient_emails, subject, body, output_filename)
+                
+                if success:
+                    routing_type = "Fallback" if is_fallback else "Targeted Match"
+                    st.success(f"📧 Outbound Email Dispatched! ({routing_type}) PDF successfully delivered to: {', '.join(recipient_emails)}")
             else:
-                st.info(f"🎯 Simulation Email Sent: (Targeted Match) PDF dispatched to targets: {', '.join(recipient_emails)}")
+                st.warning("⚠️ Email transmission skipped: No email recipients defined in system settings.")
             
             pdf_bytes = open(output_filename, "rb").read()
             st.download_button(
