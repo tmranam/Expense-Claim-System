@@ -106,7 +106,7 @@ def parse_receipt_image(uploaded_file):
         if "gst" in text or "tax" in text:
             gst_numbers = re.findall(r'(?:gst|tax)[^\d\n]*(\d+[.,]\d{2})', text)
             if gst_numbers:
-                gst_amount = float(gst_numbers[0].replace(',', '.'))
+                gst_amount = float(gst_numbers.replace(',', '.'))
             else:
                 gst_amount = round(total_amount / 11, 2)
 
@@ -139,10 +139,13 @@ def generate_official_voucher_pdf(filename, data, receipts):
     header_subtitle_style = ParagraphStyle('HeadSub', fontName='Helvetica-Bold', fontSize=12, alignment=1, spaceAfter=2)
     dept_style = ParagraphStyle('Dept', fontName='Helvetica', fontSize=11, alignment=1, spaceAfter=2)
     doc_title_style = ParagraphStyle('DocTitle', fontName='Helvetica-Bold', fontSize=13, alignment=1, spaceAfter=15)
+    
+    # --- FIXED CENTERING ALIGNMENT FOR TOP TASMIYAH LINE ---
+    top_line_style = ParagraphStyle('TopLine', fontName='Helvetica-Oblique', fontSize=9, leading=11, alignment=1, spaceAfter=4)
     cell_style = ParagraphStyle('Cell', fontName='Helvetica', fontSize=9, leading=11)
     cell_bold_style = ParagraphStyle('CellB', fontName='Helvetica-Bold', fontSize=9, leading=11)
     
-    story.append(Paragraph("<i>In the name of Allah, the gracious, the merciful</i>", cell_style))
+    story.append(Paragraph("In the name of Allah, the gracious, the merciful", top_line_style))
     story.append(Paragraph("MAJLIS ANSARULLAH AUSTRALIA", header_title_style))
     story.append(Paragraph("Department of Mal", dept_style))
     story.append(Paragraph("Expense Payment Voucher", header_subtitle_style))
@@ -157,7 +160,7 @@ def generate_official_voucher_pdf(filename, data, receipts):
         [Paragraph("<b>Majlis:</b>", cell_style), Paragraph(data['majlis'], cell_style), Paragraph("<b>Advance Issued:</b>", cell_style), Paragraph("", cell_style)]
     ]
     
-    t_header = Table(header_data, colWidths=[100, 170, 110, 160])
+    t_header = Table(header_data, colWidths=[100, 240, 100, 100])
     t_header.setStyle(TableStyle([
         ('GRID', (0,0), (-1,-1), 1, colors.black),
         ('VALIGN', (0,0), (-1,-1), 'MIDDLE'),
