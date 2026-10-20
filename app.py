@@ -3,7 +3,12 @@ import re
 import json
 import os
 import shutil
+import smtplib
 from datetime import datetime
+from email.mime.multipart import MIMEMultipart
+from email.mime.text import MIMEText
+from email.mime.base import MIMEBase
+from email import encoders
 from PIL import Image, ImageOps
 import pytesseract
 from reportlab.lib.pagesizes import letter
@@ -22,7 +27,7 @@ else:
 
 CONFIG_FILE = "admin_config.json"
 
-# Relational mapping framework configuration dictionary supporting extended dependencies
+# Relational mapping framework configuration dictionary updated for Majlis Ansarullah Australia
 DEFAULT_CONFIG = {
     "regions": ["National", "Region North", "Region South"],
     "regional_majlis": {
@@ -32,10 +37,16 @@ DEFAULT_CONFIG = {
     },
     "emails": ["finance@example.com", "approvals@example.com"],
     "admin_password": "123",
-    "regional_details": {
-        "National": {"nazim_name": "Tahir Ahmad", "nazim_email": "nazim.national@example.com", "sadr_majlis": "Sadr Sahib National", "qaid_mal": "Qaid Mal National"},
-        "Region North": {"nazim_name": "Naseer Ahmad", "nazim_email": "nazim.north@example.com", "sadr_majlis": "Sadr Sahib North", "qaid_mal": "Qaid Mal North"},
-        "Region South": {"nazim_name": "Mansoor Ahmad", "nazim_email": "nazim.south@example.com", "sadr_majlis": "Sadr Sahib South", "qaid_mal": "Qaid Mal South"}
+    "smtp_server": "://gmail.com",
+    "smtp_port": 587,
+    "smtp_user": "claimsubmissionmaaa@gmail.com",
+    "smtp_password": "",
+    "qaid_mal_name": "Tahir Mahmood Rana",
+    "sadr_maa_name": "Abdul Jamil Mubbashar",
+    "regional_nazims": {
+        "National": {"name": "National Representative", "email": "nationalnazim@example.com"},
+        "Region North": {"name": "Nazim North", "email": "northnazim@example.com"},
+        "Region South": {"name": "Nazim South", "email": "southnazim@example.com"}
     }
 }
 
@@ -50,16 +61,9 @@ def load_admin_settings():
                 data = json.load(f)
                 
                 # --- FIXED CRITICAL FALLBACK STRUCTURE CHECKS ---
-                if "regions" not in data or not data["regions"]:
-                    data["regions"] = DEFAULT_CONFIG["regions"]
-                if "regional_majlis" not in data or not data["regional_majlis"]:
-                    data["regional_majlis"] = DEFAULT_CONFIG["regional_majlis"]
-                if "admin_password" not in data:
-                    data["admin_password"] = DEFAULT_CONFIG["admin_password"]
-                if "emails" not in data:
-                    data["emails"] = DEFAULT_CONFIG["emails"]
-                if "regional_details" not in data:
-                    data["regional_details"] = DEFAULT_CONFIG["regional_details"]
+                for key in DEFAULT_CONFIG:
+                    if key not in data or not data[key]:
+                        data[key] = DEFAULT_CONFIG[key]
                 return data
         except Exception:
             return DEFAULT_CONFIG
@@ -73,11 +77,11 @@ def save_admin_settings(config_data):
 # Initialize settings in state
 if 'admin_lists' not in st.session_state:
     st.session_state.admin_lists = load_admin_settings()
- # -------------------------------------------------------------------------
-# OPTIMIZED WORKING OCR ENGINE LOGIC
+# -------------------------------------------------------------------------
+# OPTIMIZED WORKING OCR ENGINE WITH DATE IDENTIFICATION
 # -------------------------------------------------------------------------
 def parse_receipt_image(uploaded_file):
-    """Returns (description, total, gst, inferred_date, raw_text)."""
+    """Returns (description, total, gst, receipt_date, raw_text)."""
     try:
         uploaded_file.seek(0)
         image = Image.open(uploaded_file)
@@ -89,6 +93,7 @@ def parse_receipt_image(uploaded_file):
 
         text = re.sub(r'(?<=\d)[ \t]*([.,])[ \t]*(?=\d{2}\b)', r'\1', raw_text)
 
+        # Parse amounts
         amounts = []
         for m in re.findall(r'\b\d+[.,]\d{2}\b', text):
             try:
@@ -101,154 +106,247 @@ def parse_receipt_image(uploaded_file):
         if "gst" in text or "tax" in text:
             gst_numbers = re.findall(r'(?:gst|tax)[^\d\n]*(\d+[.,]\d{2})', text)
             if gst_numbers:
-                gst_amount = float(gst_numbers.replace(',', '.'))
+                gst_amount = float(gst_numbers[0].replace(',', '.'))
             else:
                 gst_amount = round(total_amount / 11, 2)
 
-        # Basic regex to grab receipt date style occurrences
-        date_match = re.search(r'\b\d{1,2}[/\-]\d{1,2}[/\-]\d{2,4}\b', raw_text)
-        inferred_date = date_match.group(0) if date_match else datetime.today().strftime('%d/%m/%Y')
+        # Parse dates matching common formats (DD/MM/YYYY or DD-MM-YYYY)
+        detected_date = datetime.today().strftime('%d/%m/%Y')
+        date_patterns = re.findall(r'\b\d{1,2}[/\-]\d{1,2}[/\-]\d{2,4}\b', raw_text)
+        if date_patterns:
+            detected_date = date_patterns[0].replace('-', '/')
 
         possible_items = ['uber', 'cafe', 'officeworks', 'bunnings', 'parking',
                           'fuel', 'stationery', 'food', 'meals', 'woolworths', 'coles']
         keywords = [i.title() for i in possible_items if i in text]
         description = ", ".join(keywords) if keywords else "General Expense Purchases"
 
-        return description, total_amount, gst_amount, inferred_date, raw_text
+        return description, total_amount, gst_amount, detected_date, raw_text
     except Exception as e:
         return "Scan failed", 0.0, 0.0, datetime.today().strftime('%d/%m/%Y'), f"ERROR: {e}"
 
-def generate_pdf(filename, data, receipts):
-    """Compiles a clean document statement using ReportLab canvas flowables."""
+# -------------------------------------------------------------------------
+# COMPREHENSIVE DYNAMIC MULTI-PAGE REPORTLAB PDF BUILDER MODULE
+# -------------------------------------------------------------------------
+def generate_official_voucher_pdf(filename, data, receipts):
+    """Compiles a dynamic multi-page clone matching the Majlis Ansarullah Australia layout."""
     doc = SimpleDocTemplate(filename, pagesize=letter, rightMargin=36, leftMargin=36, topMargin=36, bottomMargin=36)
     story = []
     styles = getSampleStyleSheet()
     
-    title_style = ParagraphStyle('Title', parent=styles['Heading1'], spaceAfter=12, textColor=colors.HexColor("#1A365D"))
-    heading_style = ParagraphStyle('Heading', parent=styles['Heading2'], spaceBefore=10, spaceAfter=6, textColor=colors.HexColor("#2B6CB0"))
-    normal_style = styles['Normal']
+    header_title_style = ParagraphStyle('HeadTitle', fontName='Helvetica-Bold', fontSize=14, alignment=1, spaceAfter=2)
+    header_subtitle_style = ParagraphStyle('HeadSub', fontName='Helvetica-Bold', fontSize=12, alignment=1, spaceAfter=2)
+    dept_style = ParagraphStyle('Dept', fontName='Helvetica', fontSize=11, alignment=1, spaceAfter=2)
+    top_line_style = ParagraphStyle('TopLine', fontName='Helvetica-Oblique', fontSize=9, leading=11, alignment=1, spaceAfter=4)
+    cell_style = ParagraphStyle('Cell', fontName='Helvetica', fontSize=9, leading=11)
+    cell_bold_style = ParagraphStyle('CellB', fontName='Helvetica-Bold', fontSize=9, leading=11)
     
-    story.append(Paragraph("Expense Claim Summary Statement", title_style))
-    story.append(Spacer(1, 12))
+    story.append(Paragraph("In the name of Allah, the gracious, the merciful", top_line_style))
+    story.append(Paragraph("MAJLIS ANSARULLAH AUSTRALIA", header_title_style))
+    story.append(Paragraph("Department of Mal", dept_style))
+    story.append(Paragraph("Expense Payment Voucher", header_subtitle_style))
+    story.append(Spacer(1, 10))
     
-    profile_data = [
-        [Paragraph(f"<b>Claimant Name:</b> {data['name']}", normal_style), Paragraph(f"<b>Region/National:</b> {data['region']}", normal_style)],
-        [Paragraph(f"<b>Claimant Email:</b> {data['claimant_email']}", normal_style), Paragraph(f"<b>Majlis/Office:</b> {data['majlis']}", normal_style)],
-        [Paragraph(f"<b>BSB No:</b> {data['bsb']}", normal_style), Paragraph(f"<b>Account Category:</b> {data['account']}", normal_style)],
-        [Paragraph(f"<b>Account No:</b> {data['acc_num']}", normal_style), Paragraph(f"<b>Total Receipts:</b> {data['total_receipts']}", normal_style)],
-        [Paragraph(f"<b>Total Claim Amount:</b> ${data['total_amount']:.2f}", normal_style), Paragraph(f"<b>Total GST Amount:</b> ${data['total_gst']:.2f}", normal_style)],
-        [Paragraph(f"<b>Sadr Majlis:</b> {data['sadr_majlis']}", normal_style), Paragraph(f"<b>Qaid Mal:</b> {data['qaid_mal']}", normal_style)],
-        [Paragraph(f"<b>Nazim-e-Ala:</b> {data['nazim_name']} ({data['nazim_email']})", normal_style), Paragraph("", normal_style)]
+    # Block A: Header profiles allocation alignment grid (Total = 540 points wide)
+    header_data = [
+        [Paragraph("<b>Payee Name:</b>", cell_style), Paragraph(data['name'], cell_style), Paragraph("<b>Voucher No:</b>", cell_style), Paragraph("", cell_style)],
+        [Paragraph("<b>Expense Type:</b>", cell_style), Paragraph(data['expense_type'], cell_style), Paragraph("<b>BSB:</b>", cell_style), Paragraph(data['bsb'], cell_style)],
+        [Paragraph("<b>Account:</b>", cell_style), Paragraph(data['account'], cell_style), Paragraph("<b>Account:</b>", cell_style), Paragraph(data['acc_num'], cell_style)],
+        [Paragraph("<b>Region:</b>", cell_style), Paragraph(data['region'], cell_style), Paragraph("<b>Total Claim:</b>", cell_bold_style), Paragraph(f"<b>$ {data['total_amount']:.2f}</b>", cell_bold_style)],
+        [Paragraph("<b>Majlis:</b>", cell_style), Paragraph(data['majlis'], cell_style), Paragraph("<b>Advance Issued:</b>", cell_style), Paragraph("", cell_style)]
     ]
     
-    t_profile = Table(profile_data, colWidths=[270, 270])
-    t_profile.setStyle(TableStyle([
-        ('BACKGROUND', (0,0), (-1,-1), colors.HexColor("#F7FAFC")),
-        ('BOX', (0,0), (-1,-1), 1, colors.HexColor("#E2E8F0")),
-        ('INNERGRID', (0,0), (-1,-1), 0.5, colors.HexColor("#EDF2F7")),
-        ('PADDING', (0,0), (-1,-1), 6),
+    t_header = Table(header_data, colWidths=[100, 170, 100, 170])
+    t_header.setStyle(TableStyle([
+        ('GRID', (0,0), (-1,-1), 1, colors.black),
         ('VALIGN', (0,0), (-1,-1), 'MIDDLE'),
+        ('PADDING', (0,0), (-1,-1), 5),
     ]))
-    story.append(t_profile)
+    story.append(t_header)
     story.append(Spacer(1, 15))
     
-    story.append(Paragraph("Itemized Receipt Breakdowns", heading_style))
-    receipt_table_data = [["#", "Invoice Date", "Description", "GST Amt", "Total Amt"]]
+    # Block B: Dynamic receipt row allocation matrix expansion loop (Total = 540 points wide)
+    receipt_table_data = [[Paragraph("<b>#</b>", cell_bold_style), Paragraph("<b>Date</b>", cell_bold_style), Paragraph("<b>Description</b>", cell_bold_style), Paragraph("<b>Total amount</b>", cell_bold_style), Paragraph("<b>GST</b>", cell_bold_style)]]
     
-    for idx, r in enumerate(receipts):
-        receipt_table_data.append([
-            str(idx + 1),
-            r['date'],
-            r['desc'],
-            f"${r['gst']:.2f}",
-            f"${r['amount']:.2f}"
-        ])
-        
-    t_receipts = Table(receipt_table_data, colWidths=[30, 90, 240, 90, 90])
+    total_agg_amount = 0.0
+    total_agg_gst = 0.0
+    
+    # Ensure a minimum layout look of 10 structural rows, or scale higher automatically
+    max_rows = max(10, len(receipts))
+    for idx in range(max_rows):
+        if idx < len(receipts):
+            r = receipts[idx]
+            receipt_table_data.append([
+                Paragraph(str(idx + 1), cell_style),
+                Paragraph(r['date'], cell_style),
+                Paragraph(r['desc'], cell_style),
+                Paragraph(f"${r['amount']:.2f}", cell_style),
+                Paragraph(f"${r['gst']:.2f}", cell_style)
+            ])
+            total_agg_amount += r['amount']
+            total_agg_gst += r['gst']
+        else:
+            receipt_table_data.append([Paragraph(str(idx + 1), cell_style), "", "", "", ""])
+            
+    receipt_table_data.append([Paragraph("<b>Total</b>", cell_bold_style), "", "", Paragraph(f"<b>${total_agg_amount:.2f}</b>", cell_bold_style), Paragraph(f"<b>${total_agg_gst:.2f}</b>", cell_bold_style)])
+    
+    t_receipts = Table(receipt_table_data, colWidths=[30, 80, 250, 90, 90])
     t_receipts.setStyle(TableStyle([
-        ('BACKGROUND', (0,0), (-1,0), colors.HexColor("#2B6CB0")),
-        ('TEXTCOLOR', (0,0), (-1,0), colors.whitesmoke),
-        ('ALIGN', (0,0), (-1,-1), 'LEFT'),
-        ('ALIGN', (3,1), (-1,-1), 'RIGHT'),
-        ('BOTTOMPADDING', (0,0), (-1,0), 6),
-        ('BACKGROUND', (0,1), (-1,-1), colors.HexColor("#FFFFFF")),
-        ('GRID', (0,0), (-1,-1), 1, colors.HexColor("#CBD5E0")),
-        ('PADDING', (0,0), (-1,-1), 6),
+        ('GRID', (0,0), (-1,-1), 1, colors.black),
         ('VALIGN', (0,0), (-1,-1), 'MIDDLE'),
+        ('PADDING', (0,0), (-1,-1), 4),
+        ('BACKGROUND', (0,0), (-1,0), colors.lightgrey),
+        ('ALIGN', (3,1), (-1,-1), 'RIGHT')
     ]))
     story.append(t_receipts)
+    story.append(Spacer(1, 15))
+    
+    # Block C: Sign-off configuration block elements (Total = 540 points wide)
+    signoff_data = [
+        [Paragraph("<b>Requested by:</b>", cell_bold_style), Paragraph("<b>Reviewed by Nazime A'la:</b>", cell_bold_style)],
+        [Paragraph(f"Name: {data['name']}", cell_style), Paragraph(f"Name: {data['nazim_name']}", cell_style)],
+        [Paragraph("Signature:", cell_style), Paragraph("Signature:", cell_style)],
+        [Paragraph(f"Date: {datetime.today().strftime('%d/%m/%Y')}", cell_style), Paragraph("Date:", cell_style)],
+        [Paragraph("<b>Approved by Qaid Mal:</b>", cell_bold_style), Paragraph("<b>Approved by Sadr MAA:</b>", cell_bold_style)],
+        [Paragraph(f"Name: {data['qaid_mal']}", cell_style), Paragraph(f"Name: {data['sadr_maa']}", cell_style)],
+        [Paragraph("Signature: <i>Tahir Mehmood</i>", cell_style), Paragraph("Signature:", cell_style)],
+        [Paragraph("Date:", cell_style), Paragraph("Date:", cell_style)],
+    ]
+    
+    t_signoff = Table(signoff_data, colWidths=[270, 270])
+    t_signoff.setStyle(TableStyle([
+        ('GRID', (0,0), (-1,-1), 1, colors.black),
+        ('BACKGROUND', (0,0), (1,0), colors.lightgrey),
+        ('BACKGROUND', (0,4), (1,4), colors.lightgrey),
+        ('PADDING', (0,0), (-1,-1), 4),
+    ]))
+    story.append(t_signoff)
+    
+    story.append(Spacer(1, 10))
+    story.append(Paragraph("<b>Acknowledgment</b>", header_subtitle_style))
+    story.append(Paragraph(f"I have received cash/cheque payment of $________________ as per details provided above.", cell_style))
+    story.append(Paragraph(f"<b>Comments:</b> Hand written Receipt approved by Sadr Majlis. (Updated: 1-11-19)", cell_style))
     
     doc.build(story)
 # -------------------------------------------------------------------------
+# BACKEND RECEIPTS IMAGE CO-APPENDING PIPELINE ENGINE
+# -------------------------------------------------------------------------
+def stitch_receipt_images_to_pdf(voucher_pdf_path, uploaded_files_list):
+    """Converts and appends uploaded receipt image assets directly into the final PDF bundle."""
+    try:
+        pages_bundle = []
+        for u_file in uploaded_files_list:
+            if u_file is not None:
+                u_file.seek(0)
+                img = Image.open(u_file)
+                img = ImageOps.exif_transpose(img)
+                if img.mode in ("RGBA", "P"):
+                    img = img.convert("RGB")
+                pages_bundle.append(img)
+                
+        if pages_bundle:
+            temp_images_pdf = "temp_receipt_attachments.pdf"
+            pages_bundle[0].save(temp_images_pdf, save_all=True, append_images=pages_bundle[1:])
+            
+            import pypdf
+            merger = pypdf.PdfMerger()
+            merger.append(voucher_pdf_path)
+            merger.append(temp_images_pdf)
+            merger.write(voucher_pdf_path)
+            merger.close()
+            
+            if os.path.exists(temp_images_pdf):
+                os.remove(temp_images_pdf)
+        return True
+    except Exception as merge_error:
+        st.error(f"⚠️ Image attachment pipeline notice: Raw document could not be appended: {merge_error}")
+        return False
+
+# -------------------------------------------------------------------------
+# DIRECT EMAIL OUTBOUND DISPATCH ENGINE (SMTP)
+# -------------------------------------------------------------------------
+def dispatch_real_email(recipient_list, subject_text, body_text, attachment_path, cc_recipient=None):
+    """Logs into configured SMTP server to transmit automated file payloads with optional CC."""
+    smtp_info = st.session_state.admin_lists
+    if not smtp_info.get("smtp_user") or not smtp_info.get("smtp_password"):
+        st.error("⚠️ Real Delivery Skipped: Outbound SMTP credentials must be filled out on the Admin Configuration screen.")
+        return False
+        
+    try:
+        msg = MIMEMultipart()
+        msg['From'] = smtp_info["smtp_user"]
+        msg['To'] = ", ".join(recipient_list)
+        msg['Subject'] = subject_text
+        
+        all_recipients = list(recipient_list)
+        if cc_recipient:
+            msg['Cc'] = cc_recipient
+            all_recipients.append(cc_recipient)
+        
+        msg.attach(MIMEText(body_text, 'plain'))
+        
+        if os.path.exists(attachment_path):
+            with open(attachment_path, "rb") as attachment:
+                part = MIMEBase("application", "octet-stream")
+                part.set_payload(attachment.read())
+            encoders.encode_base64(part)
+            part.add_header("Content-Disposition", f"attachment; filename= {os.path.basename(attachment_path)}")
+            msg.attach(part)
+        
+        server = smtplib.SMTP(smtp_info["smtp_server"], smtp_info["smtp_port"])
+        server.starttls()
+        server.login(smtp_info["smtp_user"], smtp_info["smtp_password"])
+        server.sendmail(smtp_info["smtp_user"], all_recipients, msg.as_string())
+        server.quit()
+        return True
+    except Exception as email_err:
+        st.error(f"❌ Failed to dispatch email. Internal Error: {email_err}")
+        return False
+
+# -------------------------------------------------------------------------
 # INTERFACE FRONT-END DESIGN
 # -------------------------------------------------------------------------
-st.set_page_config(page_title="Expense Portal (Cloud Ready)", layout="wide")
-
-# Navigation Sidebar
+st.set_page_config(page_title="Expense Portal (Official MAA Clone)", layout="wide")
 app_mode = st.sidebar.selectbox("Navigate Mode", ["User Claim Portal", "Admin Panel Configuration"])
 
-# -------------------------------------------------------------------------
-# PASSWORD-PROTECTED SECURE ADMIN INTERFACE PANEL
-# -------------------------------------------------------------------------
 if app_mode == "Admin Panel Configuration":
     st.title("⚙️ Admin Control Panel")
-    
     pwd_input = st.text_input("Enter Master Admin Access Key Password", type="password")
     
-    if pwd_input == st.session_state.admin_lists.get("admin_password", "123"):
+    if pwd_input == st.session_state.admin_lists.get("admin_password", "AdminPassword123"):
         st.success("Access Verified. Secure Configuration Screen Unlocked.")
         
-        new_pwd = st.text_input("Modify System Admin Password Key", value=st.session_state.admin_lists.get("admin_password", "123"))
+        new_pwd = st.text_input("Modify System Admin Password Key", value=st.session_state.admin_lists.get("admin_password", "AdminPassword123"))
         
-        # 1. Master configurations for Regions
+        # --- DYNAMIC GLOBAL OVERRIDES PLACED FIRST AT THE TOP ---
+        st.markdown("### 👑 Central Executive Authority Configuration")
+        q_mal = st.text_input("Approved by Qaid Mal - Target Field Assignment Name", value=st.session_state.admin_lists.get("qaid_mal_name", "Tahir Mahmood Rana"))
+        s_maa = st.text_input("Approved by Sadr Majlis - Target Field Assignment Name", value=st.session_state.admin_lists.get("sadr_maa_name", "Abdul Jamil Mubbashar"))
+        
+        st.markdown("---")
         regions_text = st.text_area("Regions Master List Configuration (One entry per line)", value="\n".join(st.session_state.admin_lists["regions"]))
         parsed_regions_list = [line.strip() for line in regions_text.split("\n") if line.strip()]
         
         st.markdown("---")
-        st.markdown("#### 🗺️ Regional Details & Assignment Matrix Panel")
-        st.caption("Select a region to configure its Majlis list, Nazim-e-Ala, Sadr Majlis, and Qaid Mal fields.")
-        
-        selected_admin_region = st.selectbox("Select a region to configure", options=parsed_regions_list)
+        st.markdown("#### 🗺️ Regional Majlis & Nazim e Ala Configuration Matrix")
+        selected_admin_region = st.selectbox("Select a region to configure details", options=parsed_regions_list)
         
         current_map = st.session_state.admin_lists.get("regional_majlis", {})
         existing_majlis_for_region = current_map.get(selected_admin_region, [])
-        
         majlis_text = st.text_area(f"Enter Majlis names for '{selected_admin_region}' (One entry per line)", value="\n".join(existing_majlis_for_region), height=100)
         parsed_majlis_list = [line.strip() for line in majlis_text.split("\n") if line.strip()]
         
-        # Load extended regional parameters dictionary securely
-        current_details = st.session_state.admin_lists.get("regional_details", {})
-        reg_data = current_details.get(selected_admin_region, {"nazim_name": "", "nazim_email": "", "sadr_majlis": "", "qaid_mal": ""})
-        
-        col_adm1, col_adm2 = st.columns(2)
-        with col_adm1:
-            adm_nazim_name = st.text_input(f"Nazim-e-Ala Name for {selected_admin_region}", value=reg_data.get("nazim_name", ""))
-            adm_nazim_email = st.text_input(f"Nazim-e-Ala Email for {selected_admin_region}", value=reg_data.get("nazim_email", ""))
-        with col_adm2:
-            adm_sadr_majlis = st.text_input(f"Sadr Majlis Name for {selected_admin_region}", value=reg_data.get("sadr_majlis", ""))
-            adm_qaid_mal = st.text_input(f"Qaid Mal Name for {selected_admin_region}", value=reg_data.get("qaid_mal", ""))
+        current_nazims = st.session_state.admin_lists.get("regional_nazims", {})
+        region_nazim_data = current_nazims.get(selected_admin_region, {"name": "", "email": ""})
+        nazim_name_input = st.text_input(f"Nazim e Ala Name for '{selected_admin_region}'", value=region_nazim_data.get("name", ""))
+        nazim_email_input = st.text_input(f"Nazim e Ala Email Address for '{selected_admin_region}'", value=region_nazim_data.get("email", ""))
         
         st.markdown("---")
-        st.markdown("#### ✉️ Target Email Assignment Matrix")
-        
-        email_region_select = st.selectbox("Step 1: Pick Target Region for Emails", options=parsed_regions_list, key="email_reg")
-        available_majlis_for_email = parsed_majlis_list if email_region_select == selected_admin_region else current_map.get(email_region_select, [])
-        
-        if available_majlis_for_email:
-            email_majlis_select = st.selectbox(f"Step 2: Pick Target Majlis in '{email_region_select}'", options=available_majlis_for_email)
-            routing_key = f"{email_region_select}|{email_majlis_select}"
-            current_routing_map = st.session_state.admin_lists.get("targeted_emails", {})
-            existing_emails = current_routing_map.get(routing_key, [])
-            
-            majlis_emails_text = st.text_area(f"Notification Distribution Emails for '{email_majlis_select}' (One entry per line)", value="\n".join(existing_emails), height=100)
-            parsed_majlis_emails = [line.strip() for line in majlis_emails_text.split("\n") if line.strip()]
-        else:
-            st.warning("Please declare at least one Majlis entry above to map specific notification routing.")
-            routing_key = None
-            parsed_majlis_emails = []
-
-        st.markdown("---")
-        emails_text = st.text_area("Global Fallback Emails (Used if no specific Majlis email is set)", value="\n".join(st.session_state.admin_lists.get("emails", [])))
+        st.markdown("#### 🔐 Outbound live SMTP Server Credentials Gateway")
+        smtp_srv = st.text_input("SMTP Server Relay Node Hostname", value=st.session_state.admin_lists.get("smtp_server", "://gmail.com"))
+        smtp_prt = st.number_input("SMTP Server TLS Port Number", value=int(st.session_state.admin_lists.get("smtp_port", 587)), step=1)
+        smtp_usr = st.text_input("Sender User Authentication Email Address ID", value=st.session_state.admin_lists.get("smtp_user", "claimsubmissionmaaa@gmail.com"))
+        smtp_pwd = st.text_input("Sender Account App Password Access Key", value=st.session_state.admin_lists.get("smtp_password", ""), type="password")
         
         if st.button("Save System Configuration Schema Matrix", type="primary"):
             updated_map = dict(current_map)
@@ -258,44 +356,30 @@ if app_mode == "Admin Panel Configuration":
                 if r not in updated_map:
                     updated_map[r] = []
             
-            # Pack nested details map entries
-            updated_details = dict(current_details)
-            updated_details[selected_admin_region] = {
-                "nazim_name": adm_nazim_name.strip(),
-                "nazim_email": adm_nazim_email.strip(),
-                "sadr_majlis": adm_sadr_majlis.strip(),
-                "qaid_mal": adm_qaid_mal.strip()
-            }
-            
-            updated_routing_map = dict(st.session_state.admin_lists.get("targeted_emails", {}))
-            if routing_key:
-                updated_routing_map[routing_key] = parsed_majlis_emails
-                
-            valid_routing_map = {}
-            for key, emails in updated_routing_map.items():
-                if "|" in key:
-                    r_part, m_part = key.split("|", 1)
-                    if r_part in updated_map and m_part in updated_map[r_part]:
-                        valid_routing_map[key] = emails
+            updated_nazims = dict(current_nazims)
+            updated_nazims[selected_admin_region] = {"name": nazim_name_input.strip(), "email": nazim_email_input.strip()}
+            updated_nazims = {k: v for k, v in updated_nazims.items() if k in parsed_regions_list}
 
             updated_config = {
                 "regions": parsed_regions_list,
                 "regional_majlis": updated_map,
-                "targeted_emails": valid_routing_map,
-                "emails": [line.strip() for line in emails_text.split("\n") if line.strip()],
+                "emails": [line.strip() for line in st.session_state.admin_lists.get("emails", [])],
                 "admin_password": new_pwd.strip(),
-                "regional_details": updated_details
+                "smtp_server": smtp_srv.strip(),
+                "smtp_port": int(smtp_prt),
+                "smtp_user": smtp_usr.strip(),
+                "smtp_password": smtp_pwd.strip(),
+                "qaid_mal_name": q_mal.strip(),
+                "sadr_maa_name": s_maa.strip(),
+                "regional_nazims": updated_nazims
             }
             
             save_admin_settings(updated_config)
             st.session_state.admin_lists = updated_config
-            st.success("Global application schema matrix and routing pipelines successfully written!")
+            st.success("Global application schema configuration matrix updated successfully!")
             st.rerun()
-            
-    elif pwd_input != "":
-        st.error("Access Refused: Secure validation key does not match records.")
-    # =========================================================================
-# BLOCK 4 OF 4: INTERACTIVE USER Portal & PROCESS SUBMISSION PIPELINE
+# =========================================================================
+# BLOCK 4 OF 4: INTERACTIVE USER PORTAL & PROCESS SUBMISSION PIPELINE
 # =========================================================================
 
 else:
