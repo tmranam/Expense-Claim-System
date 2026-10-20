@@ -2,3 +2,5 @@ streamlit
 reportlab
 pillow
 pytesseract
+pypdf
+pdf2image
