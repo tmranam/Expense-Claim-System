@@ -44,7 +44,6 @@ def load_admin_settings():
                 data = json.load(f)
                 
                 # --- FIXED CRITICAL FALLBACK STRUCTURE CHECKS ---
-                # This guarantees that if you have an old file on disk, it won't trigger a KeyError
                 if "regions" not in data or not data["regions"]:
                     data["regions"] = DEFAULT_CONFIG["regions"]
                 if "regional_majlis" not in data or not data["regional_majlis"]:
@@ -186,34 +185,56 @@ if app_mode == "Admin Panel Configuration":
         st.success("Access Verified. Secure Configuration Screen Unlocked.")
         
         new_pwd = st.text_input("Modify System Admin Password Key", value=st.session_state.admin_lists.get("admin_password", "AdminPassword123"))
+        
+        # 1. Update master configurations for Regions
         regions_text = st.text_area("Regions Master List Configuration (One entry per line)", value="\n".join(st.session_state.admin_lists["regions"]))
+        parsed_regions_list = [line.strip() for line in regions_text.split("\n") if line.strip()]
         
-        st.markdown("#### 🔄 Relational Majlis Mapping Schema Matrix (JSON Format)")
-        current_map_json = json.dumps(st.session_state.admin_lists["regional_majlis"], indent=4)
-        majlis_json_text = st.text_area("Majlis Relational JSON Schema Payload", value=current_map_json, height=220)
+        st.markdown("---")
+        st.markdown("#### 🗺️ Regional Majlis Assignment Panel")
+        st.caption("Select a region from your master list below to open its assignment configuration and allocate its respective Majlis entries.")
         
+        # 2. Dynamic dropdown based directly on entered regions above
+        selected_admin_region = st.selectbox("Select a region to configure its Majlis", options=parsed_regions_list)
+        
+        # Fetch current mapping or fallback to empty array safely if it's a new region
+        current_map = st.session_state.admin_lists.get("regional_majlis", {})
+        existing_majlis_for_region = current_map.get(selected_admin_region, [])
+        
+        # 3. Dynamic layout panel opens for the selected region
+        majlis_text = st.text_area(f"Enter Majlis names for '{selected_admin_region}' (One entry per line)", value="\n".join(existing_majlis_for_region), height=180)
+        parsed_majlis_list = [line.strip() for line in majlis_text.split("\n") if line.strip()]
+        
+        st.markdown("---")
         emails_text = st.text_area("Notification Distribution Target Emails (One entry per line)", value="\n".join(st.session_state.admin_lists["emails"]))
-        
-        if st.button("Save System Configuration Schema Matrix", type="primary"):
-            try:
-                parsed_majlis_map = json.loads(majlis_json_text)
-                parsed_regions_list = [line.strip() for line in regions_text.split("\n") if line.strip()]
-                
-                updated_config = {
-                    "regions": parsed_regions_list,
-                    "regional_majlis": parsed_majlis_map,
-                    "emails": [line.strip() for line in emails_text.split("\n") if line.strip()],
-                    "admin_password": new_pwd.strip()
-                }
-                
-                save_admin_settings(updated_config)
-                st.session_state.admin_lists = updated_config
-                st.success("Global application schema matrix written to storage successfully!")
-            except json.JSONDecodeError:
-                st.error("JSON Evaluation Error: Failed to compile the Majlis schema. Check key quote marks and trailing commas.")
+    if st.button("Save System Configuration Schema Matrix", type="primary"):
+            # Update the specific selected key value pair inside the mapping dictionary
+            updated_map = dict(current_map)
+            updated_map[selected_admin_region] = parsed_majlis_list
+            
+            # Keep map items clean by purging regions that were completely removed from the text box
+            updated_map = {k: v for k, v in updated_map.items() if k in parsed_regions_list}
+            
+            # Fill missing keys for any brand new added regions to avoid dictionary crashes
+            for r in parsed_regions_list:
+                if r not in updated_map:
+                    updated_map[r] = []
+                    
+            updated_config = {
+                "regions": parsed_regions_list,
+                "regional_majlis": updated_map,
+                "emails": [line.strip() for line in emails_text.split("\n") if line.strip()],
+                "admin_password": new_pwd.strip()
+            }
+            
+            save_admin_settings(updated_config)
+            st.session_state.admin_lists = updated_config
+            st.success(f"Global configuration written successfully! Assigned {len(parsed_majlis_list)} Majlis entries to '{selected_admin_region}'.")
+            st.rerun()
+            
     elif pwd_input != "":
         st.error("Access Refused: Secure validation key does not match records.")
-        # -------------------------------------------------------------------------
+# -------------------------------------------------------------------------
 # INTERACTIVE CLAIM FORM LAYOUT PANEL
 # -------------------------------------------------------------------------
 else:
@@ -227,7 +248,9 @@ else:
         region = st.selectbox("Select Region / National Location", options=configured_regions)
         
         majlis_lookup_map = st.session_state.admin_lists["regional_majlis"]
-        available_majlis_options = majlis_lookup_map.get(region, ["No entries declared under this region boundary"])
+        available_majlis_options = majlis_lookup_map.get(region, [])
+        if not available_majlis_options:
+            available_majlis_options = ["No entries declared under this region boundary"]
         
         majlis = st.selectbox("Select Respective Residing Majlis / Office Destination", options=available_majlis_options)
         account = st.text_input("General Ledger / Tracking Account Code")
@@ -247,7 +270,6 @@ else:
     for i in range(int(total_receipts_input)):
         st.markdown(f"#### 📄 Receipt Section Item #{i+1}")
         
-        # --- FIXED BLOCK PARAMETERS BELOW ---
         r_col1, r_col2, r_col3, r_col4 = st.columns([2, 2, 1, 1])
 
         with r_col1:
@@ -310,4 +332,4 @@ else:
                 file_name=output_filename,
                 mime="application/pdf"
             )
-
+ 
