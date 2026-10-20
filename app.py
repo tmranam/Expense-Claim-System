@@ -40,7 +40,7 @@ DEFAULT_CONFIG = {
     "smtp_server": "://gmail.com",
     "smtp_port": 587,
     "smtp_user": "claimsubmissionmaaa@gmail.com",
-    "smtp_password": "",
+    "smtp_password": ""
     "qaid_mal_name": "Tahir Mahmood Rana",
     "sadr_maa_name": "Abdul Jamil Mubbashar",
     "regional_nazims": {
@@ -77,7 +77,7 @@ def save_admin_settings(config_data):
 # Initialize settings in state
 if 'admin_lists' not in st.session_state:
     st.session_state.admin_lists = load_admin_settings()
-# -------------------------------------------------------------------------
+    # -------------------------------------------------------------------------
 # OPTIMIZED WORKING OCR ENGINE WITH DATE IDENTIFICATION
 # -------------------------------------------------------------------------
 def parse_receipt_image(uploaded_file):
@@ -114,7 +114,7 @@ def parse_receipt_image(uploaded_file):
         detected_date = datetime.today().strftime('%d/%m/%Y')
         date_patterns = re.findall(r'\b\d{1,2}[/\-]\d{1,2}[/\-]\d{2,4}\b', raw_text)
         if date_patterns:
-            detected_date = date_patterns[0].replace('-', '/')
+            detected_date = date_patterns.replace('-', '/')
 
         possible_items = ['uber', 'cafe', 'officeworks', 'bunnings', 'parking',
                           'fuel', 'stationery', 'food', 'meals', 'woolworths', 'coles']
@@ -126,21 +126,17 @@ def parse_receipt_image(uploaded_file):
         return "Scan failed", 0.0, 0.0, datetime.today().strftime('%d/%m/%Y'), f"ERROR: {e}"
 
 # -------------------------------------------------------------------------
-# COMPREHENSIVE CLONE REPORTLAB PDF BUILDER MODULE
+# COMPREHENSIVE DYNAMIC MULTI-PAGE REPORTLAB PDF BUILDER MODULE
 # -------------------------------------------------------------------------
 def generate_official_voucher_pdf(filename, data, receipts):
-    """Compiles a clone matching the Majlis Ansarullah Australia Expense Voucher layout."""
+    """Compiles a dynamic multi-page clone matching the Majlis Ansarullah Australia layout."""
     doc = SimpleDocTemplate(filename, pagesize=letter, rightMargin=36, leftMargin=36, topMargin=36, bottomMargin=36)
     story = []
     styles = getSampleStyleSheet()
     
-    # Custom specific font styles setup
     header_title_style = ParagraphStyle('HeadTitle', fontName='Helvetica-Bold', fontSize=14, alignment=1, spaceAfter=2)
     header_subtitle_style = ParagraphStyle('HeadSub', fontName='Helvetica-Bold', fontSize=12, alignment=1, spaceAfter=2)
     dept_style = ParagraphStyle('Dept', fontName='Helvetica', fontSize=11, alignment=1, spaceAfter=2)
-    doc_title_style = ParagraphStyle('DocTitle', fontName='Helvetica-Bold', fontSize=13, alignment=1, spaceAfter=15)
-    
-    # --- FIXED CENTERING ALIGNMENT FOR TOP TASMIYAH LINE ---
     top_line_style = ParagraphStyle('TopLine', fontName='Helvetica-Oblique', fontSize=9, leading=11, alignment=1, spaceAfter=4)
     cell_style = ParagraphStyle('Cell', fontName='Helvetica', fontSize=9, leading=11)
     cell_bold_style = ParagraphStyle('CellB', fontName='Helvetica-Bold', fontSize=9, leading=11)
@@ -151,7 +147,7 @@ def generate_official_voucher_pdf(filename, data, receipts):
     story.append(Paragraph("Expense Payment Voucher", header_subtitle_style))
     story.append(Spacer(1, 10))
     
-    # Block A: Header profile structural allocation alignment grids
+    # Block A: Header profiles allocation alignment grid
     header_data = [
         [Paragraph("<b>Payee Name:</b>", cell_style), Paragraph(data['name'], cell_style), Paragraph("<b>Voucher No:</b>", cell_style), Paragraph("", cell_style)],
         [Paragraph("<b>Expense Type:</b>", cell_style), Paragraph(data['expense_type'], cell_style), Paragraph("<b>BSB:</b>", cell_style), Paragraph(data['bsb'], cell_style)],
@@ -160,7 +156,7 @@ def generate_official_voucher_pdf(filename, data, receipts):
         [Paragraph("<b>Majlis:</b>", cell_style), Paragraph(data['majlis'], cell_style), Paragraph("<b>Advance Issued:</b>", cell_style), Paragraph("", cell_style)]
     ]
     
-    t_header = Table(header_data, colWidths=[100, 240, 100, 100])
+    t_header = Table(header_data, colWidths=)
     t_header.setStyle(TableStyle([
         ('GRID', (0,0), (-1,-1), 1, colors.black),
         ('VALIGN', (0,0), (-1,-1), 'MIDDLE'),
@@ -169,13 +165,15 @@ def generate_official_voucher_pdf(filename, data, receipts):
     story.append(t_header)
     story.append(Spacer(1, 15))
     
-    # Block B: Line items row generation
+    # Block B: Dynamic receipt row allocation matrix expansion loop
     receipt_table_data = [[Paragraph("<b>#</b>", cell_bold_style), Paragraph("<b>Date</b>", cell_bold_style), Paragraph("<b>Description</b>", cell_bold_style), Paragraph("<b>Total amount</b>", cell_bold_style), Paragraph("<b>GST</b>", cell_bold_style)]]
     
     total_agg_amount = 0.0
     total_agg_gst = 0.0
     
-    for idx in range(10):
+    # Ensure a minimum layout look of 10 structural rows, or scale higher automatically
+    max_rows = max(10, len(receipts))
+    for idx in range(max_rows):
         if idx < len(receipts):
             r = receipts[idx]
             receipt_table_data.append([
@@ -188,12 +186,11 @@ def generate_official_voucher_pdf(filename, data, receipts):
             total_agg_amount += r['amount']
             total_agg_gst += r['gst']
         else:
-            # Pad empty rows to match your official 10-row matrix layout exactly
             receipt_table_data.append([Paragraph(str(idx + 1), cell_style), "", "", "", ""])
             
     receipt_table_data.append([Paragraph("<b>Total</b>", cell_bold_style), "", "", Paragraph(f"<b>${total_agg_amount:.2f}</b>", cell_bold_style), Paragraph(f"<b>${total_agg_gst:.2f}</b>", cell_bold_style)])
     
-    t_receipts = Table(receipt_table_data, colWidths=[30, 80, 250, 90, 90])
+    t_receipts = Table(receipt_table_data, colWidths=)
     t_receipts.setStyle(TableStyle([
         ('GRID', (0,0), (-1,-1), 1, colors.black),
         ('VALIGN', (0,0), (-1,-1), 'MIDDLE'),
@@ -204,7 +201,7 @@ def generate_official_voucher_pdf(filename, data, receipts):
     story.append(t_receipts)
     story.append(Spacer(1, 15))
     
-    # Block C: Administrative Sign-Off matrices
+    # Block C: Sign-off configuration block elements
     signoff_data = [
         [Paragraph("<b>Requested by:</b>", cell_bold_style), Paragraph("<b>Reviewed by Nazime A'la:</b>", cell_bold_style)],
         [Paragraph(f"Name: {data['name']}", cell_style), Paragraph(f"Name: {data['nazim_name']}", cell_style)],
@@ -216,7 +213,7 @@ def generate_official_voucher_pdf(filename, data, receipts):
         [Paragraph("Date:", cell_style), Paragraph("Date:", cell_style)],
     ]
     
-    t_signoff = Table(signoff_data, colWidths=[270, 270])
+    t_signoff = Table(signoff_data, colWidths=)
     t_signoff.setStyle(TableStyle([
         ('GRID', (0,0), (-1,-1), 1, colors.black),
         ('BACKGROUND', (0,0), (1,0), colors.lightgrey),
@@ -225,14 +222,60 @@ def generate_official_voucher_pdf(filename, data, receipts):
     ]))
     story.append(t_signoff)
     
-    # Footer acknowledgement segment matching your page canvas base line instructions
     story.append(Spacer(1, 10))
     story.append(Paragraph("<b>Acknowledgment</b>", header_subtitle_style))
     story.append(Paragraph(f"I have received cash/cheque payment of $________________ as per details provided above.", cell_style))
     story.append(Paragraph(f"<b>Comments:</b> Hand written Receipt approved by Sadr Majlis. (Updated: 1-11-19)", cell_style))
     
     doc.build(story)
-    # -------------------------------------------------------------------------
+   # -------------------------------------------------------------------------
+# BACKEND RECEIPTS IMAGE CO-APPENDING PIPELINE ENGINE
+# -------------------------------------------------------------------------
+def stitch_receipt_images_to_pdf(voucher_pdf_path, uploaded_files_list):
+    """Converts and appends uploaded receipt image assets directly into the final PDF bundle."""
+    try:
+        pages_bundle = []
+        
+        # 1. Open the original ReportLab document and convert its pages to an operational baseline
+        # We read the primary sheet into memory to prepare for concatenation
+        for u_file in uploaded_files_list:
+            if u_file is not None:
+                u_file.seek(0)
+                img = Image.open(u_file)
+                img = ImageOps.exif_transpose(img) # Corrects rotation metadata matrix
+                
+                # Normalize color space mapping vectors to RGB to guarantee multi-format PDF compilation stability
+                if img.mode in ("RGBA", "P"):
+                    img = img.convert("RGB")
+                    
+                pages_bundle.append(img)
+                
+        if pages_bundle:
+            # Append images directly onto the base voucher PDF file path safely using PIL
+            # This generates a single output file with the voucher sheet first, then all original images
+            import fitz # PyMuPDF fallback or PIL image generation strategy
+            from reportlab.pdfgen import canvas
+            
+            # Temporary generation pipeline to build image canvas blocks safely
+            temp_images_pdf = "temp_receipt_attachments.pdf"
+            pages_bundle[0].save(temp_images_pdf, save_all=True, append_images=pages_bundle[1:])
+            
+            # Combine the ReportLab base file layer sheet and the images layer sheet
+            import pypdf
+            merger = pypdf.PdfMerger()
+            merger.append(voucher_pdf_path)
+            merger.append(temp_images_pdf)
+            merger.write(voucher_pdf_path)
+            merger.close()
+            
+            if os.path.exists(temp_images_pdf):
+                os.remove(temp_images_pdf)
+        return True
+    except Exception as merge_error:
+        st.error(f"⚠️ Image attachment pipeline notice: Raw document could not be appended due to context matrix limitations: {merge_error}")
+        return False
+
+# -------------------------------------------------------------------------
 # DIRECT EMAIL OUTBOUND DISPATCH ENGINE (SMTP)
 # -------------------------------------------------------------------------
 def dispatch_real_email(recipient_list, subject_text, body_text, attachment_path, cc_recipient=None):
@@ -310,7 +353,6 @@ if app_mode == "Admin Panel Configuration":
         majlis_text = st.text_area(f"Enter Majlis names for '{selected_admin_region}' (One entry per line)", value="\n".join(existing_majlis_for_region), height=100)
         parsed_majlis_list = [line.strip() for line in majlis_text.split("\n") if line.strip()]
         
-        # Nazim e Ala Specific Settings Allocation
         current_nazims = st.session_state.admin_lists.get("regional_nazims", {})
         region_nazim_data = current_nazims.get(selected_admin_region, {"name": "", "email": ""})
         nazim_name_input = st.text_input(f"Nazim e Ala Name for '{selected_admin_region}'", value=region_nazim_data.get("name", ""))
@@ -353,7 +395,7 @@ if app_mode == "Admin Panel Configuration":
             st.session_state.admin_lists = updated_config
             st.success("Global application schema configuration matrix updated successfully!")
             st.rerun()
-  # -------------------------------------------------------------------------
+      # -------------------------------------------------------------------------
 # INTERACTIVE CLAIM FORM LAYOUT PANEL
 # -------------------------------------------------------------------------
 else:
@@ -377,7 +419,7 @@ else:
         account = st.text_input("General Ledger / Tracking Account Code (Account)")
         
     with col2:
-        total_receipts_input = st.number_input("Total Number of Receipts", min_value=1, max_value=10, value=1, step=1)
+        total_receipts_input = st.number_input("Total Number of Receipts", min_value=1, max_value=50, value=1, step=1)
         total_amount_input = st.number_input("Total Aggregated Summary Amount ($)", min_value=0.0, format="%.2f")
         st.markdown("**🏦 Direct Reimbursement Bank Segment**")
         bsb = st.text_input("Bank BSB Code (e.g., 000-000)", max_chars=7)
@@ -387,17 +429,19 @@ else:
     st.subheader("📎 Individual Itemized Receipt Image Ingestion Block")
     
     receipt_records = []
+    raw_files_tracker = []
     
     for i in range(int(total_receipts_input)):
         st.markdown(f"#### 📄 Receipt Section Item #{i+1}")
         
-        r_col1, r_col2, r_col3, r_col4, r_col5 = st.columns([2, 2, 1, 1, 1])
+        r_col1, r_col2, r_col3, r_col4, r_col5 = st.columns()
 
         with r_col1:
             uploaded_file = st.file_uploader(
                 f"Upload Image Asset for Receipt #{i+1}",
                 type=["png", "jpg", "jpeg"], key=f"file_{i}"
             )
+            raw_files_tracker.append(uploaded_file)
 
         if uploaded_file is not None:
             sig = f"{uploaded_file.name}_{uploaded_file.size}"
@@ -432,7 +476,6 @@ else:
         if not name or not bsb or not acc_num or not claimant_email or not expense_event_desc:
             st.error("Submission Denied: Profile details, Event Description, Claimant Email, BSB, and Account Numbers must be filled out.")
         else:
-            # Map dynamic configuration elements from admin records
             nazim_info = st.session_state.admin_lists.get("regional_nazims", {}).get(region, {"name": "Not Configured", "email": ""})
             
             payload = {
@@ -451,8 +494,15 @@ else:
             }
             
             output_filename = f"Expense_Voucher_{name.replace(' ', '_')}.pdf"
+            
+            # Step 1: Compile the primary formal ReportLab voucher sheet structure
             generate_official_voucher_pdf(output_filename, payload, receipt_records)
-            st.success("🎉 Claim Payment Voucher form compiled successfully!")
+            
+            # Step 2: Extract uploaded images and stitch them as consecutive back-end attachments pages
+            with st.spinner("Stitching image assets into multi-page formal PDF binder format..."):
+                stitch_receipt_images_to_pdf(output_filename, raw_files_tracker)
+                
+            st.success("🎉 Comprehensive Claim Payment Voucher Pack compiled successfully with attached images!")
             st.balloons()
             
             # ROUTING ENGINE: Delivers to Nazim e Ala and CCs claimant
@@ -460,9 +510,9 @@ else:
             if target_email:
                 recipient_emails = [target_email]
                 subject = f"Expense Payment Voucher Submission - {name} ({region})"
-                body = f"Assalam-o-Alaikum,\n\nA new expense payment voucher has been generated and submitted by {name} for the '{majlis}' branch of '{region}' region.\n\nPlease find the cloned Department of Mal voucher statement attached below for review.\n\nBest regards,\nAutomated Expense Portal Gateway"
+                body = f"Assalam-o-Alaikum,\n\nA new expense payment voucher pack has been generated and submitted by {name} for the '{majlis}' branch of '{region}' region.\n\nPlease find the comprehensive document statement bundle (Voucher Sheet + Attached Receipts) pinned below.\n\nBest regards,\nAutomated Expense Portal Gateway"
                 
-                with st.spinner("Transmitting cloned PDF voucher across outbound networks..."):
+                with st.spinner("Transmitting secure PDF files bundle across outbound networks..."):
                     success = dispatch_real_email(
                         recipient_list=recipient_emails, 
                         subject_text=subject, 
@@ -482,4 +532,5 @@ else:
                 data=pdf_bytes,
                 file_name=output_filename,
                 mime="application/pdf"
-            )          
+            )      
+    
