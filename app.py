@@ -59,20 +59,27 @@ DEFAULT_CONFIG = {
 # PERSISTENT STORAGE MANAGEMENT FOR FREE STREAMLIT TIER
 # -------------------------------------------------------------------------
 def load_admin_settings():
-    """Loads admin configurations from a local JSON file to survive app sleeping."""
+    """Loads admin configurations from a local JSON file to survive app sleeping with forced data auto-repair flags."""
     if os.path.exists(CONFIG_FILE):
         try:
             with open(CONFIG_FILE, "r") as f:
                 data = json.load(f)
                 
-                # --- FIXED CRITICAL FALLBACK STRUCTURE CHECKS ---
-                for key in DEFAULT_CONFIG:
-                    if key not in data or not data[key]:
-                        data[key] = DEFAULT_CONFIG[key]
+                # --- AUTOMATED DATABASE SELF-HEALING REPAIR MATRIX ---
+                updated_needed = False
+                for key, default_value in DEFAULT_CONFIG.items():
+                    if key not in data:
+                        data[key] = default_value
+                        updated_needed = True
+                
+                if updated_needed:
+                    save_admin_settings(data)
+                    
                 return data
         except Exception:
             return DEFAULT_CONFIG
     return DEFAULT_CONFIG
+
 
 def save_admin_settings(config_data):
     """Saves admin updates permanently into the repository environment."""
