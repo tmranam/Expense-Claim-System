@@ -217,15 +217,20 @@ else:
         with r_col1:
             uploaded_file = st.file_uploader(f"Upload Image Asset for Receipt #{i+1}", type=["png", "jpg", "jpeg"], key=f"file_{i}")
             initial_desc, initial_total, initial_gst = "No file parsed", 0.0, 0.0
-if uploaded_file is not None:
-with st.spinner(f"Scanning document #{i+1}..."):
-initial_desc, initial_total, initial_gst = parse_receipt_image(uploaded_file)
-with r_col2:
-desc_val = st.text_input(f"Item Description #{i+1}", value=initial_desc, key=f"desc_{i}")
-with r_col3:
-total_val = st.number_input(f"Amount ($) #{i+1}", min_value=0.0, value=float(initial_total), format="%.2f", key=f"amt_{i}")
-with r_col4:
-gst_val = st.number_input(f"GST ($) #{i+1}", min_value=0.0, value=float(initial_gst), format="%.2f", key=f"gst_{i}")
+  # Default parameter state
+        initial_desc, initial_total, initial_gst = "No file parsed", 0.0, 0.0
+        
+        # --- FIXED BLOCK INDENTATION BELOW ---
+        if uploaded_file is not None:
+            with st.spinner(f"Scanning document #{i+1}..."):
+                initial_desc, initial_total, initial_gst = parse_receipt_image(uploaded_file)
+        
+        with r_col2:
+            desc_val = st.text_input(f"Item Description #{i+1}", value=initial_desc, key=f"desc_{i}")
+        with r_col3:
+            total_val = st.number_input(f"Amount ($) #{i+1}", min_value=0.0, value=float(initial_total), format="%.2f", key=f"amt_{i}")
+        with r_col4:
+            gst_val = st.number_input(f"GST ($) #{i+1}", min_value=0.0, value=float(initial_gst), format="%.2f", key=f"gst_{i}")
 receipt_records.append({"desc": desc_val, "amount": total_val, "gst": gst_val})
 if st.button("Finalize and Submit Expense Claims Bundle", type="primary"):
 if not name or not bsb or not acc_num:
