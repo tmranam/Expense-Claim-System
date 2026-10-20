@@ -246,14 +246,15 @@ else:
     
     for i in range(int(total_receipts_input)):
         st.markdown(f"#### 📄 Receipt Section Item #{i+1}")
-        r_col1, r_col2, r_col3, r_col4 = st.columns()
+        
+        # --- FIXED BLOCK PARAMETERS BELOW ---
+        r_col1, r_col2, r_col3, r_col4 = st.columns([2, 2, 1, 1])
 
         with r_col1:
             uploaded_file = st.file_uploader(
                 f"Upload Image Asset for Receipt #{i+1}",
                 type=["png", "jpg", "jpeg"], key=f"file_{i}"
             )
-
         initial_desc, initial_total, initial_gst = "No file parsed", 0.0, 0.0
 
         if uploaded_file is not None:
