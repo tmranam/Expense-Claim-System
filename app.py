@@ -231,21 +231,21 @@ else:
             total_val = st.number_input(f"Amount ($) #{i+1}", min_value=0.0, value=float(initial_total), format="%.2f", key=f"amt_{i}")
         with r_col4:
             gst_val = st.number_input(f"GST ($) #{i+1}", min_value=0.0, value=float(initial_gst), format="%.2f", key=f"gst_{i}")
-receipt_records.append({"desc": desc_val, "amount": total_val, "gst": gst_val})
-if st.button("Finalize and Submit Expense Claims Bundle", type="primary"):
-if not name or not bsb or not acc_num:
-st.error("Submission Denied: Profile details, BSB, and Account Numbers must be filled out.")
-else:
-payload = {
-"name": name,
-"region": region,
-"majlis": majlis,
-"account": account,
-"total_receipts": total_receipts_input,
-"total_amount": total_amount_input,
-"bsb": bsb,
-"acc_num": acc_num
-}
+            receipt_records.append({"desc": desc_val, "amount": total_val, "gst": gst_val})
+        if st.button("Finalize and Submit Expense Claims Bundle", type="primary"):
+            if not name or not bsb or not acc_num:
+                st.error("Submission Denied: Profile details, BSB, and Account Numbers must be filled out.")
+            else:
+                payload = {
+                "name": name,
+                "region": region,
+                "majlis": majlis,
+                "account": account,
+                "total_receipts": total_receipts_input,
+                "total_amount": total_amount_input,
+                "bsb": bsb,
+                "acc_num": acc_num
+                }
 output_filename = "Expense_Claim_Statement.pdf"
 generate_pdf(output_filename, payload, receipt_records)
 st.success("🎉 Claim Bundle Form processed successfully!")
