@@ -199,39 +199,39 @@ else:
     receipt_records = []
     
     for i in range(int(total_receipts_input)):
-    st.markdown(f"#### 📄 Receipt Section Item #{i+1}")
-    r_col1, r_col2, r_col3, r_col4 = st.columns([2, 2, 1, 1])
+        st.markdown(f"#### 📄 Receipt Section Item #{i+1}")
+        r_col1, r_col2, r_col3, r_col4 = st.columns([2, 2, 1, 1])
 
-    with r_col1:
-        uploaded_file = st.file_uploader(
-            f"Upload Image Asset for Receipt #{i+1}",
-            type=["png", "jpg", "jpeg"], key=f"file_{i}"
-        )
+        with r_col1:
+            uploaded_file = st.file_uploader(
+                f"Upload Image Asset for Receipt #{i+1}",
+                type=["png", "jpg", "jpeg"], key=f"file_{i}"
+            )
 
-    # Scan only when a NEW file arrives, and push results into widget state
-    if uploaded_file is not None:
-        sig = f"{uploaded_file.name}_{uploaded_file.size}"
-        if st.session_state.get(f"sig_{i}") != sig:
-            with st.spinner(f"Scanning document #{i+1}..."):
-                d, t, g, raw = parse_receipt_image(uploaded_file)
-            st.session_state[f"desc_{i}"] = d
-            st.session_state[f"amt_{i}"] = float(t)
-            st.session_state[f"gst_{i}"] = float(g)
-            st.session_state[f"ocr_{i}"] = raw
-            st.session_state[f"sig_{i}"] = sig
+        # Scan only when a NEW file arrives, and push results into widget state
+        if uploaded_file is not None:
+            sig = f"{uploaded_file.name}_{uploaded_file.size}"
+            if st.session_state.get(f"sig_{i}") != sig:
+                with st.spinner(f"Scanning document #{i+1}..."):
+                    d, t, g, raw = parse_receipt_image(uploaded_file)
+                st.session_state[f"desc_{i}"] = d
+                st.session_state[f"amt_{i}"] = float(t)
+                st.session_state[f"gst_{i}"] = float(g)
+                st.session_state[f"ocr_{i}"] = raw
+                st.session_state[f"sig_{i}"] = sig
 
-    with r_col2:
-        desc_val = st.text_input(f"Item Description #{i+1}", key=f"desc_{i}")
-    with r_col3:
-        total_val = st.number_input(f"Amount ($) #{i+1}", min_value=0.0, format="%.2f", key=f"amt_{i}")
-    with r_col4:
-        gst_val = st.number_input(f"GST ($) #{i+1}", min_value=0.0, format="%.2f", key=f"gst_{i}")
+        with r_col2:
+            desc_val = st.text_input(f"Item Description #{i+1}", key=f"desc_{i}")
+        with r_col3:
+            total_val = st.number_input(f"Amount ($) #{i+1}", min_value=0.0, format="%.2f", key=f"amt_{i}")
+        with r_col4:
+            gst_val = st.number_input(f"GST ($) #{i+1}", min_value=0.0, format="%.2f", key=f"gst_{i}")
 
-    if f"ocr_{i}" in st.session_state:
-        with st.expander(f"Debug: raw OCR text for receipt #{i+1}"):
-            st.text(st.session_state[f"ocr_{i}"])
+        if f"ocr_{i}" in st.session_state:
+            with st.expander(f"Debug: raw OCR text for receipt #{i+1}"):
+                st.text(st.session_state[f"ocr_{i}"])
 
-    receipt_records.append({"desc": desc_val, "amount": total_val, "gst": gst_val})
+        receipt_records.append({"desc": desc_val, "amount": total_val, "gst": gst_val})
 
     st.markdown("---")
 
