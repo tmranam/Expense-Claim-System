@@ -213,8 +213,8 @@ else:
             payload = {
                 "name": name, 
                 "region": region, 
-                "majlis": majlis, 
-                "account": account,
+                "majlis": majlis,
+"account": account,
 "total_receipts": total_receipts_input,
 "total_amount": total_amount_input,
 "bsb": bsb,
@@ -225,10 +225,11 @@ generate_pdf(output_filename, payload, receipt_records)
 st.success("🎉 Claim Bundle Form processed successfully!")
 st.balloons()
 st.info(f"📧 Simulation Email Sent: PDF dispatched to targets: {', '.join(st.session_state.admin_lists['emails'])}")
-with open(output_filename, "rb") as pdf_file:
+# Read pdf bytes out directly to remove the nested "with open" indentation problem
+pdf_bytes = open(output_filename, "rb").read()
 st.download_button(
 label="📥 Download Generated Summary Receipt PDF File",
-data=pdf_file,
+data=pdf_bytes,
 file_name=output_filename,
 mime="application/pdf"
 )
