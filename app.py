@@ -2,12 +2,24 @@ import streamlit as st
 import re
 import json
 import os
+import shutil
 from PIL import Image
 import pytesseract
 from reportlab.lib.pagesizes import letter
 from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle
 from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
 from reportlab.lib import colors
+
+# -------------------------------------------------------------------------
+# DEFENSIVE LINUX PATH ANCHORING FOR STREAMLIT CLOUD INFRASTRUCTURE
+# -------------------------------------------------------------------------
+# Search the server architecture directly for the native tesseract install path
+detected_path = shutil.which("tesseract")
+if detected_path:
+    pytesseract.pytesseract.tesseract_cmd = detected_path
+else:
+    # Standard fallback path assignment for free tier cloud architecture
+    pytesseract.pytesseract.tesseract_cmd = "/usr/bin/tesseract"
 
 CONFIG_FILE = "admin_config.json"
 DEFAULT_CONFIG = {
@@ -39,7 +51,7 @@ if 'admin_lists' not in st.session_state:
     st.session_state.admin_lists = load_admin_settings()
 
 # -------------------------------------------------------------------------
-# LIGHTWEIGHT OCR PARSER & PDF GENERATOR
+# OPTIMIZED OCR PARSER & PDF GENERATOR
 # -------------------------------------------------------------------------
 def parse_receipt_image(uploaded_file):
     """Scans receipt content instantly using lightweight, throttle-safe Tesseract."""
@@ -52,7 +64,7 @@ def parse_receipt_image(uploaded_file):
         # 2. Downscale safely to manage memory limits
         gray_image.thumbnail((1000, 1000))
         
-        # 3. Fast extraction using Page Segmentation Mode 6
+        # 3. Fast extraction using Page Segmentation Mode 6 (Single text block parsing)
         custom_config = r'--psm 6'
         full_text = pytesseract.image_to_string(gray_image, config=custom_config).lower()
         
@@ -77,7 +89,7 @@ def parse_receipt_image(uploaded_file):
         gst_amount = 0.0
         if "gst" in cleaned_text or "tax" in cleaned_text:
             gst_matches = re.findall(r'(?:gst|tax)\s*(?:\$?)\s*(\d+[\.,]\d{2})', cleaned_text)
-            # FIXED: Safely fetch the first indexed group out of the list
+            # FIXED CRITICAL BUG: Target first string match index layout explicitly
             if gst_matches and len(gst_matches) > 0:
                 gst_amount = float(gst_matches[0].replace(',', '.'))
             else:
@@ -94,7 +106,7 @@ def parse_receipt_image(uploaded_file):
         description = ", ".join(keywords) if keywords else "General Expense Purchases"
         return description, total_amount, gst_amount
     except Exception as e:
-        return "Scan read error", 0.0, 0.0
+        return "Scan read execution issue", 0.0, 0.0
 
 def generate_pdf(filename, data, receipts):
     """Compiles a clean document statement using ReportLab canvas flowables."""
