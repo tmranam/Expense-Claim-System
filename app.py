@@ -41,7 +41,7 @@ if 'admin_lists' not in st.session_state:
 # -------------------------------------------------------------------------
 # LIGHTWEIGHT OCR PARSER & PDF GENERATOR
 # -------------------------------------------------------------------------
-    def parse_receipt_image(uploaded_file):
+def parse_receipt_image(uploaded_file):
     """Scans receipt content instantly using lightweight, throttle-safe Tesseract."""
     try:
         image = Image.open(uploaded_file)
