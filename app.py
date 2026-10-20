@@ -3,8 +3,7 @@ import re
 import json
 import os
 from PIL import Image
-import easyocr
-import numpy as np
+import pytesseract
 from reportlab.lib.pagesizes import letter
 from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle
 from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
@@ -39,63 +38,46 @@ def save_admin_settings(config_data):
 if 'admin_lists' not in st.session_state:
     st.session_state.admin_lists = load_admin_settings()
 
-# Load OCR reader with gpu=False to prevent cloud environment driver crashes
-@st.cache_resource
-def load_ocr_reader():
-    return easyocr.Reader(['en'], gpu=False)
-
-try:
-    reader = load_ocr_reader()
-except Exception as e:
-    reader = None
-
 # -------------------------------------------------------------------------
-# OCR PARSER & PDF GENERATOR
+# LIGHTWEIGHT OCR PARSER & PDF GENERATOR
 # -------------------------------------------------------------------------
 def parse_receipt_image(uploaded_file):
-    """Scans receipt content with safe resource constraints for free servers."""
-    if reader is None:
-        return "OCR Engine Initializing (Check packages.txt)", 0.0, 0.0
+    """Scans receipt content instantly using lightweight, throttle-safe Tesseract."""
     try:
         image = Image.open(uploaded_file)
-        # Downscale image if it is too large to protect the 1GB RAM ceiling
+        # Downscale image to optimize text extraction speed and memory safety
         image.thumbnail((800, 800))
-        img_np = np.array(image)
         
-        # Run OCR extraction
-        result = reader.readtext(img_np, detail=0)
-        full_text = " ".join(result).lower()
+        # Fast, low-memory text processing extraction string
+        full_text = pytesseract.image_to_string(image).lower()
         
-        # 1. Clean the text to make parsing reliable (remove spaces between numbers/dots)
+        # Clean the text string to remove broken layout spaces inside numbers
         cleaned_text = re.sub(r'(?<=\d)\s+(?=\d)', '', full_text)
         
-        # 2. Extract anything that looks like an amount (e.g., 12.50, 105.00, 45.9)
+        # Gather all variations matching a basic price layout (e.g. 12.50)
         found_amounts = []
-        raw_matches = re.findall(r'\d+[\.,]\d{2}|\d+[\.,]\d{1}', cleaned_text)
+        raw_matches = re.findall(r'\d+[\.,]\d{2}', cleaned_text)
         
         for match in raw_matches:
             try:
-                # Standardize commas to dots for float conversion
                 clean_num = match.replace(',', '.')
                 found_amounts.append(float(clean_num))
             except ValueError:
                 continue
                 
-        # The largest value printed on a receipt is almost always the Total
+        # The maximum value discovered is safely assumed to be the Total Amount
         total_amount = max(found_amounts) if found_amounts else 0.0
         
-        # 3. Handle GST Extraction (Standard 10% Australian GST)
+        # Calculate standard 10% Australian GST if Tax marker mentions are present
         gst_amount = 0.0
         if "gst" in cleaned_text or "tax" in cleaned_text:
-            # Check if a specific GST amount is printed nearby
             gst_matches = re.findall(r'(?:gst|tax)\s*(?:\$?)\s*(\d+[\.,]\d{2})', cleaned_text)
             if gst_matches:
                 gst_amount = float(gst_matches[0].replace(',', '.'))
             else:
-                # If "GST" is found but no specific number, estimate it from the total (Total / 11)
                 gst_amount = round(total_amount / 11, 2)
         
-        # 4. Extract Category Descriptions
+        # Scan for common commercial business vendors to formulate a description
         keywords = []
         possible_items = ['uber', 'cafe', 'officeworks', 'bunnings', 'parking', 'fuel', 'stationery', 'food', 'meals', 'woolworths', 'coles']
         for item in possible_items:
@@ -105,7 +87,7 @@ def parse_receipt_image(uploaded_file):
         description = ", ".join(keywords) if keywords else "General Expense Purchases"
         return description, total_amount, gst_amount
     except Exception as e:
-        return "Scan read timeout", 0.0, 0.0
+        return "Scan ready error", 0.0, 0.0
 
 def generate_pdf(filename, data, receipts):
     """Compiles a clean document statement using ReportLab canvas flowables."""
