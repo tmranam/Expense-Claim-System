@@ -29,7 +29,7 @@ else:
 
 CONFIG_FILE = "admin_config.json"
 
-# Relational mapping framework configuration dictionary supporting dynamic dependencies
+# Relational mapping framework configuration dictionary updated for Majlis Ansarullah Australia
 DEFAULT_CONFIG = {
     "regions": ["National", "Region North", "Region South"],
     "regional_majlis": {
@@ -61,6 +61,8 @@ def load_admin_settings():
         try:
             with open(CONFIG_FILE, "r") as f:
                 data = json.load(f)
+                
+                # --- FIXED CRITICAL FALLBACK STRUCTURE CHECKS ---
                 for key in DEFAULT_CONFIG:
                     if key not in data or not data[key]:
                         data[key] = DEFAULT_CONFIG[key]
@@ -77,6 +79,7 @@ def save_admin_settings(config_data):
 # Initialize settings in state
 if 'admin_lists' not in st.session_state:
     st.session_state.admin_lists = load_admin_settings()
+
 # -------------------------------------------------------------------------
 # DUAL-FORMAT OCR ENGINE FOR IMAGE & PDF TRANSLATION PROCESSING
 # -------------------------------------------------------------------------
@@ -87,18 +90,21 @@ def parse_receipt_image_or_pdf(uploaded_file):
         file_ext = os.path.splitext(uploaded_file.name).lower()
         raw_text = ""
         
+        # Scenario A: Handle direct PDF digital uploads via page vector scanning blocks
         if file_ext == ".pdf":
             temp_pdf_path = f"temp_ocr_{uploaded_file.name}"
             with open(temp_pdf_path, "wb") as temp_f:
                 temp_f.write(uploaded_file.read())
             
             try:
+                # Attempt structural digital text reading extraction first
                 reader = pypdf.PdfReader(temp_pdf_path)
                 for page in reader.pages:
                     text_content = page.extract_text()
                     if text_content:
                         raw_text += text_content + "\n"
                 
+                # Fallback to raster image conversion parsing if document is a scanned image container
                 if not raw_text.strip():
                     converted_images = convert_from_path(temp_pdf_path)
                     for pil_img in converted_images:
@@ -107,6 +113,8 @@ def parse_receipt_image_or_pdf(uploaded_file):
             finally:
                 if os.path.exists(temp_pdf_path):
                     os.remove(temp_pdf_path)
+                    
+        # Scenario B: Handle standard image asset uploads (PNG, JPG, JPEG)
         else:
             image = Image.open(uploaded_file)
             image = ImageOps.exif_transpose(image)
@@ -117,6 +125,7 @@ def parse_receipt_image_or_pdf(uploaded_file):
         raw_text_lower = raw_text.lower()
         cleaned_text = re.sub(r'(?<=\d)[ \t]*([.,])[ \t]*(?=\d{2}\b)', r'\1', raw_text_lower)
 
+        # Extrapolate numeric balance points
         amounts = []
         for m in re.findall(r'\b\d+[.,]\d{2}\b', cleaned_text):
             try:
@@ -133,6 +142,7 @@ def parse_receipt_image_or_pdf(uploaded_file):
             else:
                 gst_amount = round(total_amount / 11, 2)
 
+        # Parse data timestamps matching common layouts
         detected_date = datetime.today().strftime('%d/%m/%Y')
         date_patterns = re.findall(r'\b\d{1,2}[/\-]\d{1,2}[/\-]\d{2,4}\b', raw_text)
         if date_patterns:
@@ -147,13 +157,12 @@ def parse_receipt_image_or_pdf(uploaded_file):
     except Exception as e:
         return "Scan failed", 0.0, 0.0, datetime.today().strftime('%d/%m/%Y'), f"ERROR: {e}"
 # -------------------------------------------------------------------------
-# COMPREHENSIVE DYNAMIC EXCEL-REPLICA REPORTLAB VOUCHER ENGINE
+# COMPREHENSIVE DYNAMIC MULTI-PAGE REPORTLAB PDF BUILDER MODULE
 # -------------------------------------------------------------------------
 def generate_official_voucher_pdf(filename, data, receipts):
-    """Compiles a complete layout clone matching the official Department of Mal Voucher."""
+    """Compiles a dynamic multi-page clone matching the Majlis Ansarullah Australia layout."""
     doc = SimpleDocTemplate(filename, pagesize=letter, rightMargin=36, leftMargin=36, topMargin=36, bottomMargin=36)
     story = []
-    styles = getSampleStyleSheet()
     
     header_title_style = ParagraphStyle('HeadTitle', fontName='Helvetica-Bold', fontSize=14, alignment=1, spaceAfter=2)
     header_subtitle_style = ParagraphStyle('HeadSub', fontName='Helvetica-Bold', fontSize=12, alignment=1, spaceAfter=2)
@@ -168,7 +177,6 @@ def generate_official_voucher_pdf(filename, data, receipts):
     story.append(Paragraph("Expense Payment Voucher", header_subtitle_style))
     story.append(Spacer(1, 10))
     
-    # Block A: Header profiles configuration structural grid (Total = 540 pt)
     header_data = [
         [Paragraph("<b>Payee Name:</b>", cell_style), Paragraph(data['name'], cell_style), Paragraph("<b>Voucher No:</b>", cell_style), Paragraph("", cell_style)],
         [Paragraph("<b>Expense Type:</b>", cell_style), Paragraph(data['expense_type'], cell_style), Paragraph("<b>BSB:</b>", cell_style), Paragraph(data['bsb'], cell_style)],
@@ -186,14 +194,7 @@ def generate_official_voucher_pdf(filename, data, receipts):
     story.append(t_header)
     story.append(Spacer(1, 15))
     
-    # Block B: Line items table breakdown structural layout grid (Total = 540 pt)
-    receipt_table_data = [[
-        Paragraph("<b>#</b>", cell_bold_style), 
-        Paragraph("<b>Date</b>", cell_bold_style), 
-        Paragraph("<b>Description</b>", cell_bold_style), 
-        Paragraph("<b>Total amount</b>", cell_bold_style), 
-        Paragraph("<b>GST</b>", cell_bold_style)
-    ]]
+    receipt_table_data = [[Paragraph("<b>#</b>", cell_bold_style), Paragraph("<b>Date</b>", cell_bold_style), Paragraph("<b>Description</b>", cell_bold_style), Paragraph("<b>Total amount</b>", cell_bold_style), Paragraph("<b>GST</b>", cell_bold_style)]]
     
     max_rows = max(10, len(receipts))
     for idx in range(max_rows):
@@ -211,7 +212,7 @@ def generate_official_voucher_pdf(filename, data, receipts):
             
     receipt_table_data.append([Paragraph("<b>Total</b>", cell_bold_style), "", "", Paragraph(f"<b>${data['total_amount']:.2f}</b>", cell_bold_style), Paragraph(f"<b>${data['total_gst']:.2f}</b>", cell_bold_style)])
     
-    t_receipts = Table(receipt_table_data, colWidths=[30, 70, 260, 90, 90])
+    t_receipts = Table(receipt_table_data, colWidths=[30, 80, 250, 90, 90])
     t_receipts.setStyle(TableStyle([
         ('GRID', (0,0), (-1,-1), 1, colors.black),
         ('VALIGN', (0,0), (-1,-1), 'MIDDLE'),
@@ -222,7 +223,6 @@ def generate_official_voucher_pdf(filename, data, receipts):
     story.append(t_receipts)
     story.append(Spacer(1, 15))
     
-    # Block C: Complete sign-off matrices verification framework (Total = 540 pt)
     signoff_data = [
         [Paragraph("<b>Requested by:</b>", cell_bold_style), Paragraph("<b>Reviewed by Nazime A'la:</b>", cell_bold_style)],
         [Paragraph(f"Name: {data['name']}", cell_style), Paragraph(f"Name: {data['nazim_name']}", cell_style)],
@@ -249,7 +249,6 @@ def generate_official_voucher_pdf(filename, data, receipts):
     story.append(Paragraph("<b>Comments:</b> Hand written Receipt approved by Sadr Majlis. (Updated: 1-11-19)", cell_style))
     
     doc.build(story)
-
 # -------------------------------------------------------------------------
 # DYNAMIC MULTI-FORMAT APPRENDIX BINDER STITCHING PIPELINE
 # -------------------------------------------------------------------------
@@ -264,8 +263,10 @@ def stitch_files_to_pdf(voucher_pdf_path, uploaded_files_list):
                 u_file.seek(0)
                 ext = os.path.splitext(u_file.name).lower()
                 
+                # Directly merge PDF file submissions
                 if ext == ".pdf":
                     merger.append(u_file)
+                # Convert and append image file submissions
                 else:
                     img = Image.open(u_file)
                     img = ImageOps.exif_transpose(img)
@@ -331,7 +332,7 @@ def dispatch_real_email(recipient_list, subject_text, body_text, attachment_path
         return False
 
 # -------------------------------------------------------------------------
-# FRONT-END DESIGNS CONFIGURATORS
+# CORE FRONT-END SELECTION ROUTER
 # -------------------------------------------------------------------------
 st.set_page_config(page_title="Expense Portal (Official MAA Clone)", layout="wide")
 app_mode = st.sidebar.selectbox("Navigate Mode", ["User Claim Portal", "Admin Panel Configuration"])
@@ -405,92 +406,14 @@ if app_mode == "Admin Panel Configuration":
             st.success("Global application schema configuration matrix updated successfully!")
             st.rerun()
 # =========================================================================
-# BLOCK 5 (PART 1 OF 2): USER Portal FIELD GRID AND RECEIPT INGESTION TABLE
-# =========================================================================
-else:
-    st.title("📋 Online Expense Claim Submission System")
-    st.markdown("##### *Majlis Ansarullah Australia - Department of Mal Form Portal*")
-    
-    col1, col2 = st.columns(2)
-    with col1:
-        name = st.text_input("Full Employee / Claimant Name (Payee Name)")
-        claimant_email = st.text_input("Your Personal/Employee Email Address (For confirmation copy)")
-        expense_event_desc = st.text_input("Description of Event / Expense Type (Expense Type)")
-        
-        configured_regions = st.session_state.admin_lists["regions"]
-        region = st.selectbox("Select Region / National Location (Region)", options=configured_regions)
-        
-        majlis_lookup_map = st.session_state.admin_lists["regional_majlis"]
-        available_majlis_options = majlis_lookup_map.get(region, ["No entries declared under this region boundary"])
-        
-        majlis = st.selectbox("Select Respective Residing Majlis / Office Destination (Majlis)", options=available_majlis_options)
-        account = st.text_input("General Ledger / Tracking Account Code (Account)")
-        
-    with col2:
-        total_receipts_input = st.number_input("Total Number of Receipts To Claim", min_value=1, max_value=50, value=1, step=1)
-        declared_total_input = st.number_input("Total Declared Claim Amount ($) (Total Claim)", min_value=0.0, format="%.2f")
-        
-        st.markdown("**🏦 Direct Reimbursement Bank Segment**")
-        bsb = st.text_input("Bank BSB Code (e.g., 000-000) (BSB)", max_chars=7)
-        acc_num = st.text_input("Account Number (Account)")
-
-    st.markdown("---")
-    st.subheader("📎 Individual Itemized Receipt Image/PDF Ingestion Block")
-    
-    receipt_records = []
-    raw_files_tracker = []
-    uploaded_files_count = 0
-    
-    for i in range(int(total_receipts_input)):
-        st.markdown(f"#### 📄 Receipt Section Item #{i+1}")
-        
-        # Explicit width scaling arrays to balance grid boundaries nicely across fields
-        r_col1, r_col2, r_col3, r_col4, r_col5 = st.columns([2.5, 2.5, 2, 1.5, 1.5])
-
-        with r_col1:
-            uploaded_file = st.file_uploader(
-                f"Upload Receipt #{i+1} (Image or PDF)",
-                type=["png", "jpg", "jpeg", "pdf"], key=f"file_{i}"
-            )
-            raw_files_tracker.append(uploaded_file)
-            if uploaded_file is not None:
-                uploaded_files_count += 1
-
-        if uploaded_file is not None:
-            sig = f"{uploaded_file.name}_{uploaded_file.size}"
-            if st.session_state.get(f"sig_{i}") != sig:
-                with st.spinner(f"Scanning document #{i+1}..."):
-                    d, t, g, dt, raw = parse_receipt_image_or_pdf(uploaded_file)
-                st.session_state[f"desc_{i}"] = d
-                st.session_state[f"amt_{i}"] = float(t)
-                st.session_state[f"gst_{i}"] = float(g)
-                st.session_state[f"date_{i}"] = dt
-                st.session_state[f"ocr_{i}"] = raw
-                st.session_state[f"sig_{i}"] = sig
-
-        with r_col2:
-            desc_val = st.text_input(f"Item Description #{i+1} (Description)", key=f"desc_{i}")
-        with r_col3:
-            date_val = st.text_input(f"Receipt Date (DD/MM/YYYY) #{i+1} (Date)", key=f"date_{i}")
-        with r_col4:
-            total_val = st.number_input(f"Amount ($) #{i+1} (Total Amount)", min_value=0.0, format="%.2f", key=f"amt_{i}")
-        with r_col5:
-            gst_val = st.number_input(f"GST ($) #{i+1} (GST)", min_value=0.0, format="%.2f", key=f"gst_{i}")
-
-        if f"ocr_{i}" in st.session_state:
-            with st.expander(f"Debug: raw OCR text for receipt #{i+1}"):
-                st.text(st.session_state[f"ocr_{i}"])
-
-        receipt_records.append({"desc": desc_val, "date": date_val, "amount": total_val, "gst": gst_val})
-# =========================================================================
-# BLOCK 5 (PART 2 OF 2): BUSINESS LOGIC VALIDATION AND SMTP SUBMISSION
+# BATCH 6 OF 6: LIVE AGGREGATION, VALIDATION BARRIERS, AND SUBMISSION DISPATCH
 # =========================================================================
 
-    # Continuous background aggregation loops
+    # Continuous background aggregation loops reading live calculated user edits instantly
     calculated_total_claim = sum(r["amount"] for r in receipt_records)
     calculated_total_gst = sum(r["gst"] for r in receipt_records)
     
-    # Validation safety logic scripts definitions
+    # Mathematical balance verification validation script checks
     is_amount_matching = abs(calculated_total_claim - declared_total_input) < 0.01
     missing_receipts_delta = int(total_receipts_input) - uploaded_files_count
 
@@ -506,9 +429,10 @@ else:
     st.markdown("---")
     st.markdown("### 🛡️ System Submission Safety Validation Checks")
 
+    # Interactive blocking flags initialization parameters
     block_submission = False
 
-    # 1. Verification of line item total amount entries matching claimant inputs
+    # 1. Verification of line item total amount entries matching claimant expectations
     if not is_amount_matching:
         st.error(f"❌ Total Doesn't Match: The sum of your individual row entries (${calculated_total_claim:.2f}) does not match your typed Total Declared Claim Amount (${declared_total_input:.2f}). Please review row values.")
         block_submission = True
@@ -535,7 +459,7 @@ else:
             if not name or not bsb or not acc_num or not claimant_email or not expense_event_desc:
                 st.error("Submission Denied: Profile details, Event Description, Claimant Email, BSB, and Account Numbers must be filled out completely.")
             else:
-                # Fetch localized admin configuration variables
+                # Fetch localized admin configuration variables mapped out under Batch 4
                 nazim_info = st.session_state.admin_lists.get("regional_nazims", {}).get(region, {"name": "Not Configured", "email": ""})
                 
                 payload = {
