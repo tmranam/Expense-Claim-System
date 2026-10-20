@@ -205,14 +205,20 @@ else:
             
         receipt_records.append({"desc": desc_val, "amount": total_val, "gst": gst_val})
 
+    # --- INDENTATION CRITICAL SUBMIT REGION FIXED BELOW ---
     if st.button("Finalize and Submit Expense Claims Bundle", type="primary"):
         if not name or not bsb or not acc_num:
             st.error("Submission Denied: Profile details, BSB, and Account Numbers must be filled out.")
         else:
             payload = {
-                "name": name, "region": region, "majlis": majlis, "account": account,
-                "total_receipts": total_receipts_input, "total_amount": total_amount_input,
-              "bsb": bsb, "acc_num": acc_num
+                "name": name, 
+                "region": region, 
+                "majlis": majlis,
+"account": account,
+"total_receipts": total_receipts_input,
+"total_amount": total_amount_input,
+"bsb": bsb,
+"acc_num": acc_num
 }
 output_filename = "Expense_Claim_Statement.pdf"
 generate_pdf(output_filename, payload, receipt_records)
