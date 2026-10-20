@@ -52,7 +52,7 @@ def parse_receipt_image(uploaded_file):
         # 2. Downscale safely to manage memory limits
         gray_image.thumbnail((1000, 1000))
         
-        # 3. Fast extraction using Page Segmentation Mode 6 (treat image as a uniform block of text)
+        # 3. Fast extraction using Page Segmentation Mode 6
         custom_config = r'--psm 6'
         full_text = pytesseract.image_to_string(gray_image, config=custom_config).lower()
         
@@ -77,8 +77,8 @@ def parse_receipt_image(uploaded_file):
         gst_amount = 0.0
         if "gst" in cleaned_text or "tax" in cleaned_text:
             gst_matches = re.findall(r'(?:gst|tax)\s*(?:\$?)\s*(\d+[\.,]\d{2})', cleaned_text)
-            if gst_matches:
-                # FIXED: Pick the first element out of the regex match list safely
+            # FIXED: Verify the regex group list actually contains an element before parsing it
+            if gst_matches and len(gst_matches) > 0:
                 gst_amount = float(gst_matches[0].replace(',', '.'))
             else:
                 # If 'GST' text is present but no clean float next to it, apply the math rule (Total / 11)
@@ -95,7 +95,6 @@ def parse_receipt_image(uploaded_file):
         return description, total_amount, gst_amount
     except Exception as e:
         return "Scan read error", 0.0, 0.0
-
 def generate_pdf(filename, data, receipts):
     """Compiles a clean document statement using ReportLab canvas flowables."""
     doc = SimpleDocTemplate(filename, pagesize=letter)
