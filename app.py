@@ -571,14 +571,14 @@ else:
                 
                generate_official_voucher_pdf(output_filename, payload, receipt_records)
 
-with st.spinner("Stitching receipts into the claim PDF..."):
-    stitched_ok = stitch_files_to_pdf(output_filename, raw_files_tracker)
+                with st.spinner("Stitching receipts into the claim PDF..."):
+                    stitched_ok = stitch_files_to_pdf(output_filename, raw_files_tracker)
 
-if not stitched_ok:
-    st.stop()
+                if not stitched_ok:
+                    st.stop()
 
-st.success("🎉 Claim pack compiled: summary page + all receipts!")
-st.balloons()
+            st.success("🎉 Claim pack compiled: summary page + all receipts!")
+            st.balloons()
                 
                 target_email = nazim_info.get("email", "")
                 if target_email:
