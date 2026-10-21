@@ -543,7 +543,7 @@ else:
     st.markdown("---")
 
     if block_submission:
-        st.button("Finalize and Submit Expense Claims Bundle", type="primary", disabled=True, help="Please resolve all structural error/warning notifications above to unlock the submit pipeline.")
+        st.button("Submit", type="primary", disabled=True, help="Please resolve all structural error/warning notifications above to unlock the submit pipeline.")
     else:
         if st.button("Finalize and Submit Expense Claims Bundle", type="primary"):
             if not name or not bsb or not acc_num or not claimant_email or not expense_event_desc:
