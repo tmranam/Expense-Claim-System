@@ -450,20 +450,20 @@ else:
     
     col1, col2 = st.columns(2)
     with col1:
-        name = st.text_input("Full Employee / Claimant Name (Payee Name)")
-        claimant_email = st.text_input("Your Personal/Employee Email Address (For confirmation copy)")
+        name = st.text_input("Full Name (Payee Name)")
+        claimant_email = st.text_input("Email Address")
         expense_event_desc = st.text_input("Description of Event (Expense Type)")
         
         configured_regions = st.session_state.admin_lists["regions"]
-        region = st.selectbox("Select Region / National Location", options=configured_regions)
+        region = st.selectbox("Select Region / National", options=configured_regions)
         
         majlis_lookup_map = st.session_state.admin_lists["regional_majlis"]
         available_majlis_options = majlis_lookup_map.get(region, [])
         if not available_majlis_options:
             available_majlis_options = ["No entries declared under this region boundary"]
         
-        majlis = st.selectbox("Select Respective Residing Majlis / Office Destination", options=available_majlis_options)
-        account = st.text_input("General Ledger / Tracking Account Code (Account)")
+        majlis = st.selectbox("Select your Majlis / Office", options=available_majlis_options)
+        account = st.text_input("Account")
         
     with col2:
         total_receipts_input = st.number_input("Total Number of Receipts To Claim", min_value=1, max_value=50, value=1, step=1)
