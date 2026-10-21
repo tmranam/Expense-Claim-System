@@ -142,6 +142,9 @@ def parse_receipt_image_or_pdf(uploaded_file):
 # -------------------------------------------------------------------------
 # COMPREHENSIVE DYNAMIC MULTI-PAGE REPORTLAB PDF BUILDER MODULE
 # -------------------------------------------------------------------------
+# -------------------------------------------------------------------------
+# COMPREHENSIVE DYNAMIC MULTI-PAGE REPORTLAB PDF BUILDER MODULE
+# -------------------------------------------------------------------------
 def generate_official_voucher_pdf(filename, data, receipts):
     doc = SimpleDocTemplate(filename, pagesize=letter, rightMargin=36, leftMargin=36, topMargin=36, bottomMargin=36)
     story = []
@@ -178,6 +181,7 @@ def generate_official_voucher_pdf(filename, data, receipts):
     ]))
     story.append(t_header)
     story.append(Spacer(1, 15))
+
 
     
     receipt_table_data = [[Paragraph("<b>#</b>", cell_bold_style), Paragraph("<b>Date</b>", cell_bold_style), Paragraph("<b>Description</b>", cell_bold_style), Paragraph("<b>Total amount</b>", cell_bold_style), Paragraph("<b>GST</b>", cell_bold_style)]]
@@ -252,6 +256,7 @@ def generate_official_voucher_pdf(filename, data, receipts):
     story.append(Paragraph("<b>Comments:</b> Hand written Receipt approved by Sadr Majlis. (Updated: 1-11-19)", cell_style))
     
     doc.build(story)
+
 
 def _image_to_pdf_buffer(u_file, label):
     img = Image.open(u_file)
