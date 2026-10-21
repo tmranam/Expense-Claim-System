@@ -33,7 +33,7 @@ else:
 
 CONFIG_FILE = "admin_config.json"
 
-# Relational mapping framework configuration dictionary updated for Majlis Ansarullah Australia
+# Relational mapping framework configuration dictionary updated for split National vs Regional Accounts
 DEFAULT_CONFIG = {
     "regions": ["National", "Region North", "Region South"],
     "regional_majlis": {
@@ -41,7 +41,20 @@ DEFAULT_CONFIG = {
         "Region North": ["Youth Majlis North", "Local Chapter A"],
         "Region South": ["Youth Majlis South", "Local Chapter B"]
     },
-    "accounts": ["1000 - General Operations", "2000 - Local Events", "3000 - Welfare Projects", "4000 - Office Admin"],
+    "regional_accounts": {
+        "National": [
+            "NAT-1000 - National HQ Operations",
+            "NAT-2000 - Central Tabligh Campaigns",
+            "NAT-3000 - Australia-Wide Tarbiyat Initiatives",
+            "NAT-4000 - Head Office Administrative Overhead"
+        ],
+        "General_Regional": [
+            "REG-5000 - Local Majlis Operational Funds",
+            "REG-6000 - Regional ljtema Expense Allocation",
+            "REG-7000 - Local Welfare & Khidmat-e-Khalq",
+            "REG-8000 - Regional Sports & Local Youth Engagement"
+        ]
+    },
     "emails": ["finance@example.com", "approvals@example.com"],
     "admin_password": "123",
     "smtp_server": "://gmail.com",
@@ -91,7 +104,7 @@ def parse_receipt_image_or_pdf(uploaded_file):
     """Processes images or PDFs, returning (description, total, gst, receipt_date, raw_text)."""
     try:
         uploaded_file.seek(0)
-        file_ext = os.path.splitext(uploaded_file.name)[1].lower()
+        file_ext = os.path.splitext(uploaded_file.name).lower()
         raw_text = ""
         
         # Scenario A: Handle direct PDF digital uploads via page vector scanning blocks
@@ -142,7 +155,7 @@ def parse_receipt_image_or_pdf(uploaded_file):
         if "gst" in cleaned_text or "tax" in cleaned_text:
             gst_numbers = re.findall(r'(?:gst|tax)[^\d\n]*(\d+[.,]\d{2})', cleaned_text)
             if gst_numbers:
-                gst_amount = float(gst_numbers[0].replace(',', '.'))
+                gst_amount = float(gst_numbers.replace(',', '.'))
             else:
                 gst_amount = round(total_amount / 11, 2)
 
@@ -150,7 +163,7 @@ def parse_receipt_image_or_pdf(uploaded_file):
         detected_date = datetime.today().strftime('%d/%m/%Y')
         date_patterns = re.findall(r'\b\d{1,2}[/\-]\d{1,2}[/\-]\d{2,4}\b', raw_text)
         if date_patterns:
-            detected_date = date_patterns[0].replace('-', '/')
+            detected_date = date_patterns.replace('-', '/')
 
         possible_items = ['uber', 'cafe', 'officeworks', 'bunnings', 'parking',
                           'fuel', 'stationery', 'food', 'meals', 'woolworths', 'coles']
@@ -190,7 +203,7 @@ def generate_official_voucher_pdf(filename, data, receipts):
         [Paragraph("<b>Majlis:</b>", cell_style), Paragraph(data['majlis'], cell_style), Paragraph("<b>Advance Issued:</b>", cell_style), Paragraph(f"$ {data['advance']:.2f}" if data['advance'] > 0 else "", cell_red_bold_style)]
     ]
     
-    t_header = Table(header_data, colWidths=[100, 170, 100, 170])
+    t_header = Table(header_data, colWidths=)
     t_header.setStyle(TableStyle([
         ('GRID', (0,0), (-1,-1), 1, colors.black),
         ('VALIGN', (0,0), (-1,-1), 'MIDDLE'),
@@ -232,7 +245,7 @@ def generate_official_voucher_pdf(filename, data, receipts):
         Paragraph(f"<b>${data['total_gst']:.2f}</b>", cell_bold_style)
     ])
     
-    t_receipts = Table(receipt_table_data, colWidths=[30, 80, 250, 90, 90])
+    t_receipts = Table(receipt_table_data, colWidths=)
     t_receipts.setStyle(TableStyle([
         ('GRID', (0,0), (-1,-1), 1, colors.black),
         ('VALIGN', (0,0), (-1,-1), 'MIDDLE'),
@@ -254,7 +267,7 @@ def generate_official_voucher_pdf(filename, data, receipts):
         [Paragraph("Date:", cell_style), Paragraph("Date:", cell_style)],
     ]
     
-    t_signoff = Table(signoff_data, colWidths=[270, 270])
+    t_signoff = Table(signoff_data, colWidths=)
     t_signoff.setStyle(TableStyle([
         ('GRID', (0,0), (-1,-1), 1, colors.black),
         ('BACKGROUND', (0,0), (1,0), colors.lightgrey),
@@ -341,10 +354,10 @@ if app_mode == "Admin Panel Configuration":
     st.title("⚙️ Admin Control Panel")
     pwd_input = st.text_input("Enter Master Admin Access Key Password", type="password")
     
-    if pwd_input == st.session_state.admin_lists.get("admin_password", "AdminPassword123"):
+    if pwd_input == st.session_state.admin_lists.get("admin_password", "123"):
         st.success("Access Verified. Secure Configuration Screen Unlocked.")
         
-        new_pwd = st.text_input("Modify System Admin Password Key", value=st.session_state.admin_lists.get("admin_password", "AdminPassword123"))
+        new_pwd = st.text_input("Modify System Admin Password Key", value=st.session_state.admin_lists.get("admin_password", "123"))
         
         st.markdown("### 👑 Central Executive Authority Configuration (Global Overrides)")
         q_mal = st.text_input("Approved by Qaid Mal - Target Field Assignment Name", value=st.session_state.admin_lists.get("qaid_mal_name", "Tahir Mahmood Rana"))
@@ -355,9 +368,15 @@ if app_mode == "Admin Panel Configuration":
         parsed_regions_list = [line.strip() for line in regions_text.split("\n") if line.strip()]
 
         st.markdown("---")
-        st.markdown("#### 📑 Ledger Accounts Master List Configuration")
-        accounts_text = st.text_area("Accounts Master List Configuration (One entry per line)", value="\n".join(st.session_state.admin_lists.get("accounts", DEFAULT_CONFIG["accounts"])))
-        parsed_accounts_list = [line.strip() for line in accounts_text.split("\n") if line.strip()]
+        st.markdown("#### 📑 Categorized Ledger Accounts Management Matrix")
+        
+        saved_accounts = st.session_state.admin_lists.get("regional_accounts", DEFAULT_CONFIG["regional_accounts"])
+        
+        nat_acc_text = st.text_area("National-Only Accounts Configuration (One entry per line)", value="\n".join(saved_accounts.get("National", [])))
+        reg_acc_text = st.text_area("General Regional Accounts Configuration (One entry per line)", value="\n".join(saved_accounts.get("General_Regional", [])))
+        
+        parsed_nat_accounts = [line.strip() for line in nat_acc_text.split("\n") if line.strip()]
+        parsed_reg_accounts = [line.strip() for line in reg_acc_text.split("\n") if line.strip()]
         
         st.markdown("---")
         st.markdown("#### 🗺️ Regional Majlis & Nazim e Ala Configuration Matrix")
@@ -395,7 +414,10 @@ if app_mode == "Admin Panel Configuration":
             updated_config = {
                 "regions": parsed_regions_list,
                 "regional_majlis": updated_map,
-                "accounts": parsed_accounts_list,
+                "regional_accounts": {
+                    "National": parsed_nat_accounts,
+                    "General_Regional": parsed_reg_accounts
+                },
                 "emails": [line.strip() for line in st.session_state.admin_lists.get("emails", [])],
                 "admin_password": new_pwd.strip(),
                 "smtp_server": smtp_srv.strip(),
@@ -433,9 +455,17 @@ else:
         
         majlis = st.selectbox("Select your Majlis / Office", options=available_majlis_options)
         
-        # --- REPLACED TEXT INPUT WITH DYNAMIC SELECTBOX DROPDOWN MATRIX ---
-        configured_accounts = st.session_state.admin_lists.get("accounts", DEFAULT_CONFIG["accounts"])
-        account = st.selectbox("Select Tracking Account Code", options=configured_accounts)
+        # --- DYNAMIC CATEGORIZED ACCOUNT DROPDOWN MATRIX INTERACTION ---
+        saved_accounts = st.session_state.admin_lists.get("regional_accounts", DEFAULT_CONFIG["regional_accounts"])
+        if region == "National":
+            active_account_choices = saved_accounts.get("National", [])
+        else:
+            active_account_choices = saved_accounts.get("General_Regional", [])
+            
+        if not active_account_choices:
+            active_account_choices = ["No configured account lines found for this category"]
+            
+        account = st.selectbox("Select Tracking Account Code", options=active_account_choices)
         
     with col2:
         total_receipts_input = st.number_input("Total Number of Receipts To Claim", min_value=1, max_value=50, value=1, step=1)
