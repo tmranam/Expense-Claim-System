@@ -580,23 +580,23 @@ else:
             st.success("🎉 Claim pack compiled: summary page + all receipts!")
             st.balloons()
                 
-                target_email = nazim_info.get("email", "")
-                if target_email:
-                    recipient_emails = [target_email]
-                    subject = f"Expense Payment Voucher Submission - {name} ({region})"
-                    body = f"Assalam-o-Alaikum,\n\nA new expense payment voucher pack has been generated and submitted by {name} for the '{majlis}' branch of the '{region}' region.\n\nPlease find the comprehensive document statement bundle (Voucher Sheet + Attached Receipts) attached below for your immediate review.\n\nBest regards,\nAutomated Expense Portal Gateway"
+            target_email = nazim_info.get("email", "")
+            if target_email:
+                recipient_emails = [target_email]
+                subject = f"Expense Payment Voucher Submission - {name} ({region})"
+                body = f"Assalam-o-Alaikum,\n\nA new expense payment voucher pack has been generated and submitted by {name} for the '{majlis}' branch of the '{region}' region.\n\nPlease find the comprehensive document statement bundle (Voucher Sheet + Attached Receipts) attached below for your immediate review.\n\nBest regards,\nAutomated Expense Portal Gateway"
                     
-                    with st.spinner("Transmitting secure PDF files bundle across outbound networks..."):
-                        success = dispatch_real_email(
-                            recipient_list=recipient_emails, 
-                            subject_text=subject, 
-                            body_text=body, 
-                            attachment_path=output_filename,
-                            cc_recipient=claimant_email.strip()
-                        )
+                with st.spinner("Transmitting secure PDF files bundle across outbound networks..."):
+                    success = dispatch_real_email(
+                        recipient_list=recipient_emails, 
+                        subject_text=subject, 
+                        body_text=body, 
+                        attachment_path=output_filename,
+                        cc_recipient=claimant_email.strip()
+                    )
                     
-                    if success:
-                        st.success(f"📧 Outbound Email Dispatched! Delivered directly to Nazim e Ala ({target_email}) and carbon-copied (CC) to claimant address: {claimant_email}")
+                if success:
+                    st.success(f"📧 Outbound Email Dispatched! Delivered directly to Nazim e Ala ({target_email}) and carbon-copied (CC) to claimant address: {claimant_email}")
                 else:
                     st.warning("⚠️ Email delivery skipped: No Nazim e Ala email address configured for this region in admin settings.")
                 
