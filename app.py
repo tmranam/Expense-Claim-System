@@ -2,25 +2,25 @@ import streamlit as st
 import re
 import json
 import os
+import io
+import uuid
 import shutil
-import smtplib
 from datetime import datetime
-from email.mime.multipart import MIMEMultipart
-from email.mime.text import MIMEText
-from email.mime.base import MIMEBase
-from email import encoders
+from zoneinfo import ZoneInfo
 from PIL import Image, ImageOps
 import pytesseract
 from reportlab.lib.pagesizes import A4
 from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle
-from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+from reportlab.lib.styles import ParagraphStyle
 from reportlab.lib import colors
 import pypdf
 from pdf2image import convert_from_path
-import io
 from pypdf import PdfReader, PdfWriter
 from reportlab.pdfgen import canvas
 from reportlab.lib.utils import ImageReader
+from google.oauth2 import service_account
+from googleapiclient.discovery import build
+from googleapiclient.http import MediaIoBaseUpload
 
 # -------------------------------------------------------------------------
 # DEFENSIVE LINUX PATH ANCHORING FOR STREAMLIT CLOUD INFRASTRUCTURE
@@ -32,8 +32,21 @@ else:
     pytesseract.pytesseract.tesseract_cmd = "/usr/bin/tesseract"
 
 CONFIG_FILE = "admin_config.json"
+LOCAL_TZ = ZoneInfo("Australia/Sydney")
 
-# Relational mapping framework configuration dictionary updated for split National vs Regional Accounts
+STATUS_PENDING = "Pending"
+STATUS_HOLD = "On Hold"
+STATUS_APPROVED = "Approved"
+STATUS_REJECTED = "Rejected"
+
+REGISTER_NAME = "claims_register.json"
+DRIVE_SCOPES = ["https://www.googleapis.com/auth/drive"]
+
+
+def now_local():
+    return datetime.now(LOCAL_TZ)
+
+
 DEFAULT_CONFIG = {
     "regions": ["National", "Region North", "Region South"],
     "regional_majlis": {
@@ -55,9 +68,10 @@ DEFAULT_CONFIG = {
             "REG-8000 - Regional Sports & Local Youth Engagement"
         ]
     },
+    "drive_folder_link": "",
     "emails": ["finance@example.com", "approvals@example.com"],
     "admin_password": "123",
-    "smtp_server": "://gmail.com",
+    "smtp_server": "smtp.gmail.com",
     "smtp_port": 587,
     "smtp_user": "claimsubmissionmaaa@gmail.com",
     "smtp_password": "",
@@ -71,57 +85,153 @@ DEFAULT_CONFIG = {
 }
 
 # -------------------------------------------------------------------------
-# PERSISTENT STORAGE MANAGEMENT FOR FREE STREAMLIT TIER
+# SETTINGS STORAGE
 # -------------------------------------------------------------------------
 def load_admin_settings():
-    """Loads admin configurations from a local JSON file to survive app sleeping."""
+    """Loads admin configurations from a local JSON file."""
     if os.path.exists(CONFIG_FILE):
         try:
             with open(CONFIG_FILE, "r") as f:
                 data = json.load(f)
-                
-                # --- FIXED CRITICAL FALLBACK STRUCTURE CHECKS ---
                 for key in DEFAULT_CONFIG:
-                    if key not in data or not data[key]:
+                    if key not in data:
+                        data[key] = DEFAULT_CONFIG[key]
+                    elif not data[key] and key != "drive_folder_link":
                         data[key] = DEFAULT_CONFIG[key]
                 return data
         except Exception:
-            return DEFAULT_CONFIG
-    return DEFAULT_CONFIG
+            return dict(DEFAULT_CONFIG)
+    return dict(DEFAULT_CONFIG)
+
 
 def save_admin_settings(config_data):
-    """Saves admin updates permanently into the repository environment."""
     with open(CONFIG_FILE, "w") as f:
         json.dump(config_data, f, indent=4)
 
-# Initialize settings in state
+
 if 'admin_lists' not in st.session_state:
     st.session_state.admin_lists = load_admin_settings()
+
 # -------------------------------------------------------------------------
-# DUAL-FORMAT OCR ENGINE FOR IMAGE & PDF TRANSLATION PROCESSING
+# GOOGLE DRIVE LAYER (PDF storage + claims register)
+# -------------------------------------------------------------------------
+def _secret(key):
+    try:
+        return st.secrets[key]
+    except Exception:
+        return None
+
+
+def extract_folder_id(link_or_id):
+    """Accepts a Drive folder URL or a bare folder ID and returns the ID."""
+    text = (link_or_id or "").strip()
+    if not text:
+        return None
+    m = re.search(r"/folders/([A-Za-z0-9_-]+)", text) or re.search(r"[?&]id=([A-Za-z0-9_-]+)", text)
+    if m:
+        return m.group(1)
+    if re.fullmatch(r"[A-Za-z0-9_-]{20,}", text):
+        return text
+    return None
+
+
+def get_drive_folder_id():
+    link = st.session_state.admin_lists.get("drive_folder_link", "") or _secret("drive_folder_link") or ""
+    return extract_folder_id(link)
+
+
+def get_service_account_email():
+    info = _secret("gcp_service_account")
+    try:
+        return info["client_email"] if info else None
+    except Exception:
+        return None
+
+
+def get_drive_service():
+    info = _secret("gcp_service_account")
+    if not info:
+        return None
+    creds = service_account.Credentials.from_service_account_info(dict(info), scopes=DRIVE_SCOPES)
+    return build("drive", "v3", credentials=creds, cache_discovery=False)
+
+
+def upload_pdf_to_drive(service, folder_id, filename, pdf_bytes):
+    media = MediaIoBaseUpload(io.BytesIO(pdf_bytes), mimetype="application/pdf", resumable=False)
+    meta = {"name": filename, "parents": [folder_id]}
+    created = service.files().create(
+        body=meta, media_body=media, fields="id, webViewLink", supportsAllDrives=True
+    ).execute()
+    return created["id"], created["webViewLink"]
+
+
+def _find_register_id(service, folder_id):
+    q = f"name = '{REGISTER_NAME}' and '{folder_id}' in parents and trashed = false"
+    res = service.files().list(
+        q=q, fields="files(id)", supportsAllDrives=True, includeItemsFromAllDrives=True
+    ).execute()
+    files = res.get("files", [])
+    return files[0]["id"] if files else None
+
+
+def load_register(service, folder_id):
+    """Returns (list_of_claims, register_file_id_or_None)."""
+    fid = _find_register_id(service, folder_id)
+    if not fid:
+        return [], None
+    raw = service.files().get_media(fileId=fid, supportsAllDrives=True).execute()
+    return json.loads(raw.decode("utf-8")), fid
+
+
+def save_register(service, folder_id, claims, fid):
+    body_bytes = json.dumps(claims, indent=2).encode("utf-8")
+    media = MediaIoBaseUpload(io.BytesIO(body_bytes), mimetype="application/json", resumable=False)
+    if fid:
+        service.files().update(fileId=fid, media_body=media, supportsAllDrives=True).execute()
+    else:
+        service.files().create(
+            body={"name": REGISTER_NAME, "parents": [folder_id]},
+            media_body=media, fields="id", supportsAllDrives=True
+        ).execute()
+
+
+def add_claim_to_register(service, folder_id, record):
+    claims, fid = load_register(service, folder_id)
+    claims.append(record)
+    save_register(service, folder_id, claims, fid)
+
+
+def set_claim_status(service, folder_id, claim_id, new_status):
+    claims, fid = load_register(service, folder_id)
+    for c in claims:
+        if c["id"] == claim_id:
+            c["status"] = new_status
+            c["decided_on"] = now_local().strftime('%d/%m/%Y') if new_status in (STATUS_APPROVED, STATUS_REJECTED) else ""
+            break
+    save_register(service, folder_id, claims, fid)
+
+# -------------------------------------------------------------------------
+# OCR ENGINE FOR IMAGE & PDF RECEIPTS
 # -------------------------------------------------------------------------
 def parse_receipt_image_or_pdf(uploaded_file):
     """Processes images or PDFs, returning (description, total, gst, receipt_date, raw_text)."""
     try:
         uploaded_file.seek(0)
-        file_ext = os.path.splitext(uploaded_file.name).lower()
+        file_ext = os.path.splitext(uploaded_file.name)[1].lower()
         raw_text = ""
-        
-        # Scenario A: Handle direct PDF digital uploads via page vector scanning blocks
+
         if file_ext == ".pdf":
-            temp_pdf_path = f"temp_ocr_{uploaded_file.name}"
+            temp_pdf_path = f"temp_ocr_{uuid.uuid4().hex}.pdf"
             with open(temp_pdf_path, "wb") as temp_f:
                 temp_f.write(uploaded_file.read())
-            
+
             try:
-                # Attempt structural digital text reading extraction first
                 reader = pypdf.PdfReader(temp_pdf_path)
                 for page in reader.pages:
                     text_content = page.extract_text()
                     if text_content:
                         raw_text += text_content + "\n"
-                
-                # Fallback to raster image conversion parsing if document is a scanned image container
+
                 if not raw_text.strip():
                     converted_images = convert_from_path(temp_pdf_path)
                     for pil_img in converted_images:
@@ -130,8 +240,6 @@ def parse_receipt_image_or_pdf(uploaded_file):
             finally:
                 if os.path.exists(temp_pdf_path):
                     os.remove(temp_pdf_path)
-                    
-        # Scenario B: Handle standard image asset uploads (PNG, JPG, JPEG)
         else:
             image = Image.open(uploaded_file)
             image = ImageOps.exif_transpose(image)
@@ -142,7 +250,6 @@ def parse_receipt_image_or_pdf(uploaded_file):
         raw_text_lower = raw_text.lower()
         cleaned_text = re.sub(r'(?<=\d)[ \t]*([.,])[ \t]*(?=\d{2}\b)', r'\1', raw_text_lower)
 
-        # Extrapolate numeric balance points
         amounts = []
         for m in re.findall(r'\b\d+[.,]\d{2}\b', cleaned_text):
             try:
@@ -155,15 +262,14 @@ def parse_receipt_image_or_pdf(uploaded_file):
         if "gst" in cleaned_text or "tax" in cleaned_text:
             gst_numbers = re.findall(r'(?:gst|tax)[^\d\n]*(\d+[.,]\d{2})', cleaned_text)
             if gst_numbers:
-                gst_amount = float(gst_numbers.replace(',', '.'))
+                gst_amount = float(gst_numbers[0].replace(',', '.'))
             else:
                 gst_amount = round(total_amount / 11, 2)
 
-        # Parse data timestamps matching common layouts
-        detected_date = datetime.today().strftime('%d/%m/%Y')
+        detected_date = now_local().strftime('%d/%m/%Y')
         date_patterns = re.findall(r'\b\d{1,2}[/\-]\d{1,2}[/\-]\d{2,4}\b', raw_text)
         if date_patterns:
-            detected_date = date_patterns.replace('-', '/')
+            detected_date = date_patterns[0].replace('-', '/')
 
         possible_items = ['uber', 'cafe', 'officeworks', 'bunnings', 'parking',
                           'fuel', 'stationery', 'food', 'meals', 'woolworths', 'coles']
@@ -172,18 +278,16 @@ def parse_receipt_image_or_pdf(uploaded_file):
 
         return description, total_amount, gst_amount, detected_date, raw_text
     except Exception as e:
-        return "Scan failed", 0.0, 0.0, datetime.today().strftime('%d/%m/%Y'), f"ERROR: {e}"
+        return "Scan failed", 0.0, 0.0, now_local().strftime('%d/%m/%Y'), f"ERROR: {e}"
+
 # -------------------------------------------------------------------------
-# COMPREHENSIVE DYNAMIC MULTI-PAGE REPORTLAB PDF BUILDER MODULE
-# -------------------------------------------------------------------------
-# -------------------------------------------------------------------------
-# COMPREHENSIVE DYNAMIC MULTI-PAGE REPORTLAB PDF BUILDER MODULE
+# VOUCHER PDF BUILDER
 # -------------------------------------------------------------------------
 def generate_official_voucher_pdf(filename, data, receipts):
-    """Compiles a dynamic multi-page clone matching the Majlis Ansarullah Australia layout."""
+    """Compiles the Majlis Ansarullah Australia expense voucher."""
     doc = SimpleDocTemplate(filename, pagesize=A4, rightMargin=36, leftMargin=36, topMargin=36, bottomMargin=36)
     story = []
-    
+
     header_title_style = ParagraphStyle('HeadTitle', fontName='Helvetica-Bold', fontSize=14, alignment=1, spaceAfter=2)
     header_subtitle_style = ParagraphStyle('HeadSub', fontName='Helvetica-Bold', fontSize=12, alignment=1, spaceAfter=2)
     dept_style = ParagraphStyle('Dept', fontName='Helvetica', fontSize=11, alignment=1, spaceAfter=2)
@@ -191,13 +295,13 @@ def generate_official_voucher_pdf(filename, data, receipts):
     cell_style = ParagraphStyle('Cell', fontName='Helvetica', fontSize=9, leading=11)
     cell_bold_style = ParagraphStyle('CellB', fontName='Helvetica-Bold', fontSize=9, leading=11)
     cell_red_bold_style = ParagraphStyle('CellRB', fontName='Helvetica-Bold', fontSize=9, leading=11, textColor=colors.red)
-    
+
     story.append(Paragraph("In the name of Allah, the gracious, the merciful", top_line_style))
     story.append(Paragraph("MAJLIS ANSARULLAH AUSTRALIA", header_title_style))
     story.append(Paragraph("Department of Mal", dept_style))
     story.append(Paragraph("Expense Payment Voucher", header_subtitle_style))
     story.append(Spacer(1, 10))
-    
+
     header_data = [
         [Paragraph("<b>Payee Name:</b>", cell_style), Paragraph(data['name'], cell_style), Paragraph("<b>Voucher No:</b>", cell_style), Paragraph("", cell_style)],
         [Paragraph("<b>Expense Type:</b>", cell_style), Paragraph(data['expense_type'], cell_style), Paragraph("<b>BSB:</b>", cell_style), Paragraph(data['bsb'], cell_style)],
@@ -205,18 +309,18 @@ def generate_official_voucher_pdf(filename, data, receipts):
         [Paragraph("<b>Region:</b>", cell_style), Paragraph(data['region'], cell_style), Paragraph("<b>Total Claim:</b>", cell_bold_style), Paragraph(f"<b>$ {data['total_amount']:.2f}</b>", cell_bold_style)],
         [Paragraph("<b>Majlis:</b>", cell_style), Paragraph(data['majlis'], cell_style), Paragraph("<b>Advance Issued:</b>", cell_style), Paragraph(f"$ {data['advance']:.2f}" if data['advance'] > 0 else "", cell_red_bold_style)]
     ]
-    
+
     t_header = Table(header_data, colWidths=[100, 170, 100, 170])
     t_header.setStyle(TableStyle([
-        ('GRID', (0,0), (-1,-1), 1, colors.black),
-        ('VALIGN', (0,0), (-1,-1), 'MIDDLE'),
-        ('PADDING', (0,0), (-1,-1), 5),
+        ('GRID', (0, 0), (-1, -1), 1, colors.black),
+        ('VALIGN', (0, 0), (-1, -1), 'MIDDLE'),
+        ('PADDING', (0, 0), (-1, -1), 5),
     ]))
     story.append(t_header)
     story.append(Spacer(1, 15))
-    
+
     receipt_table_data = [[Paragraph("<b>#</b>", cell_bold_style), Paragraph("<b>Date</b>", cell_bold_style), Paragraph("<b>Description</b>", cell_bold_style), Paragraph("<b>Total amount</b>", cell_bold_style), Paragraph("<b>GST</b>", cell_bold_style)]]
-    
+
     advance = data.get('advance', 0.0)
     net_total = data['total_amount'] - advance
 
@@ -247,47 +351,47 @@ def generate_official_voucher_pdf(filename, data, receipts):
         Paragraph(f"<b>${net_total:.2f}</b>", cell_bold_style),
         Paragraph(f"<b>${data['total_gst']:.2f}</b>", cell_bold_style)
     ])
-    
+
     t_receipts = Table(receipt_table_data, colWidths=[30, 80, 250, 90, 90])
     t_receipts.setStyle(TableStyle([
-        ('GRID', (0,0), (-1,-1), 1, colors.black),
-        ('VALIGN', (0,0), (-1,-1), 'MIDDLE'),
-        ('PADDING', (0,0), (-1,-1), 4),
-        ('BACKGROUND', (0,0), (-1,0), colors.lightgrey),
-        ('ALIGN', (3,1), (-1,-1), 'RIGHT')
+        ('GRID', (0, 0), (-1, -1), 1, colors.black),
+        ('VALIGN', (0, 0), (-1, -1), 'MIDDLE'),
+        ('PADDING', (0, 0), (-1, -1), 4),
+        ('BACKGROUND', (0, 0), (-1, 0), colors.lightgrey),
+        ('ALIGN', (3, 1), (-1, -1), 'RIGHT')
     ]))
     story.append(t_receipts)
     story.append(Spacer(1, 15))
-    
+
     signoff_data = [
         [Paragraph("<b>Requested by:</b>", cell_bold_style), Paragraph("<b>Reviewed by Nazime A'la:</b>", cell_bold_style)],
         [Paragraph(f"Name: {data['name']}", cell_style), Paragraph(f"Name: {data['nazim_name']}", cell_style)],
         [Paragraph("Signature:", cell_style), Paragraph("Signature:", cell_style)],
-        [Paragraph(f"Date: {datetime.today().strftime('%d/%m/%Y')}", cell_style), Paragraph("Date:", cell_style)],
+        [Paragraph(f"Date: {now_local().strftime('%d/%m/%Y')}", cell_style), Paragraph("Date:", cell_style)],
         [Paragraph("<b>Approved by Qaid Mal:</b>", cell_bold_style), Paragraph("<b>Approved by Sadr MAA:</b>", cell_bold_style)],
         [Paragraph(f"Name: {data['qaid_mal']}", cell_style), Paragraph(f"Name: {data['sadr_maa']}", cell_style)],
         [Paragraph("Signature: <i>Tahir Mehmood</i>", cell_style), Paragraph("Signature:", cell_style)],
         [Paragraph("Date:", cell_style), Paragraph("Date:", cell_style)],
     ]
-    
+
     t_signoff = Table(signoff_data, colWidths=[270, 270])
     t_signoff.setStyle(TableStyle([
-        ('GRID', (0,0), (-1,-1), 1, colors.black),
-        ('BACKGROUND', (0,0), (1,0), colors.lightgrey),
-        ('BACKGROUND', (0,4), (1,4), colors.lightgrey),
-        ('PADDING', (0,0), (-1,-1), 4),
+        ('GRID', (0, 0), (-1, -1), 1, colors.black),
+        ('BACKGROUND', (0, 0), (1, 0), colors.lightgrey),
+        ('BACKGROUND', (0, 4), (1, 4), colors.lightgrey),
+        ('PADDING', (0, 0), (-1, -1), 4),
     ]))
     story.append(t_signoff)
-    
+
     story.append(Spacer(1, 10))
     story.append(Paragraph("<b>Acknowledgment</b>", header_subtitle_style))
     story.append(Paragraph("I have received cash/cheque payment of $________________ as per details provided above.", cell_style))
     story.append(Paragraph("<b>Comments:</b> Hand written Receipt approved by Sadr Majlis. (Updated: 1-11-19)", cell_style))
-    
+
     doc.build(story)
 
 # -------------------------------------------------------------------------
-# DUAL-FORMAT APPENDIX BINDER STITCHING PIPELINE
+# APPENDIX BINDER STITCHING PIPELINE
 # -------------------------------------------------------------------------
 def _image_to_pdf_buffer(u_file, label):
     """Places an image receipt on an A4-size page, scaled to fit."""
@@ -317,6 +421,7 @@ def _image_to_pdf_buffer(u_file, label):
     c.save()
     buf.seek(0)
     return buf
+
 
 def stitch_files_to_pdf(voucher_pdf_path, uploaded_files_list):
     """Summary page first, then every uploaded receipt, as one PDF."""
@@ -348,6 +453,229 @@ def stitch_files_to_pdf(voucher_pdf_path, uploaded_files_list):
     except Exception as e:
         st.error(f"⚠️ Could not attach receipts to the voucher: {e}")
         return False
+
+# -------------------------------------------------------------------------
+# ADMIN: CLAIMS DASHBOARD
+# -------------------------------------------------------------------------
+DASH_HEADERS = ["Claimant", "Date", "Event", "Total Claim", "GST", "Advance Adj.", "Amount To Pay", "File", "Action"]
+DASH_WIDTHS = [1.5, 1.0, 1.6, 1.0, 0.8, 1.0, 1.1, 0.8, 2.6]
+
+
+def _cell(col, text):
+    col.markdown(str(text).replace("$", "\\$"))
+
+
+def render_claim_rows(service, folder_id, claims_subset, actions):
+    if not claims_subset:
+        st.info("No claims in this tab.")
+        return
+
+    header_cols = st.columns(DASH_WIDTHS)
+    for col, label in zip(header_cols, DASH_HEADERS):
+        col.markdown(f"**{label}**")
+    st.divider()
+
+    for c in sorted(claims_subset, key=lambda x: x.get("submitted_ts", ""), reverse=True):
+        cols = st.columns(DASH_WIDTHS)
+        _cell(cols[0], c.get("name", ""))
+        _cell(cols[1], c.get("submitted_on", ""))
+        _cell(cols[2], c.get("event", ""))
+        _cell(cols[3], f"${c.get('total_claim', 0):,.2f}")
+        _cell(cols[4], f"${c.get('gst', 0):,.2f}")
+        advance = c.get("advance", 0)
+        _cell(cols[5], f"-${advance:,.2f}" if advance > 0 else "-")
+        _cell(cols[6], f"**${c.get('amount_payable', 0):,.2f}**")
+        cols[7].markdown(f"[Open PDF]({c.get('file_link', '')})")
+
+        with cols[8]:
+            btn_cols = st.columns(len(actions))
+            for b_col, (label, new_status) in zip(btn_cols, actions):
+                if b_col.button(label, key=f"{c['status']}_{new_status}_{c['id']}", use_container_width=True):
+                    try:
+                        set_claim_status(service, folder_id, c["id"], new_status)
+                    except Exception as e:
+                        st.error(f"Could not update claim: {e}")
+                    else:
+                        st.rerun()
+        st.divider()
+
+
+def render_claims_dashboard():
+    st.markdown("### 📊 Claims Dashboard")
+    top_a, top_b, _ = st.columns([1, 1, 6])
+    if top_a.button("⚙️ Settings", use_container_width=True):
+        st.session_state.admin_view = "settings"
+        st.rerun()
+    if top_b.button("🔄 Refresh", use_container_width=True):
+        st.rerun()
+
+    folder_id = get_drive_folder_id()
+    try:
+        service = get_drive_service()
+    except Exception as e:
+        st.error(f"Google Drive credentials problem: {e}")
+        return
+
+    if service is None:
+        st.warning("Google Drive credentials are not set up yet. Add the service account to the app secrets (see Settings for details).")
+        return
+    if not folder_id:
+        st.warning("No Google Drive folder is configured. Open Settings and paste your Drive folder link.")
+        return
+
+    try:
+        claims, _ = load_register(service, folder_id)
+    except Exception as e:
+        st.error(f"Could not read the claims register from Google Drive: {e}")
+        return
+
+    by_status = {
+        STATUS_PENDING: [c for c in claims if c.get("status") == STATUS_PENDING],
+        STATUS_HOLD: [c for c in claims if c.get("status") == STATUS_HOLD],
+        STATUS_APPROVED: [c for c in claims if c.get("status") == STATUS_APPROVED],
+        STATUS_REJECTED: [c for c in claims if c.get("status") == STATUS_REJECTED],
+    }
+
+    tab_pending, tab_hold, tab_approved, tab_rejected = st.tabs([
+        f"Pending ({len(by_status[STATUS_PENDING])})",
+        f"On Hold ({len(by_status[STATUS_HOLD])})",
+        f"Approved ({len(by_status[STATUS_APPROVED])})",
+        f"Rejected ({len(by_status[STATUS_REJECTED])})",
+    ])
+
+    with tab_pending:
+        render_claim_rows(service, folder_id, by_status[STATUS_PENDING],
+                          [("Approve", STATUS_APPROVED), ("Reject", STATUS_REJECTED), ("Hold", STATUS_HOLD)])
+    with tab_hold:
+        render_claim_rows(service, folder_id, by_status[STATUS_HOLD],
+                          [("Approve", STATUS_APPROVED), ("Reject", STATUS_REJECTED)])
+    with tab_approved:
+        render_claim_rows(service, folder_id, by_status[STATUS_APPROVED],
+                          [("Reopen", STATUS_PENDING)])
+    with tab_rejected:
+        render_claim_rows(service, folder_id, by_status[STATUS_REJECTED],
+                          [("Reopen", STATUS_PENDING)])
+
+# -------------------------------------------------------------------------
+# ADMIN: SETTINGS PAGE
+# -------------------------------------------------------------------------
+def render_settings_page():
+    st.markdown("### ⚙️ Settings")
+    if st.button("⬅ Back to Claims Dashboard"):
+        st.session_state.admin_view = "dashboard"
+        st.rerun()
+
+    new_pwd = st.text_input("Modify System Admin Password Key", value=st.session_state.admin_lists.get("admin_password", "123"))
+
+    st.markdown("---")
+    st.markdown("#### ☁️ Google Drive Storage")
+    sa_email = get_service_account_email()
+    if sa_email:
+        st.info(f"Share your Google Drive folder with this address (Editor access): `{sa_email}`")
+    else:
+        st.warning("Google service account credentials were not found in the app secrets, so claims cannot be saved to Drive yet.")
+
+    drive_link_input = st.text_input(
+        "Google Drive Folder Link (claim PDFs and the claims register are saved here — change it each year)",
+        value=st.session_state.admin_lists.get("drive_folder_link", "")
+    )
+    typed_folder_id = extract_folder_id(drive_link_input)
+    if drive_link_input.strip() and not typed_folder_id:
+        st.error("Could not find a folder ID in that link. Open the folder in Drive and copy the address from the browser.")
+
+    if st.button("Test Drive connection"):
+        if not typed_folder_id:
+            st.error("Enter a valid Drive folder link first.")
+        else:
+            try:
+                service = get_drive_service()
+                if service is None:
+                    st.error("Service account credentials are missing from the app secrets.")
+                else:
+                    meta = service.files().get(
+                        fileId=typed_folder_id, fields="id, name, mimeType", supportsAllDrives=True
+                    ).execute()
+                    if meta.get("mimeType") != "application/vnd.google-apps.folder":
+                        st.error("That link points to a file, not a folder.")
+                    else:
+                        st.success(f"Connected. Folder found: {meta.get('name')}")
+            except Exception as e:
+                st.error(f"Could not open that folder. Check that it is shared with the service account. Details: {e}")
+
+    st.markdown("---")
+    st.markdown("### 👑 Central Executive Authority Configuration (Global Overrides)")
+    q_mal = st.text_input("Approved by Qaid Mal - Target Field Assignment Name", value=st.session_state.admin_lists.get("qaid_mal_name", "Tahir Mahmood Rana"))
+    s_maa = st.text_input("Approved by Sadr MAA - Target Field Assignment Name", value=st.session_state.admin_lists.get("sadr_maa_name", "Abdul Jamil Mubbashar"))
+
+    st.markdown("---")
+    regions_text = st.text_area("Regions Master List Configuration (One entry per line)", value="\n".join(st.session_state.admin_lists["regions"]))
+    parsed_regions_list = [line.strip() for line in regions_text.split("\n") if line.strip()]
+
+    st.markdown("---")
+    st.markdown("#### 📑 Categorized Ledger Accounts Management Matrix")
+    saved_accounts = st.session_state.admin_lists.get("regional_accounts", DEFAULT_CONFIG["regional_accounts"])
+    nat_acc_text = st.text_area("National-Only Accounts Configuration (One entry per line)", value="\n".join(saved_accounts.get("National", [])))
+    reg_acc_text = st.text_area("General Regional Accounts Configuration (One entry per line)", value="\n".join(saved_accounts.get("General_Regional", [])))
+    parsed_nat_accounts = [line.strip() for line in nat_acc_text.split("\n") if line.strip()]
+    parsed_reg_accounts = [line.strip() for line in reg_acc_text.split("\n") if line.strip()]
+
+    st.markdown("---")
+    st.markdown("#### 🗺️ Regional Majlis & Nazim e Ala Configuration Matrix")
+    selected_admin_region = st.selectbox("Select a region to configure details", options=parsed_regions_list)
+
+    current_map = st.session_state.admin_lists.get("regional_majlis", {})
+    existing_majlis_for_region = current_map.get(selected_admin_region, [])
+    majlis_text = st.text_area(f"Enter Majlis names for '{selected_admin_region}' (One entry per line)", value="\n".join(existing_majlis_for_region), height=100)
+    parsed_majlis_list = [line.strip() for line in majlis_text.split("\n") if line.strip()]
+
+    current_nazims = st.session_state.admin_lists.get("regional_nazims", {})
+    region_nazim_data = current_nazims.get(selected_admin_region, {"name": "", "email": ""})
+    nazim_name_input = st.text_input(f"Nazim e Ala Name for '{selected_admin_region}'", value=region_nazim_data.get("name", ""))
+    nazim_email_input = st.text_input(f"Nazim e Ala Email Address for '{selected_admin_region}'", value=region_nazim_data.get("email", ""))
+
+    st.markdown("---")
+    st.markdown("#### 🔐 Outbound live SMTP Server Credentials Gateway")
+    smtp_srv = st.text_input("SMTP Server Relay Node Hostname", value=st.session_state.admin_lists.get("smtp_server", "smtp.gmail.com"))
+    smtp_prt = st.number_input("SMTP Server TLS Port Number", value=int(st.session_state.admin_lists.get("smtp_port", 587)), step=1)
+    smtp_usr = st.text_input("Sender User Authentication Email Address ID", value=st.session_state.admin_lists.get("smtp_user", "claimsubmissionmaaa@gmail.com"))
+    smtp_pwd = st.text_input("Sender Account App Password Access Key", value=st.session_state.admin_lists.get("smtp_password", ""), type="password")
+
+    if st.button("Save System Configuration Schema Matrix", type="primary"):
+        updated_map = dict(current_map)
+        updated_map[selected_admin_region] = parsed_majlis_list
+        updated_map = {k: v for k, v in updated_map.items() if k in parsed_regions_list}
+        for r in parsed_regions_list:
+            if r not in updated_map:
+                updated_map[r] = []
+
+        updated_nazims = dict(current_nazims)
+        updated_nazims[selected_admin_region] = {"name": nazim_name_input.strip(), "email": nazim_email_input.strip()}
+        updated_nazims = {k: v for k, v in updated_nazims.items() if k in parsed_regions_list}
+
+        updated_config = {
+            "regions": parsed_regions_list,
+            "regional_majlis": updated_map,
+            "regional_accounts": {
+                "National": parsed_nat_accounts,
+                "General_Regional": parsed_reg_accounts
+            },
+            "drive_folder_link": drive_link_input.strip(),
+            "emails": [line.strip() for line in st.session_state.admin_lists.get("emails", [])],
+            "admin_password": new_pwd.strip(),
+            "smtp_server": smtp_srv.strip(),
+            "smtp_port": int(smtp_prt),
+            "smtp_user": smtp_usr.strip(),
+            "smtp_password": smtp_pwd.strip(),
+            "qaid_mal_name": q_mal.strip(),
+            "sadr_maa_name": s_maa.strip(),
+            "regional_nazims": updated_nazims
+        }
+
+        save_admin_settings(updated_config)
+        st.session_state.admin_lists = updated_config
+        st.success("Global application schema configuration matrix updated successfully!")
+        st.rerun()
+
 # -------------------------------------------------------------------------
 # CORE FRONT-END SELECTION ROUTER
 # -------------------------------------------------------------------------
@@ -357,124 +685,52 @@ app_mode = st.sidebar.selectbox("Navigate Mode", ["User Claim Portal", "Admin Pa
 if app_mode == "Admin Panel Configuration":
     st.title("⚙️ Admin Control Panel")
     pwd_input = st.text_input("Enter Master Admin Access Key Password", type="password")
-    
+
     if pwd_input == st.session_state.admin_lists.get("admin_password", "123"):
-        st.success("Access Verified. Secure Configuration Screen Unlocked.")
-        
-        new_pwd = st.text_input("Modify System Admin Password Key", value=st.session_state.admin_lists.get("admin_password", "123"))
-        
-        st.markdown("### 👑 Central Executive Authority Configuration (Global Overrides)")
-        q_mal = st.text_input("Approved by Qaid Mal - Target Field Assignment Name", value=st.session_state.admin_lists.get("qaid_mal_name", "Tahir Mahmood Rana"))
-        s_maa = st.text_input("Approved by Sadr MAA - Target Field Assignment Name", value=st.session_state.admin_lists.get("sadr_maa_name", "Abdul Jamil Mubbashar"))
-        
-        st.markdown("---")
-        regions_text = st.text_area("Regions Master List Configuration (One entry per line)", value="\n".join(st.session_state.admin_lists["regions"]))
-        parsed_regions_list = [line.strip() for line in regions_text.split("\n") if line.strip()]
+        if st.session_state.get("admin_view", "dashboard") == "settings":
+            render_settings_page()
+        else:
+            render_claims_dashboard()
+    elif pwd_input:
+        st.error("Incorrect password.")
 
-        st.markdown("---")
-        st.markdown("#### 📑 Categorized Ledger Accounts Management Matrix")
-        
-        saved_accounts = st.session_state.admin_lists.get("regional_accounts", DEFAULT_CONFIG["regional_accounts"])
-        
-        nat_acc_text = st.text_area("National-Only Accounts Configuration (One entry per line)", value="\n".join(saved_accounts.get("National", [])))
-        reg_acc_text = st.text_area("General Regional Accounts Configuration (One entry per line)", value="\n".join(saved_accounts.get("General_Regional", [])))
-        
-        parsed_nat_accounts = [line.strip() for line in nat_acc_text.split("\n") if line.strip()]
-        parsed_reg_accounts = [line.strip() for line in reg_acc_text.split("\n") if line.strip()]
-        
-        st.markdown("---")
-        st.markdown("#### 🗺️ Regional Majlis & Nazim e Ala Configuration Matrix")
-        selected_admin_region = st.selectbox("Select a region to configure details", options=parsed_regions_list)
-        
-        current_map = st.session_state.admin_lists.get("regional_majlis", {})
-        existing_majlis_for_region = current_map.get(selected_admin_region, [])
-        majlis_text = st.text_area(f"Enter Majlis names for '{selected_admin_region}' (One entry per line)", value="\n".join(existing_majlis_for_region), height=100)
-        parsed_majlis_list = [line.strip() for line in majlis_text.split("\n") if line.strip()]
-        
-        current_nazims = st.session_state.admin_lists.get("regional_nazims", {})
-        region_nazim_data = current_nazims.get(selected_admin_region, {"name": "", "email": ""})
-        nazim_name_input = st.text_input(f"Nazim e Ala Name for '{selected_admin_region}'", value=region_nazim_data.get("name", ""))
-        nazim_email_input = st.text_input(f"Nazim e Ala Email Address for '{selected_admin_region}'", value=region_nazim_data.get("email", ""))
-        
-        st.markdown("---")
-        st.markdown("#### 🔐 Outbound live SMTP Server Credentials Gateway")
-        smtp_srv = st.text_input("SMTP Server Relay Node Hostname", value=st.session_state.admin_lists.get("smtp_server", "://gmail.com"))
-        smtp_prt = st.number_input("SMTP Server TLS Port Number", value=int(st.session_state.admin_lists.get("smtp_port", 587)), step=1)
-        smtp_usr = st.text_input("Sender User Authentication Email Address ID", value=st.session_state.admin_lists.get("smtp_user", "claimsubmissionmaaa@gmail.com"))
-        smtp_pwd = st.text_input("Sender Account App Password Access Key", value=st.session_state.admin_lists.get("smtp_password", ""), type="password")
-        
-        if st.button("Save System Configuration Schema Matrix", type="primary"):
-            updated_map = dict(current_map)
-            updated_map[selected_admin_region] = parsed_majlis_list
-            updated_map = {k: v for k, v in updated_map.items() if k in parsed_regions_list}
-            for r in parsed_regions_list:
-                if r not in updated_map:
-                    updated_map[r] = []
-            
-            updated_nazims = dict(current_nazims)
-            updated_nazims[selected_admin_region] = {"name": nazim_name_input.strip(), "email": nazim_email_input.strip()}
-            updated_nazims = {k: v for k, v in updated_nazims.items() if k in parsed_regions_list}
-
-            updated_config = {
-                "regions": parsed_regions_list,
-                "regional_majlis": updated_map,
-                "regional_accounts": {
-                    "National": parsed_nat_accounts,
-                    "General_Regional": parsed_reg_accounts
-                },
-                "emails": [line.strip() for line in st.session_state.admin_lists.get("emails", [])],
-                "admin_password": new_pwd.strip(),
-                "smtp_server": smtp_srv.strip(),
-                "smtp_port": int(smtp_prt),
-                "smtp_user": smtp_usr.strip(),
-                "smtp_password": smtp_pwd.strip(),
-                "qaid_mal_name": q_mal.strip(),
-                "sadr_maa_name": s_maa.strip(),
-                "regional_nazims": updated_nazims
-            }
-            
-            save_admin_settings(updated_config)
-            st.session_state.admin_lists = updated_config
-            st.success("Global application schema configuration matrix updated successfully!")
-            st.rerun()
 # -------------------------------------------------------------------------
 # INTERACTIVE CLAIM FORM LAYOUT PANEL
 # -------------------------------------------------------------------------
 else:
     st.title("📋 Online Expense Claim Submission System")
-    
+
     col1, col2 = st.columns(2)
     with col1:
         name = st.text_input("Full Name (Payee Name)")
         claimant_email = st.text_input("Email Address")
         expense_event_desc = st.text_input("Description of Event (Expense Type)")
-        
+
         configured_regions = st.session_state.admin_lists["regions"]
         region = st.selectbox("Select Region / National", options=configured_regions)
-        
+
         majlis_lookup_map = st.session_state.admin_lists["regional_majlis"]
         available_majlis_options = majlis_lookup_map.get(region, [])
         if not available_majlis_options:
             available_majlis_options = ["No entries declared under this region boundary"]
-        
+
         majlis = st.selectbox("Select your Majlis / Office", options=available_majlis_options)
-        
-        # --- DYNAMIC CATEGORIZED ACCOUNT DROPDOWN MATRIX INTERACTION ---
+
         saved_accounts = st.session_state.admin_lists.get("regional_accounts", DEFAULT_CONFIG["regional_accounts"])
         if region == "National":
             active_account_choices = saved_accounts.get("National", [])
         else:
             active_account_choices = saved_accounts.get("General_Regional", [])
-            
+
         if not active_account_choices:
             active_account_choices = ["No configured account lines found for this category"]
-            
+
         account = st.selectbox("Select Tracking Account Code", options=active_account_choices)
-        
+
     with col2:
         total_receipts_input = st.number_input("Total Number of Receipts To Claim", min_value=1, max_value=50, value=1, step=1)
         declared_total_input = st.number_input("Total Declared Claim Amount ($)", min_value=0.0, format="%.2f")
-        
+
         st.markdown("**🏦 Direct Reimbursement Bank Segment**")
         bsb = st.text_input("Bank BSB Code (e.g., 000-000)", max_chars=7)
         acc_num = st.text_input("Account Number")
@@ -486,11 +742,11 @@ else:
 
     st.markdown("---")
     st.subheader("📎 Individual Itemized Receipt Image/PDF Ingestion Block")
-    
+
     receipt_records = []
     raw_files_tracker = []
     uploaded_files_count = 0
-    
+
     for i in range(int(total_receipts_input)):
         st.markdown(f"#### 📄 Receipt Section Item #{i+1}")
         r_col1, r_col2, r_col3, r_col4, r_col5 = st.columns([2.5, 2.5, 2, 1.5, 1.5])
@@ -533,13 +789,13 @@ else:
 
     calculated_total_claim = sum(r["amount"] for r in receipt_records)
     calculated_total_gst = sum(r["gst"] for r in receipt_records)
-    
+
     is_amount_matching = abs(calculated_total_claim - declared_total_input) < 0.01
     missing_receipts_delta = int(total_receipts_input) - uploaded_files_count
 
     st.markdown("---")
     st.markdown("### 📊 Dynamic Live Aggregated Verification Totals")
-    
+
     sum_col1, sum_col2 = st.columns(2)
     with sum_col1:
         st.metric(label="Total Aggregated Claim Amount (Calculated)", value=f"${calculated_total_claim:,.2f}")
@@ -565,9 +821,10 @@ else:
         block_submission = True
     else:
         st.success("✅ Attachment verification passed: All structural files accounted for.")
+
     if advance_amount > calculated_total_claim:
         st.error(f"❌ Advance Too High: The advance being settled (${advance_amount:.2f}) is more than the total claim (${calculated_total_claim:.2f}).")
-        block_submission = True        
+        block_submission = True
 
     st.markdown("---")
 
@@ -597,7 +854,9 @@ else:
                     "nazim_name": nazim_info.get("name", "Not Configured")
                 }
 
-                output_filename = f"Expense_Voucher_{name.replace(' ', '_')}.pdf"
+                stamp = now_local().strftime("%Y%m%d_%H%M%S")
+                safe_name = re.sub(r"[^A-Za-z0-9_-]", "", name.replace(" ", "_")) or "Claimant"
+                output_filename = f"Expense_Voucher_{safe_name}_{stamp}.pdf"
                 generate_official_voucher_pdf(output_filename, payload, receipt_records)
 
                 with st.spinner("Stitching receipts into the claim PDF..."):
@@ -606,14 +865,68 @@ else:
                 if not stitched_ok:
                     st.stop()
 
-                st.success("🎉 Claim pack compiled: summary page + all receipts!")
-                st.balloons()
-
                 with open(output_filename, "rb") as f:
                     pdf_bytes = f.read()
-                st.download_button(
-                    label="📥 Download Official Summary Voucher PDF File",
-                    data=pdf_bytes,
-                    file_name=output_filename,
-                    mime="application/pdf"
-                )
+                os.remove(output_filename)
+
+                saved_to_drive = False
+                drive_error = ""
+                with st.spinner("Saving your claim..."):
+                    try:
+                        service = get_drive_service()
+                        folder_id = get_drive_folder_id()
+                        if service is None or not folder_id:
+                            raise RuntimeError("Google Drive storage has not been set up by the administrator yet.")
+
+                        file_id, file_link = upload_pdf_to_drive(service, folder_id, output_filename, pdf_bytes)
+                        record = {
+                            "id": uuid.uuid4().hex[:10],
+                            "submitted_on": now_local().strftime('%d/%m/%Y'),
+                            "submitted_ts": now_local().isoformat(),
+                            "name": name,
+                            "event": expense_event_desc,
+                            "region": region,
+                            "majlis": majlis,
+                            "total_claim": round(calculated_total_claim, 2),
+                            "gst": round(calculated_total_gst, 2),
+                            "advance": round(advance_amount, 2),
+                            "amount_payable": round(calculated_total_claim - advance_amount, 2),
+                            "file_name": output_filename,
+                            "file_id": file_id,
+                            "file_link": file_link,
+                            "status": STATUS_PENDING,
+                            "decided_on": ""
+                        }
+                        add_claim_to_register(service, folder_id, record)
+                        saved_to_drive = True
+                    except Exception as e:
+                        drive_error = str(e)
+                        if "storage quota" in drive_error.lower() or "storagequota" in drive_error.lower():
+                            drive_error += " (The service account cannot own files in this folder. See the setup notes.)"
+
+                st.session_state.last_submission = {
+                    "saved": saved_to_drive,
+                    "error": drive_error,
+                    "filename": output_filename,
+                    "pdf_bytes": pdf_bytes,
+                }
+                if saved_to_drive:
+                    st.balloons()
+
+    last_submission = st.session_state.get("last_submission")
+    if last_submission:
+        st.markdown("---")
+        if last_submission["saved"]:
+            st.success("🎉 Your claim has been submitted and saved. You can download a copy below for your records.")
+        else:
+            st.error(
+                "Your claim PDF was created, but it could NOT be saved for the administrator. "
+                "Please download it below and send it to them directly. "
+                f"Details: {last_submission['error']}"
+            )
+        st.download_button(
+            label="📥 Download Official Summary Voucher PDF File",
+            data=last_submission["pdf_bytes"],
+            file_name=last_submission["filename"],
+            mime="application/pdf"
+        )
