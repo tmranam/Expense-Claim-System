@@ -55,63 +55,65 @@ DEFAULT_CONFIG = {
 # -------------------------------------------------------------------------
 # PERSISTENT STORAGE MANAGEMENT FOR FREE STREAMLIT TIER
 # -------------------------------------------------------------------------
-def save_admin_settings(config_data):
-    """Saves admin updates permanently into the repository environment."""
-    with open(CONFIG_FILE, "w") as f:
-        json.dump(config_data, f, indent=4)
-
 def load_admin_settings():
-    """Loads admin configurations from a local JSON file with auto-repair flags."""
+    """Loads admin configurations from a local JSON file to survive app sleeping."""
     if os.path.exists(CONFIG_FILE):
         try:
             with open(CONFIG_FILE, "r") as f:
                 data = json.load(f)
                 
-                # --- AUTOMATED DATABASE SELF-HEALING REPAIR MATRIX ---
-                updated_needed = False
-                for key, default_value in DEFAULT_CONFIG.items():
-                    if key not in data:
-                        data[key] = default_value
-                        updated_needed = True
-                
-                if updated_needed:
-                    save_admin_settings(data)
-                    
+                # --- FIXED CRITICAL FALLBACK STRUCTURE CHECKS ---
+                for key in DEFAULT_CONFIG:
+                    if key not in data or not data[key]:
+                        data[key] = DEFAULT_CONFIG[key]
                 return data
         except Exception:
             return DEFAULT_CONFIG
     return DEFAULT_CONFIG
 
+def save_admin_settings(config_data):
+    """Saves admin updates permanently into the repository environment."""
+    with open(CONFIG_FILE, "w") as f:
+        json.dump(config_data, f, indent=4)
+
 # Initialize settings in state
 if 'admin_lists' not in st.session_state:
     st.session_state.admin_lists = load_admin_settings()
-# =========================================================================
-# BATCH 2 OF 6: DUAL-FORMAT OCR ENGINE FOR IMAGE & PDF TRANSLATION
-# =========================================================================
+# -------------------------------------------------------------------------
+# DUAL-FORMAT OCR ENGINE FOR IMAGE & PDF TRANSLATION PROCESSING
+# -------------------------------------------------------------------------
 def parse_receipt_image_or_pdf(uploaded_file):
-    """Processes images or PDFs securely without background server tools, 
-    returning (description, total, gst, receipt_date, raw_text)."""
+    """Processes images or PDFs, returning (description, total, gst, receipt_date, raw_text)."""
     try:
         uploaded_file.seek(0)
         file_ext = os.path.splitext(uploaded_file.name)[1].lower()
         raw_text = ""
         
-        # Scenario A: Handle direct PDF digital uploads via page text scanning vectors
+        # Scenario A: Handle direct PDF digital uploads via page vector scanning blocks
         if file_ext == ".pdf":
+            temp_pdf_path = f"temp_ocr_{uploaded_file.name}"
+            with open(temp_pdf_path, "wb") as temp_f:
+                temp_f.write(uploaded_file.read())
+            
             try:
-                reader = pypdf.PdfReader(uploaded_file)
+                # Attempt structural digital text reading extraction first
+                reader = pypdf.PdfReader(temp_pdf_path)
                 for page in reader.pages:
                     text_content = page.extract_text()
                     if text_content:
                         raw_text += text_content + "\n"
                 
-                # If the PDF is flat/scanned text-empty, give the user a clear hint
+                # Fallback to raster image conversion parsing if document is a scanned image container
                 if not raw_text.strip():
-                    raw_text = "scanned flat pdf container layer file notice"
-            except Exception as pdf_err:
-                raw_text = f"PDF text read bypassed: {pdf_err}"
+                    converted_images = convert_from_path(temp_pdf_path)
+                    for pil_img in converted_images:
+                        gray = ImageOps.autocontrast(pil_img.convert("L"))
+                        raw_text += pytesseract.image_to_string(gray, config="--psm 6") + "\n"
+            finally:
+                if os.path.exists(temp_pdf_path):
+                    os.remove(temp_pdf_path)
                     
-        # Scenario B: Handle standard image asset uploads (PNG, JPG, JPEG) completely isolated
+        # Scenario B: Handle standard image asset uploads (PNG, JPG, JPEG)
         else:
             image = Image.open(uploaded_file)
             image = ImageOps.exif_transpose(image)
@@ -153,7 +155,6 @@ def parse_receipt_image_or_pdf(uploaded_file):
         return description, total_amount, gst_amount, detected_date, raw_text
     except Exception as e:
         return "Scan failed", 0.0, 0.0, datetime.today().strftime('%d/%m/%Y'), f"ERROR: {e}"
-
 # -------------------------------------------------------------------------
 # COMPREHENSIVE DYNAMIC MULTI-PAGE REPORTLAB PDF BUILDER MODULE
 # -------------------------------------------------------------------------
@@ -247,6 +248,7 @@ def generate_official_voucher_pdf(filename, data, receipts):
     story.append(Paragraph("<b>Comments:</b> Hand written Receipt approved by Sadr Majlis. (Updated: 1-11-19)", cell_style))
     
     doc.build(story)
+
 # -------------------------------------------------------------------------
 # DYNAMIC MULTI-FORMAT APPRENDIX BINDER STITCHING PIPELINE
 # -------------------------------------------------------------------------
@@ -261,8 +263,10 @@ def stitch_files_to_pdf(voucher_pdf_path, uploaded_files_list):
                 u_file.seek(0)
                 ext = os.path.splitext(u_file.name)[1].lower()
                 
+                # Directly merge PDF file submissions
                 if ext == ".pdf":
                     merger.append(u_file)
+                # Convert and append image file submissions
                 else:
                     img = Image.open(u_file)
                     img = ImageOps.exif_transpose(img)
@@ -279,14 +283,13 @@ def stitch_files_to_pdf(voucher_pdf_path, uploaded_files_list):
         merger.close()
         return True
     except Exception as e:
-        st.error(f"⚠️ Appending engine notice: Attachment compilation encountered an error: {e}")
+        st.error(f"⚠️ Appending engine notice: Attachment compilation encountered a restriction vector: {e}")
         return False
-
 # -------------------------------------------------------------------------
 # DIRECT EMAIL OUTBOUND DISPATCH ENGINE (SMTP)
 # -------------------------------------------------------------------------
 def dispatch_real_email(recipient_list, subject_text, body_text, attachment_path, cc_recipient=None):
-    """Logs into SMTP server to transmit automated summary file payloads with optional CC."""
+    """Logs into configured SMTP engine server to transmit automated summary file payloads with optional CC."""
     smtp_info = st.session_state.admin_lists
     
     if not smtp_info.get("smtp_user") or not smtp_info.get("smtp_password"):
@@ -325,17 +328,15 @@ def dispatch_real_email(recipient_list, subject_text, body_text, attachment_path
         server.quit()
         return True
     except Exception as email_err:
-        st.error(f"❌ Failed to dispatch email. Internal Error details: {email_err}")
+        st.error(f"❌ Failed to dispatch email via mail network relay servers. Internal Error details: {email_err}")
         return False
 
 # -------------------------------------------------------------------------
-# CORE FRONT-END SELECTION NAVIGATION ROUTER
+# CORE FRONT-END SELECTION ROUTER
 # -------------------------------------------------------------------------
 st.set_page_config(page_title="Expense Portal (Official MAA Clone)", layout="wide")
 app_mode = st.sidebar.selectbox("Navigate Mode", ["User Claim Portal", "Admin Panel Configuration"])
-# -------------------------------------------------------------------------
-# PASSWORD-PROTECTED SECURE ADMIN INTERFACE PANEL
-# -------------------------------------------------------------------------
+
 if app_mode == "Admin Panel Configuration":
     st.title("⚙️ Admin Control Panel")
     pwd_input = st.text_input("Enter Master Admin Access Key Password", type="password")
@@ -404,15 +405,11 @@ if app_mode == "Admin Panel Configuration":
             st.session_state.admin_lists = updated_config
             st.success("Global application schema configuration matrix updated successfully!")
             st.rerun()
-            
-    elif pwd_input != "":
-        st.error("Access Refused: Secure validation key does not match records.")
 # -------------------------------------------------------------------------
 # INTERACTIVE CLAIM FORM LAYOUT PANEL
 # -------------------------------------------------------------------------
 else:
     st.title("📋 Online Expense Claim Submission System")
-    st.markdown("##### *Majlis Ansarullah Australia - Department of Mal Form Portal*")
     
     col1, col2 = st.columns(2)
     with col1:
