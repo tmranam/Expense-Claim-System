@@ -99,7 +99,6 @@ def parse_receipt_image_or_pdf(uploaded_file):
             finally:
                 if os.path.exists(temp_pdf_path):
                     os.remove(temp_pdf_path)
-                    
         else:
             image = Image.open(uploaded_file)
             image = ImageOps.exif_transpose(image)
@@ -139,12 +138,6 @@ def parse_receipt_image_or_pdf(uploaded_file):
         return description, total_amount, gst_amount, detected_date, raw_text
     except Exception as e:
         return "Scan failed", 0.0, 0.0, datetime.today().strftime('%d/%m/%Y'), f"ERROR: {e}"
-# -------------------------------------------------------------------------
-# COMPREHENSIVE DYNAMIC MULTI-PAGE REPORTLAB PDF BUILDER MODULE
-# -------------------------------------------------------------------------
-# -------------------------------------------------------------------------
-# COMPREHENSIVE DYNAMIC MULTI-PAGE REPORTLAB PDF BUILDER MODULE
-# -------------------------------------------------------------------------
 def generate_official_voucher_pdf(filename, data, receipts):
     doc = SimpleDocTemplate(filename, pagesize=letter, rightMargin=36, leftMargin=36, topMargin=36, bottomMargin=36)
     story = []
@@ -181,12 +174,9 @@ def generate_official_voucher_pdf(filename, data, receipts):
     ]))
     story.append(t_header)
     story.append(Spacer(1, 15))
-
-
     
     receipt_table_data = [[Paragraph("<b>#</b>", cell_bold_style), Paragraph("<b>Date</b>", cell_bold_style), Paragraph("<b>Description</b>", cell_bold_style), Paragraph("<b>Total amount</b>", cell_bold_style), Paragraph("<b>GST</b>", cell_bold_style)]]
     
-    # Calculate row padding layout space
     base_receipt_count = len(receipts)
     has_advance = data['advance_amount'] > 0
     total_functional_rows = base_receipt_count + (1 if has_advance else 0)
@@ -252,12 +242,10 @@ def generate_official_voucher_pdf(filename, data, receipts):
     
     story.append(Spacer(1, 10))
     story.append(Paragraph("<b>Acknowledgment</b>", header_subtitle_style))
-    story.append(Paragraph(f"I have received cash/cheque payment of $________________ as per details provided above.", cell_style))
+    story.append(Paragraph("I have received cash/cheque payment of $________________ as per details provided above.", cell_style))
     story.append(Paragraph("<b>Comments:</b> Hand written Receipt approved by Sadr Majlis. (Updated: 1-11-19)", cell_style))
     
     doc.build(story)
-
-
 def _image_to_pdf_buffer(u_file, label):
     img = Image.open(u_file)
     img = ImageOps.exif_transpose(img)
@@ -289,7 +277,6 @@ def _image_to_pdf_buffer(u_file, label):
 def stitch_files_to_pdf(voucher_pdf_path, uploaded_files_list):
     try:
         writer = PdfWriter()
-
         for page in PdfReader(voucher_pdf_path).pages:
             writer.add_page(page)
 
@@ -315,6 +302,76 @@ def stitch_files_to_pdf(voucher_pdf_path, uploaded_files_list):
     except Exception as e:
         st.error(f"⚠️ Could not attach receipts to the voucher: {e}")
         return False
+st.set_page_config(page_title="Expense Portal (Official MAA Clone)", layout="wide")
+app_mode = st.sidebar.selectbox("Navigate Mode", ["User Claim Portal", "Admin Panel Configuration"])
+
+if app_mode == "Admin Panel Configuration":
+    st.title("⚙️ Admin Control Panel")
+    pwd_input = st.text_input("Enter Master Admin Access Key Password", type="password")
+    
+    if pwd_input == st.session_state.admin_lists.get("admin_password", "123"):
+        st.success("Access Verified. Secure Configuration Screen Unlocked.")
+        new_pwd = st.text_input("Modify System Admin Password Key", value=st.session_state.admin_lists.get("admin_password", "123"))
+        
+        st.markdown("### 👑 Central Executive Authority Configuration (Global Overrides)")
+        q_mal = st.text_input("Approved by Qaid Mal - Target Field Assignment Name", value=st.session_state.admin_lists.get("qaid_mal_name", "Tahir Mahmood Rana"))
+        s_maa = st.text_input("Approved by Sadr MAA - Target Field Assignment Name", value=st.session_state.admin_lists.get("sadr_maa_name", "Abdul Jamil Mubbashar"))
+        
+        st.markdown("---")
+        regions_text = st.text_area("Regions Master List Configuration (One entry per line)", value="\n".join(st.session_state.admin_lists["regions"]))
+        parsed_regions_list = [line.strip() for line in regions_text.split("\n") if line.strip()]
+        
+        st.markdown("---")
+        st.markdown("#### 🗺️ Regional Majlis & Nazim e Ala Configuration Matrix")
+        selected_admin_region = st.selectbox("Select a region to configure details", options=parsed_regions_list)
+        
+        current_map = st.session_state.admin_lists.get("regional_majlis", {})
+        existing_majlis_for_region = current_map.get(selected_admin_region, [])
+        majlis_text = st.text_area(f"Enter Majlis names for '{selected_admin_region}' (One entry per line)", value="\n".join(existing_majlis_for_region), height=100)
+        parsed_majlis_list = [line.strip() for line in majlis_text.split("\n") if line.strip()]
+        
+        current_nazims = st.session_state.admin_lists.get("regional_nazims", {})
+        region_nazim_data = current_nazims.get(selected_admin_region, {"name": "", "email": ""})
+        nazim_name_input = st.text_input(f"Nazim e Ala Name for '{selected_admin_region}'", value=region_nazim_data.get("name", ""))
+        nazim_email_input = st.text_input(f"Nazim e Ala Email Address for '{selected_admin_region}'", value=region_nazim_data.get("email", ""))
+        
+        st.markdown("---")
+        st.markdown("#### 🔐 Outbound live SMTP Server Credentials Gateway")
+        smtp_srv = st.text_input("SMTP Server Relay Node Hostname", value=st.session_state.admin_lists.get("smtp_server", "://gmail.com"))
+        smtp_prt = st.number_input("SMTP Server TLS Port Number", value=int(st.session_state.admin_lists.get("smtp_port", 587)), step=1)
+        smtp_usr = st.text_input("Sender User Authentication Email Address ID", value=st.session_state.admin_lists.get("smtp_user", "claimsubmissionmaaa@gmail.com"))
+        smtp_pwd = st.text_input("Sender Account App Password Access Key", value=st.session_state.admin_lists.get("smtp_password", ""), type="password")
+        
+        if st.button("Save System Configuration Schema Matrix", type="primary"):
+            updated_map = dict(current_map)
+            updated_map[selected_admin_region] = parsed_majlis_list
+            updated_map = {k: v for k, v in updated_map.items() if k in parsed_regions_list}
+            for r in parsed_regions_list:
+                if r not in updated_map:
+                    updated_map[r] = []
+            
+            updated_nazims = dict(current_nazims)
+            updated_nazims[selected_admin_region] = {"name": nazim_name_input.strip(), "email": nazim_email_input.strip()}
+            updated_nazims = {k: v for k, v in updated_nazims.items() if k in parsed_regions_list}
+
+            updated_config = {
+                "regions": parsed_regions_list,
+                "regional_majlis": updated_map,
+                "emails": [line.strip() for line in st.session_state.admin_lists.get("emails", [])],
+                "admin_password": new_pwd.strip(),
+                "smtp_server": smtp_srv.strip(),
+                "smtp_port": int(smtp_prt),
+                "smtp_user": smtp_usr.strip(),
+                "smtp_password": smtp_pwd.strip(),
+                "qaid_mal_name": q_mal.strip(),
+                "sadr_maa_name": s_maa.strip(),
+                "regional_nazims": updated_nazims
+            }
+            
+            save_admin_settings(updated_config)
+            st.session_state.admin_lists = updated_config
+            st.success("Global application schema configuration matrix updated successfully!")
+            st.rerun()
     calculated_total_claim = sum(r["amount"] for r in receipt_records)
     calculated_total_gst = sum(r["gst"] for r in receipt_records)
     
@@ -382,7 +439,6 @@ def stitch_files_to_pdf(voucher_pdf_path, uploaded_files_list):
                 }
 
                 output_filename = f"Expense_Voucher_{name.replace(' ', '_')}.pdf"
-
                 generate_official_voucher_pdf(output_filename, payload, receipt_records)
 
                 with st.spinner("Stitching receipts into the claim PDF..."):
@@ -393,12 +449,6 @@ def stitch_files_to_pdf(voucher_pdf_path, uploaded_files_list):
 
                 st.success("🎉 Claim pack compiled: summary page + all receipts!")
                 st.balloons()
-
-                target_email = nazim_info.get("email", "")
-                if target_email:
-                    recipient_emails = [target_email]
-                    subject = f"Expense Payment Voucher Submission - {name} ({region})"
-                    body = f"Assalam-o-Alaikum,\n\nA new expense payment voucher pack has been generated and submitted by {name} for the '{majlis}' branch of the '{region}' region.\n\nPlease find the comprehensive document statement bundle (Voucher Sheet + Attached Receipts) attached below for your immediate review.\n\nBest regards,\nAutomated Expense Portal Gateway"
 
                 with open(output_filename, "rb") as f:
                     pdf_bytes = f.read()
