@@ -173,6 +173,7 @@ def generate_official_voucher_pdf(filename, data, receipts):
     top_line_style = ParagraphStyle('TopLine', fontName='Helvetica-Oblique', fontSize=9, leading=11, alignment=1, spaceAfter=4)
     cell_style = ParagraphStyle('Cell', fontName='Helvetica', fontSize=9, leading=11)
     cell_bold_style = ParagraphStyle('CellB', fontName='Helvetica-Bold', fontSize=9, leading=11)
+    cell_red_bold_style = ParagraphStyle('CellRB', fontName='Helvetica-Bold', fontSize=9, leading=11, textColor=colors.red)
     
     story.append(Paragraph("In the name of Allah, the gracious, the merciful", top_line_style))
     story.append(Paragraph("MAJLIS ANSARULLAH AUSTRALIA", header_title_style))
@@ -185,7 +186,7 @@ def generate_official_voucher_pdf(filename, data, receipts):
         [Paragraph("<b>Expense Type:</b>", cell_style), Paragraph(data['expense_type'], cell_style), Paragraph("<b>BSB:</b>", cell_style), Paragraph(data['bsb'], cell_style)],
         [Paragraph("<b>Account:</b>", cell_style), Paragraph(data['account'], cell_style), Paragraph("<b>Account:</b>", cell_style), Paragraph(data['acc_num'], cell_style)],
         [Paragraph("<b>Region:</b>", cell_style), Paragraph(data['region'], cell_style), Paragraph("<b>Total Claim:</b>", cell_bold_style), Paragraph(f"<b>$ {data['total_amount']:.2f}</b>", cell_bold_style)],
-        [Paragraph("<b>Majlis:</b>", cell_style), Paragraph(data['majlis'], cell_style), Paragraph("<b>Advance Issued:</b>", cell_style), Paragraph("", cell_style)]
+        [Paragraph("<b>Majlis:</b>", cell_style), Paragraph(data['majlis'], cell_style), Paragraph("<b>Advance Issued:</b>", cell_style), Paragraph(f"$ {data['advance']:.2f}" if data['advance'] > 0 else "", cell_red_bold_style)]
     ]
     
     t_header = Table(header_data, colWidths=[100, 170, 100, 170])
@@ -199,6 +200,9 @@ def generate_official_voucher_pdf(filename, data, receipts):
     
     receipt_table_data = [[Paragraph("<b>#</b>", cell_bold_style), Paragraph("<b>Date</b>", cell_bold_style), Paragraph("<b>Description</b>", cell_bold_style), Paragraph("<b>Total amount</b>", cell_bold_style), Paragraph("<b>GST</b>", cell_bold_style)]]
     
+    advance = data.get('advance', 0.0)
+    net_total = data['total_amount'] - advance
+
     max_rows = max(10, len(receipts))
     for idx in range(max_rows):
         if idx < len(receipts):
@@ -212,8 +216,20 @@ def generate_official_voucher_pdf(filename, data, receipts):
             ])
         else:
             receipt_table_data.append([Paragraph(str(idx + 1), cell_style), "", "", "", ""])
-            
-    receipt_table_data.append([Paragraph("<b>Total</b>", cell_bold_style), "", "", Paragraph(f"<b>${data['total_amount']:.2f}</b>", cell_bold_style), Paragraph(f"<b>${data['total_gst']:.2f}</b>", cell_bold_style)])
+
+    if advance > 0:
+        receipt_table_data.append([
+            "", "",
+            Paragraph("Less: Advance Settled", cell_red_bold_style),
+            Paragraph(f"-${advance:.2f}", cell_red_bold_style),
+            ""
+        ])
+
+    receipt_table_data.append([
+        Paragraph("<b>Total</b>", cell_bold_style), "", "",
+        Paragraph(f"<b>${net_total:.2f}</b>", cell_bold_style),
+        Paragraph(f"<b>${data['total_gst']:.2f}</b>", cell_bold_style)
+    ])
     
     t_receipts = Table(receipt_table_data, colWidths=[30, 80, 250, 90, 90])
     t_receipts.setStyle(TableStyle([
@@ -456,6 +472,11 @@ else:
         st.markdown("**🏦 Direct Reimbursement Bank Segment**")
         bsb = st.text_input("Bank BSB Code (e.g., 000-000)", max_chars=7)
         acc_num = st.text_input("Account Number")
+        st.markdown("**💵 Advance Settlement**")
+        settling_advance = st.radio("Are you settling an advance in this claim?", ["No", "Yes"], horizontal=True)
+        advance_amount = 0.0
+        if settling_advance == "Yes":
+            advance_amount = st.number_input("Advance Amount Being Settled ($)", min_value=0.0, format="%.2f")
 
     st.markdown("---")
     st.subheader("📎 Individual Itemized Receipt Image/PDF Ingestion Block")
@@ -539,6 +560,9 @@ else:
         block_submission = True
     else:
         st.success("✅ Attachment verification passed: All structural files accounted for.")
+    if advance_amount > calculated_total_claim:
+        st.error(f"❌ Advance Too High: The advance being settled (${advance_amount:.2f}) is more than the total claim (${calculated_total_claim:.2f}).")
+        block_submission = True        
 
     st.markdown("---")
 
@@ -562,6 +586,7 @@ else:
                     "total_gst": calculated_total_gst,
                     "bsb": bsb,
                     "acc_num": acc_num,
+                    "advance": advance_amount,
                     "qaid_mal": st.session_state.admin_lists.get("qaid_mal_name", "Tahir Mahmood Rana"),
                     "sadr_maa": st.session_state.admin_lists.get("sadr_maa_name", "Abdul Jamil Mubbashar"),
                     "nazim_name": nazim_info.get("name", "Not Configured")
