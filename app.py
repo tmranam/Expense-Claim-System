@@ -19,6 +19,7 @@ from pypdf import PdfReader, PdfWriter
 from reportlab.pdfgen import canvas
 from reportlab.lib.utils import ImageReader
 from google.oauth2 import service_account
+from google.oauth2.credentials import Credentials as OAuthCredentials
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaIoBaseUpload
 
@@ -148,7 +149,28 @@ def get_service_account_email():
         return None
 
 
+def get_drive_auth_mode():
+    """'oauth' = saves as the admin's own Google account (recommended), 'service_account' = fallback."""
+    if _secret("google_oauth"):
+        return "oauth"
+    if _secret("gcp_service_account"):
+        return "service_account"
+    return None
+
+
 def get_drive_service():
+    oauth = _secret("google_oauth")
+    if oauth:
+        creds = OAuthCredentials(
+            token=None,
+            refresh_token=oauth["refresh_token"],
+            token_uri="https://oauth2.googleapis.com/token",
+            client_id=oauth["client_id"],
+            client_secret=oauth["client_secret"],
+            scopes=DRIVE_SCOPES,
+        )
+        return build("drive", "v3", credentials=creds, cache_discovery=False)
+
     info = _secret("gcp_service_account")
     if not info:
         return None
@@ -517,7 +539,7 @@ def render_claims_dashboard():
         return
 
     if service is None:
-        st.warning("Google Drive credentials are not set up yet. Add the service account to the app secrets (see Settings for details).")
+        st.warning("Google Drive credentials are not set up yet. Add them to the app secrets (see Settings for details).")
         return
     if not folder_id:
         st.warning("No Google Drive folder is configured. Open Settings and paste your Drive folder link.")
@@ -569,11 +591,17 @@ def render_settings_page():
 
     st.markdown("---")
     st.markdown("#### ☁️ Google Drive Storage")
-    sa_email = get_service_account_email()
-    if sa_email:
-        st.info(f"Share your Google Drive folder with this address (Editor access): `{sa_email}`")
+    auth_mode = get_drive_auth_mode()
+    if auth_mode == "oauth":
+        st.success("Drive is connected using your own Google account. Claims are saved as you, so the folder just needs to be in that account's Drive.")
+    elif auth_mode == "service_account":
+        sa_email = get_service_account_email()
+        st.warning(
+            "Using a service account, which Google often refuses for normal Drive folders (storage quota error). "
+            f"If you use it, share the folder with `{sa_email}` as Editor. Switching to the google_oauth secret is recommended."
+        )
     else:
-        st.warning("Google service account credentials were not found in the app secrets, so claims cannot be saved to Drive yet.")
+        st.warning("No Google credentials were found in the app secrets, so claims cannot be saved to Drive yet.")
 
     drive_link_input = st.text_input(
         "Google Drive Folder Link (claim PDFs and the claims register are saved here — change it each year)",
@@ -590,7 +618,7 @@ def render_settings_page():
             try:
                 service = get_drive_service()
                 if service is None:
-                    st.error("Service account credentials are missing from the app secrets.")
+                    st.error("Google credentials are missing from the app secrets.")
                 else:
                     meta = service.files().get(
                         fileId=typed_folder_id, fields="id, name, mimeType", supportsAllDrives=True
@@ -600,7 +628,7 @@ def render_settings_page():
                     else:
                         st.success(f"Connected. Folder found: {meta.get('name')}")
             except Exception as e:
-                st.error(f"Could not open that folder. Check that it is shared with the service account. Details: {e}")
+                st.error(f"Could not open that folder. Check the link, and that it belongs to (or is shared with) the connected Google account. Details: {e}")
 
     st.markdown("---")
     st.markdown("### 👑 Central Executive Authority Configuration (Global Overrides)")
@@ -902,7 +930,7 @@ else:
                     except Exception as e:
                         drive_error = str(e)
                         if "storage quota" in drive_error.lower() or "storagequota" in drive_error.lower():
-                            drive_error += " (The service account cannot own files in this folder. See the setup notes.)"
+                            drive_error += " (Google does not allow a service account to save files here. The administrator needs to connect Drive with their own Google account.)"
 
                 st.session_state.last_submission = {
                     "saved": saved_to_drive,
