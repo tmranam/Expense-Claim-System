@@ -586,14 +586,14 @@ else:
                     subject = f"Expense Payment Voucher Submission - {name} ({region})"
                     body = f"Assalam-o-Alaikum,\n\nA new expense payment voucher pack has been generated and submitted by {name} for the '{majlis}' branch of the '{region}' region.\n\nPlease find the comprehensive document statement bundle (Voucher Sheet + Attached Receipts) attached below for your immediate review.\n\nBest regards,\nAutomated Expense Portal Gateway"
 
-                    with st.spinner("Sending the PDF bundle by email..."):
-                        success = dispatch_real_email(
-                            recipient_list=recipient_emails,
-                            subject_text=subject,
-                            body_text=body,
-                            attachment_path=output_filename,
-                            cc_recipient=claimant_email.strip()
-                        )
+                   // with st.spinner("Sending the PDF bundle by email..."):
+                   //     success = dispatch_real_email(
+                   //         recipient_list=recipient_emails,
+                   //         subject_text=subject,
+                   //         body_text=body,
+                   //         attachment_path=output_filename,
+                   //         cc_recipient=claimant_email.strip()
+                   //     )
 
                     if success:
                         st.success(f"📧 Email sent to Nazim e Ala ({target_email}) and CC'd to {claimant_email}")
