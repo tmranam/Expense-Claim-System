@@ -16,6 +16,7 @@ from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, Tabl
 from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
 from reportlab.lib import colors
 import pypdf
+from pdf2image import convert_from_path
 
 # -------------------------------------------------------------------------
 # DEFENSIVE LINUX PATH ANCHORING FOR STREAMLIT CLOUD INFRASTRUCTURE
@@ -54,62 +55,65 @@ DEFAULT_CONFIG = {
 # -------------------------------------------------------------------------
 # PERSISTENT STORAGE MANAGEMENT FOR FREE STREAMLIT TIER
 # -------------------------------------------------------------------------
-def save_admin_settings(config_data):
-    """Saves admin updates permanently into the repository environment."""
-    with open(CONFIG_FILE, "w") as f:
-        json.dump(config_data, f, indent=4)
-
 def load_admin_settings():
-    """Loads admin configurations from a local JSON file with auto-repair flags."""
+    """Loads admin configurations from a local JSON file to survive app sleeping."""
     if os.path.exists(CONFIG_FILE):
         try:
             with open(CONFIG_FILE, "r") as f:
                 data = json.load(f)
                 
-                # --- AUTOMATED DATABASE SELF-HEALING REPAIR MATRIX ---
-                updated_needed = False
-                for key, default_value in DEFAULT_CONFIG.items():
-                    if key not in data:
-                        data[key] = default_value
-                        updated_needed = True
-                
-                if updated_needed:
-                    save_admin_settings(data)
-                    
+                # --- FIXED CRITICAL FALLBACK STRUCTURE CHECKS ---
+                for key in DEFAULT_CONFIG:
+                    if key not in data or not data[key]:
+                        data[key] = DEFAULT_CONFIG[key]
                 return data
         except Exception:
             return DEFAULT_CONFIG
     return DEFAULT_CONFIG
 
+def save_admin_settings(config_data):
+    """Saves admin updates permanently into the repository environment."""
+    with open(CONFIG_FILE, "w") as f:
+        json.dump(config_data, f, indent=4)
+
 # Initialize settings in state
 if 'admin_lists' not in st.session_state:
     st.session_state.admin_lists = load_admin_settings()
 # -------------------------------------------------------------------------
-# DUAL-FORMAT OCR ENGINE FOR IMAGE & PDF TRANSLATION
+# DUAL-FORMAT OCR ENGINE FOR IMAGE & PDF TRANSLATION PROCESSING
 # -------------------------------------------------------------------------
 def parse_receipt_image_or_pdf(uploaded_file):
-    """Processes images or PDFs securely without background server tools, 
-    returning (description, total, gst, receipt_date, raw_text)."""
+    """Processes images or PDFs, returning (description, total, gst, receipt_date, raw_text)."""
     try:
         uploaded_file.seek(0)
         file_ext = os.path.splitext(uploaded_file.name)[1].lower()
         raw_text = ""
         
-        # Scenario A: Handle direct PDF digital uploads via page text scanning vectors
+        # Scenario A: Handle direct PDF digital uploads via page vector scanning blocks
         if file_ext == ".pdf":
+            temp_pdf_path = f"temp_ocr_{uploaded_file.name}"
+            with open(temp_pdf_path, "wb") as temp_f:
+                temp_f.write(uploaded_file.read())
+            
             try:
-                reader = pypdf.PdfReader(uploaded_file)
+                # Attempt structural digital text reading extraction first
+                reader = pypdf.PdfReader(temp_pdf_path)
                 for page in reader.pages:
                     text_content = page.extract_text()
                     if text_content:
                         raw_text += text_content + "\n"
                 
+                # Fallback to raster image conversion parsing if document is a scanned image container
                 if not raw_text.strip():
-                    raw_text = "Scanned flat PDF document layer"
-            except Exception as pdf_err:
-                raw_text = f"PDF text read bypassed: {pdf_err}"
+                    converted_images = convert_from_path(temp_pdf_path)
+                    for pil_img in converted_images:
+                        gray = ImageOps.autocontrast(pil_img.convert("L"))
+                        raw_text += pytesseract.image_to_string(gray, config="--psm 6") + "\n"
+            finally:
+                if os.path.exists(temp_pdf_path):
+                    os.remove(temp_pdf_path)
                     
-        # Scenario B: Handle standard image asset uploads (PNG, JPG, JPEG) completely isolated
+        # Scenario B: Handle standard image asset uploads (PNG, JPG, JPEG)
         else:
             image = Image.open(uploaded_file)
             image = ImageOps.exif_transpose(image)
@@ -244,6 +248,7 @@ def generate_official_voucher_pdf(filename, data, receipts):
     story.append(Paragraph("<b>Comments:</b> Hand written Receipt approved by Sadr Majlis. (Updated: 1-11-19)", cell_style))
     
     doc.build(story)
+
 # -------------------------------------------------------------------------
 # DYNAMIC MULTI-FORMAT APPRENDIX BINDER STITCHING PIPELINE
 # -------------------------------------------------------------------------
@@ -261,7 +266,7 @@ def stitch_files_to_pdf(voucher_pdf_path, uploaded_files_list):
                 # Directly merge PDF file submissions
                 if ext == ".pdf":
                     merger.append(u_file)
-                # Convert and append image file submissions safely
+                # Convert and append image file submissions
                 else:
                     img = Image.open(u_file)
                     img = ImageOps.exif_transpose(img)
@@ -280,7 +285,6 @@ def stitch_files_to_pdf(voucher_pdf_path, uploaded_files_list):
     except Exception as e:
         st.error(f"⚠️ Appending engine notice: Attachment compilation encountered a restriction vector: {e}")
         return False
-
 # -------------------------------------------------------------------------
 # DIRECT EMAIL OUTBOUND DISPATCH ENGINE (SMTP)
 # -------------------------------------------------------------------------
@@ -327,12 +331,12 @@ def dispatch_real_email(recipient_list, subject_text, body_text, attachment_path
         st.error(f"❌ Failed to dispatch email via mail network relay servers. Internal Error details: {email_err}")
         return False
 
-# Front-End Initialization Configurations
+# -------------------------------------------------------------------------
+# CORE FRONT-END SELECTION ROUTER
+# -------------------------------------------------------------------------
 st.set_page_config(page_title="Expense Portal (Official MAA Clone)", layout="wide")
 app_mode = st.sidebar.selectbox("Navigate Mode", ["User Claim Portal", "Admin Panel Configuration"])
-# -------------------------------------------------------------------------
-# PASSWORD-PROTECTED SECURE ADMIN INTERFACE PANEL
-# -------------------------------------------------------------------------
+
 if app_mode == "Admin Panel Configuration":
     st.title("⚙️ Admin Control Panel")
     pwd_input = st.text_input("Enter Master Admin Access Key Password", type="password")
@@ -401,18 +405,88 @@ if app_mode == "Admin Panel Configuration":
             st.session_state.admin_lists = updated_config
             st.success("Global application schema configuration matrix updated successfully!")
             st.rerun()
-            
-    elif pwd_input != "":
-        st.error("Access Refused: Secure validation key does not match records.")
-# =========================================================================
-# BATCH 6 OF 6: CALCULATIONS, SAFETY VALIDATIONS, AND COMPREHENSIVE MERGE
-# =========================================================================
+# -------------------------------------------------------------------------
+# INTERACTIVE CLAIM FORM LAYOUT PANEL
+# -------------------------------------------------------------------------
+else:
+    st.title("📋 Online Expense Claim Submission System")
+    
+    col1, col2 = st.columns(2)
+    with col1:
+        name = st.text_input("Full Employee / Claimant Name (Payee Name)")
+        claimant_email = st.text_input("Your Personal/Employee Email Address (For confirmation copy)")
+        expense_event_desc = st.text_input("Description of Event (Expense Type)")
+        
+        configured_regions = st.session_state.admin_lists["regions"]
+        region = st.selectbox("Select Region / National Location", options=configured_regions)
+        
+        majlis_lookup_map = st.session_state.admin_lists["regional_majlis"]
+        available_majlis_options = majlis_lookup_map.get(region, [])
+        if not available_majlis_options:
+            available_majlis_options = ["No entries declared under this region boundary"]
+        
+        majlis = st.selectbox("Select Respective Residing Majlis / Office Destination", options=available_majlis_options)
+        account = st.text_input("General Ledger / Tracking Account Code (Account)")
+        
+    with col2:
+        total_receipts_input = st.number_input("Total Number of Receipts To Claim", min_value=1, max_value=50, value=1, step=1)
+        declared_total_input = st.number_input("Total Declared Claim Amount ($)", min_value=0.0, format="%.2f")
+        
+        st.markdown("**🏦 Direct Reimbursement Bank Segment**")
+        bsb = st.text_input("Bank BSB Code (e.g., 000-000)", max_chars=7)
+        acc_num = st.text_input("Account Number")
 
-    # Real-time state aggregation loops reading live calculated user edits instantly
+    st.markdown("---")
+    st.subheader("📎 Individual Itemized Receipt Image/PDF Ingestion Block")
+    
+    receipt_records = []
+    raw_files_tracker = []
+    uploaded_files_count = 0
+    
+    for i in range(int(total_receipts_input)):
+        st.markdown(f"#### 📄 Receipt Section Item #{i+1}")
+        
+        r_col1, r_col2, r_col3, r_col4, r_col5 = st.columns([2.5, 2.5, 2, 1.5, 1.5])
+
+        with r_col1:
+            uploaded_file = st.file_uploader(
+                f"Upload Receipt #{i+1} (Image or PDF)",
+                type=["png", "jpg", "jpeg", "pdf"], key=f"file_{i}"
+            )
+            raw_files_tracker.append(uploaded_file)
+            if uploaded_file is not None:
+                uploaded_files_count += 1
+
+        if uploaded_file is not None:
+            sig = f"{uploaded_file.name}_{uploaded_file.size}"
+            if st.session_state.get(f"sig_{i}") != sig:
+                with st.spinner(f"Scanning document #{i+1}..."):
+                    d, t, g, dt, raw = parse_receipt_image_or_pdf(uploaded_file)
+                st.session_state[f"desc_{i}"] = d
+                st.session_state[f"amt_{i}"] = float(t)
+                st.session_state[f"gst_{i}"] = float(g)
+                st.session_state[f"date_{i}"] = dt
+                st.session_state[f"ocr_{i}"] = raw
+                st.session_state[f"sig_{i}"] = sig
+
+        with r_col2:
+            desc_val = st.text_input(f"Item Description #{i+1}", key=f"desc_{i}")
+        with r_col3:
+            date_val = st.text_input(f"Receipt Date (DD/MM/YYYY) #{i+1}", key=f"date_{i}")
+        with r_col4:
+            total_val = st.number_input(f"Amount ($) #{i+1}", min_value=0.0, format="%.2f", key=f"amt_{i}")
+        with r_col5:
+            gst_val = st.number_input(f"GST ($) #{i+1}", min_value=0.0, format="%.2f", key=f"gst_{i}")
+
+        if f"ocr_{i}" in st.session_state:
+            with st.expander(f"Debug: raw OCR text for receipt #{i+1}"):
+                st.text(st.session_state[f"ocr_{i}"])
+
+        receipt_records.append({"desc": desc_val, "date": date_val, "amount": total_val, "gst": gst_val})
+
     calculated_total_claim = sum(r["amount"] for r in receipt_records)
     calculated_total_gst = sum(r["gst"] for r in receipt_records)
     
-    # Mathematical balance verification validation script checks
     is_amount_matching = abs(calculated_total_claim - declared_total_input) < 0.01
     missing_receipts_delta = int(total_receipts_input) - uploaded_files_count
 
@@ -428,17 +502,14 @@ if app_mode == "Admin Panel Configuration":
     st.markdown("---")
     st.markdown("### 🛡️ System Submission Safety Validation Checks")
 
-    # Interactive blocking flags initialization parameters
     block_submission = False
 
-    # 1. Verification of line item total amount entries matching claimant expectations
     if not is_amount_matching:
         st.error(f"❌ Total Doesn't Match: The sum of your individual row entries (${calculated_total_claim:.2f}) does not match your typed Total Declared Claim Amount (${declared_total_input:.2f}). Please review row values.")
         block_submission = True
     else:
         st.success("✅ Financial balance validation passed: Claim amounts are matching.")
 
-    # 2. Verification of total line item count matched against physically present files
     if missing_receipts_delta > 0:
         st.warning(f"⚠️ {missing_receipts_delta} Receipt Outstanding: You have stated a total count of {total_receipts_input} receipts, but uploaded only {uploaded_files_count} file assets. Please upload remaining attachments.")
         block_submission = True
@@ -450,7 +521,6 @@ if app_mode == "Admin Panel Configuration":
 
     st.markdown("---")
 
-    # Dynamic interface enforcement: submit button is deactivated until validation errors are cleared
     if block_submission:
         st.button("Finalize and Submit Expense Claims Bundle", type="primary", disabled=True, help="Please resolve all structural error/warning notifications above to unlock the submit pipeline.")
     else:
@@ -458,7 +528,6 @@ if app_mode == "Admin Panel Configuration":
             if not name or not bsb or not acc_num or not claimant_email or not expense_event_desc:
                 st.error("Submission Denied: Profile details, Event Description, Claimant Email, BSB, and Account Numbers must be filled out completely.")
             else:
-                # Fetch localized admin configuration variables mapped out under Batch 4
                 nazim_info = st.session_state.admin_lists.get("regional_nazims", {}).get(region, {"name": "Not Configured", "email": ""})
                 
                 payload = {
@@ -479,17 +548,14 @@ if app_mode == "Admin Panel Configuration":
                 
                 output_filename = f"Expense_Voucher_{name.replace(' ', '_')}.pdf"
                 
-                # Step 1: Compile primary formal ReportLab voucher sheet structure matching the MAA official format
                 generate_official_voucher_pdf(output_filename, payload, receipt_records)
                 
-                # Step 2: Extract uploaded images or PDFs and stitch them as consecutive backend attachment pages
                 with st.spinner("Stitching file assets into multi-page formal PDF binder format..."):
                     stitch_files_to_pdf(output_filename, raw_files_tracker)
                     
                 st.success("🎉 Comprehensive Claim Payment Voucher Pack compiled successfully with attached file pages!")
                 st.balloons()
                 
-                # ROUTING ENGINE: Delivers directly to dynamic Nazim e Ala and CCs claimant
                 target_email = nazim_info.get("email", "")
                 if target_email:
                     recipient_emails = [target_email]
@@ -510,12 +576,9 @@ if app_mode == "Admin Panel Configuration":
                 else:
                     st.warning("⚠️ Email delivery skipped: No Nazim e Ala email address configured for this region in admin settings.")
                 
-                # Step 3: Open and read the final multi-page file payload into the download stream
-                with open(output_filename, "rb") as final_pdf_file:
-                    pdf_bytes = final_pdf_file.read()
-                    
+                pdf_bytes = open(output_filename, "rb").read()
                 st.download_button(
-                    label="📥 Download Official Consolidated Voucher PDF File",
+                    label="📥 Download Official Summary Voucher PDF File",
                     data=pdf_bytes,
                     file_name=output_filename,
                     mime="application/pdf"
