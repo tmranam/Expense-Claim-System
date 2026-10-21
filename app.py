@@ -85,41 +85,33 @@ def load_admin_settings():
 # Initialize settings in state
 if 'admin_lists' not in st.session_state:
     st.session_state.admin_lists = load_admin_settings()
-# -------------------------------------------------------------------------
-# DUAL-FORMAT OCR ENGINE FOR IMAGE & PDF TRANSLATION PROCESSING
-# -------------------------------------------------------------------------
+# =========================================================================
+# BATCH 2 OF 6: DUAL-FORMAT OCR ENGINE FOR IMAGE & PDF TRANSLATION
+# =========================================================================
 def parse_receipt_image_or_pdf(uploaded_file):
-    """Processes images or PDFs, returning (description, total, gst, receipt_date, raw_text)."""
+    """Processes images or PDFs securely without background server tools, 
+    returning (description, total, gst, receipt_date, raw_text)."""
     try:
         uploaded_file.seek(0)
-        file_ext = os.path.splitext(uploaded_file.name).lower()
+        file_ext = os.path.splitext(uploaded_file.name)[1].lower()
         raw_text = ""
         
-        # Scenario A: Handle direct PDF digital uploads via page vector scanning blocks
+        # Scenario A: Handle direct PDF digital uploads via page text scanning vectors
         if file_ext == ".pdf":
-            temp_pdf_path = f"temp_ocr_{uploaded_file.name}"
-            with open(temp_pdf_path, "wb") as temp_f:
-                temp_f.write(uploaded_file.read())
-            
             try:
-                # Attempt structural digital text reading extraction first
-                reader = pypdf.PdfReader(temp_pdf_path)
+                reader = pypdf.PdfReader(uploaded_file)
                 for page in reader.pages:
                     text_content = page.extract_text()
                     if text_content:
                         raw_text += text_content + "\n"
                 
-                # Fallback to raster image conversion parsing if document is a scanned image container
+                # If the PDF is flat/scanned text-empty, give the user a clear hint
                 if not raw_text.strip():
-                    converted_images = convert_from_path(temp_pdf_path)
-                    for pil_img in converted_images:
-                        gray = ImageOps.autocontrast(pil_img.convert("L"))
-                        raw_text += pytesseract.image_to_string(gray, config="--psm 6") + "\n"
-            finally:
-                if os.path.exists(temp_pdf_path):
-                    os.remove(temp_pdf_path)
+                    raw_text = "scanned flat pdf container layer file notice"
+            except Exception as pdf_err:
+                raw_text = f"PDF text read bypassed: {pdf_err}"
                     
-        # Scenario B: Handle standard image asset uploads (PNG, JPG, JPEG)
+        # Scenario B: Handle standard image asset uploads (PNG, JPG, JPEG) completely isolated
         else:
             image = Image.open(uploaded_file)
             image = ImageOps.exif_transpose(image)
@@ -151,7 +143,7 @@ def parse_receipt_image_or_pdf(uploaded_file):
         detected_date = datetime.today().strftime('%d/%m/%Y')
         date_patterns = re.findall(r'\b\d{1,2}[/\-]\d{1,2}[/\-]\d{2,4}\b', raw_text)
         if date_patterns:
-            detected_date = date_patterns.replace('-', '/')
+            detected_date = date_patterns[0].replace('-', '/')
 
         possible_items = ['uber', 'cafe', 'officeworks', 'bunnings', 'parking',
                           'fuel', 'stationery', 'food', 'meals', 'woolworths', 'coles']
@@ -161,6 +153,7 @@ def parse_receipt_image_or_pdf(uploaded_file):
         return description, total_amount, gst_amount, detected_date, raw_text
     except Exception as e:
         return "Scan failed", 0.0, 0.0, datetime.today().strftime('%d/%m/%Y'), f"ERROR: {e}"
+
 # -------------------------------------------------------------------------
 # COMPREHENSIVE DYNAMIC MULTI-PAGE REPORTLAB PDF BUILDER MODULE
 # -------------------------------------------------------------------------
