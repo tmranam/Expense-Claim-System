@@ -176,6 +176,9 @@ def parse_receipt_image_or_pdf(uploaded_file):
 # -------------------------------------------------------------------------
 # COMPREHENSIVE DYNAMIC MULTI-PAGE REPORTLAB PDF BUILDER MODULE
 # -------------------------------------------------------------------------
+# -------------------------------------------------------------------------
+# COMPREHENSIVE DYNAMIC MULTI-PAGE REPORTLAB PDF BUILDER MODULE
+# -------------------------------------------------------------------------
 def generate_official_voucher_pdf(filename, data, receipts):
     """Compiles a dynamic multi-page clone matching the Majlis Ansarullah Australia layout."""
     doc = SimpleDocTemplate(filename, pagesize=A4, rightMargin=36, leftMargin=36, topMargin=36, bottomMargin=36)
@@ -203,7 +206,7 @@ def generate_official_voucher_pdf(filename, data, receipts):
         [Paragraph("<b>Majlis:</b>", cell_style), Paragraph(data['majlis'], cell_style), Paragraph("<b>Advance Issued:</b>", cell_style), Paragraph(f"$ {data['advance']:.2f}" if data['advance'] > 0 else "", cell_red_bold_style)]
     ]
     
-    t_header = Table(header_data, colWidths=)
+    t_header = Table(header_data, colWidths=[100, 170, 100, 170])
     t_header.setStyle(TableStyle([
         ('GRID', (0,0), (-1,-1), 1, colors.black),
         ('VALIGN', (0,0), (-1,-1), 'MIDDLE'),
@@ -245,7 +248,7 @@ def generate_official_voucher_pdf(filename, data, receipts):
         Paragraph(f"<b>${data['total_gst']:.2f}</b>", cell_bold_style)
     ])
     
-    t_receipts = Table(receipt_table_data, colWidths=)
+    t_receipts = Table(receipt_table_data, colWidths=[30, 80, 250, 90, 90])
     t_receipts.setStyle(TableStyle([
         ('GRID', (0,0), (-1,-1), 1, colors.black),
         ('VALIGN', (0,0), (-1,-1), 'MIDDLE'),
@@ -267,7 +270,7 @@ def generate_official_voucher_pdf(filename, data, receipts):
         [Paragraph("Date:", cell_style), Paragraph("Date:", cell_style)],
     ]
     
-    t_signoff = Table(signoff_data, colWidths=)
+    t_signoff = Table(signoff_data, colWidths=[270, 270])
     t_signoff.setStyle(TableStyle([
         ('GRID', (0,0), (-1,-1), 1, colors.black),
         ('BACKGROUND', (0,0), (1,0), colors.lightgrey),
@@ -282,6 +285,7 @@ def generate_official_voucher_pdf(filename, data, receipts):
     story.append(Paragraph("<b>Comments:</b> Hand written Receipt approved by Sadr Majlis. (Updated: 1-11-19)", cell_style))
     
     doc.build(story)
+
 # -------------------------------------------------------------------------
 # DUAL-FORMAT APPENDIX BINDER STITCHING PIPELINE
 # -------------------------------------------------------------------------
