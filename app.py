@@ -32,6 +32,8 @@ else:
     pytesseract.pytesseract.tesseract_cmd = "/usr/bin/tesseract"
 
 CONFIG_FILE = "admin_config.json"
+
+# Relational mapping framework configuration dictionary updated for Majlis Ansarullah Australia
 DEFAULT_CONFIG = {
     "regions": ["National", "Region North", "Region South"],
     "regional_majlis": {
@@ -54,11 +56,17 @@ DEFAULT_CONFIG = {
     }
 }
 
+# -------------------------------------------------------------------------
+# PERSISTENT STORAGE MANAGEMENT FOR FREE STREAMLIT TIER
+# -------------------------------------------------------------------------
 def load_admin_settings():
+    """Loads admin configurations from a local JSON file to survive app sleeping."""
     if os.path.exists(CONFIG_FILE):
         try:
             with open(CONFIG_FILE, "r") as f:
                 data = json.load(f)
+                
+                # --- FIXED CRITICAL FALLBACK STRUCTURE CHECKS ---
                 for key in DEFAULT_CONFIG:
                     if key not in data or not data[key]:
                         data[key] = DEFAULT_CONFIG[key]
@@ -68,29 +76,38 @@ def load_admin_settings():
     return DEFAULT_CONFIG
 
 def save_admin_settings(config_data):
+    """Saves admin updates permanently into the repository environment."""
     with open(CONFIG_FILE, "w") as f:
         json.dump(config_data, f, indent=4)
 
+# Initialize settings in state
 if 'admin_lists' not in st.session_state:
     st.session_state.admin_lists = load_admin_settings()
+# -------------------------------------------------------------------------
+# DUAL-FORMAT OCR ENGINE FOR IMAGE & PDF TRANSLATION PROCESSING
+# -------------------------------------------------------------------------
 def parse_receipt_image_or_pdf(uploaded_file):
+    """Processes images or PDFs, returning (description, total, gst, receipt_date, raw_text)."""
     try:
         uploaded_file.seek(0)
         file_ext = os.path.splitext(uploaded_file.name)[1].lower()
         raw_text = ""
         
+        # Scenario A: Handle direct PDF digital uploads via page vector scanning blocks
         if file_ext == ".pdf":
             temp_pdf_path = f"temp_ocr_{uploaded_file.name}"
             with open(temp_pdf_path, "wb") as temp_f:
                 temp_f.write(uploaded_file.read())
             
             try:
+                # Attempt structural digital text reading extraction first
                 reader = pypdf.PdfReader(temp_pdf_path)
                 for page in reader.pages:
                     text_content = page.extract_text()
                     if text_content:
                         raw_text += text_content + "\n"
                 
+                # Fallback to raster image conversion parsing if document is a scanned image container
                 if not raw_text.strip():
                     converted_images = convert_from_path(temp_pdf_path)
                     for pil_img in converted_images:
@@ -99,6 +116,8 @@ def parse_receipt_image_or_pdf(uploaded_file):
             finally:
                 if os.path.exists(temp_pdf_path):
                     os.remove(temp_pdf_path)
+                    
+        # Scenario B: Handle standard image asset uploads (PNG, JPG, JPEG)
         else:
             image = Image.open(uploaded_file)
             image = ImageOps.exif_transpose(image)
@@ -109,6 +128,7 @@ def parse_receipt_image_or_pdf(uploaded_file):
         raw_text_lower = raw_text.lower()
         cleaned_text = re.sub(r'(?<=\d)[ \t]*([.,])[ \t]*(?=\d{2}\b)', r'\1', raw_text_lower)
 
+        # Extrapolate numeric balance points
         amounts = []
         for m in re.findall(r'\b\d+[.,]\d{2}\b', cleaned_text):
             try:
@@ -125,6 +145,7 @@ def parse_receipt_image_or_pdf(uploaded_file):
             else:
                 gst_amount = round(total_amount / 11, 2)
 
+        # Parse data timestamps matching common layouts
         detected_date = datetime.today().strftime('%d/%m/%Y')
         date_patterns = re.findall(r'\b\d{1,2}[/\-]\d{1,2}[/\-]\d{2,4}\b', raw_text)
         if date_patterns:
@@ -138,7 +159,11 @@ def parse_receipt_image_or_pdf(uploaded_file):
         return description, total_amount, gst_amount, detected_date, raw_text
     except Exception as e:
         return "Scan failed", 0.0, 0.0, datetime.today().strftime('%d/%m/%Y'), f"ERROR: {e}"
+# -------------------------------------------------------------------------
+# COMPREHENSIVE DYNAMIC MULTI-PAGE REPORTLAB PDF BUILDER MODULE
+# -------------------------------------------------------------------------
 def generate_official_voucher_pdf(filename, data, receipts):
+    """Compiles a dynamic multi-page clone matching the Majlis Ansarullah Australia layout."""
     doc = SimpleDocTemplate(filename, pagesize=letter, rightMargin=36, leftMargin=36, topMargin=36, bottomMargin=36)
     story = []
     
@@ -148,7 +173,6 @@ def generate_official_voucher_pdf(filename, data, receipts):
     top_line_style = ParagraphStyle('TopLine', fontName='Helvetica-Oblique', fontSize=9, leading=11, alignment=1, spaceAfter=4)
     cell_style = ParagraphStyle('Cell', fontName='Helvetica', fontSize=9, leading=11)
     cell_bold_style = ParagraphStyle('CellB', fontName='Helvetica-Bold', fontSize=9, leading=11)
-    cell_red_bold_style = ParagraphStyle('CellRedB', fontName='Helvetica-Bold', fontSize=9, leading=11, textColor=colors.HexColor("#CC0000"))
     
     story.append(Paragraph("In the name of Allah, the gracious, the merciful", top_line_style))
     story.append(Paragraph("MAJLIS ANSARULLAH AUSTRALIA", header_title_style))
@@ -156,14 +180,12 @@ def generate_official_voucher_pdf(filename, data, receipts):
     story.append(Paragraph("Expense Payment Voucher", header_subtitle_style))
     story.append(Spacer(1, 10))
     
-    advance_display_value = f"$ {data['advance_amount']:.2f}" if data['advance_amount'] > 0 else ""
-
     header_data = [
         [Paragraph("<b>Payee Name:</b>", cell_style), Paragraph(data['name'], cell_style), Paragraph("<b>Voucher No:</b>", cell_style), Paragraph("", cell_style)],
         [Paragraph("<b>Expense Type:</b>", cell_style), Paragraph(data['expense_type'], cell_style), Paragraph("<b>BSB:</b>", cell_style), Paragraph(data['bsb'], cell_style)],
         [Paragraph("<b>Account:</b>", cell_style), Paragraph(data['account'], cell_style), Paragraph("<b>Account:</b>", cell_style), Paragraph(data['acc_num'], cell_style)],
         [Paragraph("<b>Region:</b>", cell_style), Paragraph(data['region'], cell_style), Paragraph("<b>Total Claim:</b>", cell_bold_style), Paragraph(f"<b>$ {data['total_amount']:.2f}</b>", cell_bold_style)],
-        [Paragraph("<b>Majlis:</b>", cell_style), Paragraph(data['majlis'], cell_style), Paragraph("<b>Advance Issued:</b>", cell_style), Paragraph(advance_display_value, cell_style)]
+        [Paragraph("<b>Majlis:</b>", cell_style), Paragraph(data['majlis'], cell_style), Paragraph("<b>Advance Issued:</b>", cell_style), Paragraph("", cell_style)]
     ]
     
     t_header = Table(header_data, colWidths=[100, 170, 100, 170])
@@ -177,15 +199,10 @@ def generate_official_voucher_pdf(filename, data, receipts):
     
     receipt_table_data = [[Paragraph("<b>#</b>", cell_bold_style), Paragraph("<b>Date</b>", cell_bold_style), Paragraph("<b>Description</b>", cell_bold_style), Paragraph("<b>Total amount</b>", cell_bold_style), Paragraph("<b>GST</b>", cell_bold_style)]]
     
-    base_receipt_count = len(receipts)
-    has_advance = data['advance_amount'] > 0
-    total_functional_rows = base_receipt_count + (1 if has_advance else 0)
-    max_rows = max(10, total_functional_rows)
-    
-    functional_row_index = 0
+    max_rows = max(10, len(receipts))
     for idx in range(max_rows):
-        if functional_row_index < base_receipt_count:
-            r = receipts[functional_row_index]
+        if idx < len(receipts):
+            r = receipts[idx]
             receipt_table_data.append([
                 Paragraph(str(idx + 1), cell_style),
                 Paragraph(r['date'], cell_style),
@@ -193,21 +210,10 @@ def generate_official_voucher_pdf(filename, data, receipts):
                 Paragraph(f"${r['amount']:.2f}", cell_style),
                 Paragraph(f"${r['gst']:.2f}", cell_style)
             ])
-            functional_row_index += 1
-        elif has_advance and functional_row_index == base_receipt_count:
-            receipt_table_data.append([
-                Paragraph(str(idx + 1), cell_red_bold_style),
-                Paragraph(datetime.today().strftime('%d/%m/%Y'), cell_red_bold_style),
-                Paragraph("Less: Advance Settlement Adjustment", cell_red_bold_style),
-                Paragraph(f"-${data['advance_amount']:.2f}", cell_red_bold_style),
-                Paragraph("$0.00", cell_red_bold_style)
-            ])
-            functional_row_index += 1
         else:
             receipt_table_data.append([Paragraph(str(idx + 1), cell_style), "", "", "", ""])
             
-    net_reimbursement_payable = data['total_amount'] - data['advance_amount']
-    receipt_table_data.append([Paragraph("<b>Total</b>", cell_bold_style), "", "", Paragraph(f"<b>${net_reimbursement_payable:.2f}</b>", cell_bold_style), Paragraph(f"<b>${data['total_gst']:.2f}</b>", cell_bold_style)])
+    receipt_table_data.append([Paragraph("<b>Total</b>", cell_bold_style), "", "", Paragraph(f"<b>${data['total_amount']:.2f}</b>", cell_bold_style), Paragraph(f"<b>${data['total_gst']:.2f}</b>", cell_bold_style)])
     
     t_receipts = Table(receipt_table_data, colWidths=[30, 80, 250, 90, 90])
     t_receipts.setStyle(TableStyle([
@@ -246,7 +252,48 @@ def generate_official_voucher_pdf(filename, data, receipts):
     story.append(Paragraph("<b>Comments:</b> Hand written Receipt approved by Sadr Majlis. (Updated: 1-11-19)", cell_style))
     
     doc.build(story)
+
+# -------------------------------------------------------------------------
+# DYNAMIC MULTI-FORMAT APPRENDIX BINDER STITCHING PIPELINE
+# -------------------------------------------------------------------------
+def stitch_files_to_pdf(voucher_pdf_path, uploaded_files_list):
+    """Stitches multi-format attachments directly onto the base voucher sheet."""
+    try:
+        merger = pypdf.PdfMerger()
+        merger.append(voucher_pdf_path)
+        
+        for idx, u_file in enumerate(uploaded_files_list):
+            if u_file is not None:
+                u_file.seek(0)
+                ext = os.path.splitext(u_file.name)[1].lower()
+                
+                # Directly merge PDF file submissions
+                if ext == ".pdf":
+                    merger.append(u_file)
+                # Convert and append image file submissions
+                else:
+                    img = Image.open(u_file)
+                    img = ImageOps.exif_transpose(img)
+                    if img.mode in ("RGBA", "P"):
+                        img = img.convert("RGB")
+                    
+                    tmp_img_pdf = f"tmp_stitch_{idx}.pdf"
+                    img.save(tmp_img_pdf, "PDF", resolution=100.0)
+                    merger.append(tmp_img_pdf)
+                    if os.path.exists(tmp_img_pdf):
+                        os.remove(tmp_img_pdf)
+                        
+        merger.write(voucher_pdf_path)
+        merger.close()
+        return True
+    except Exception as e:
+        st.error(f"⚠️ Appending engine notice: Attachment compilation encountered a restriction vector: {e}")
+        return False
+# -------------------------------------------------------------------------
+# DIRECT EMAIL OUTBOUND DISPATCH ENGINE (SMTP)
+# -------------------------------------------------------------------------
 def _image_to_pdf_buffer(u_file, label):
+    """Places an image receipt on a letter-size page, scaled to fit."""
     img = Image.open(u_file)
     img = ImageOps.exif_transpose(img)
     if img.mode != "RGB":
@@ -275,8 +322,10 @@ def _image_to_pdf_buffer(u_file, label):
     return buf
 
 def stitch_files_to_pdf(voucher_pdf_path, uploaded_files_list):
+    """Summary page first, then every uploaded receipt, as one PDF."""
     try:
         writer = PdfWriter()
+
         for page in PdfReader(voucher_pdf_path).pages:
             writer.add_page(page)
 
@@ -284,7 +333,7 @@ def stitch_files_to_pdf(voucher_pdf_path, uploaded_files_list):
             if u_file is None:
                 continue
             u_file.seek(0)
-            ext = os.path.splitext(u_file.name).lower()
+            ext = os.path.splitext(u_file.name)[1].lower()
 
             if ext == ".pdf":
                 reader = PdfReader(io.BytesIO(u_file.read()))
@@ -302,6 +351,10 @@ def stitch_files_to_pdf(voucher_pdf_path, uploaded_files_list):
     except Exception as e:
         st.error(f"⚠️ Could not attach receipts to the voucher: {e}")
         return False
+
+# -------------------------------------------------------------------------
+# CORE FRONT-END SELECTION ROUTER
+# -------------------------------------------------------------------------
 st.set_page_config(page_title="Expense Portal (Official MAA Clone)", layout="wide")
 app_mode = st.sidebar.selectbox("Navigate Mode", ["User Claim Portal", "Admin Panel Configuration"])
 
@@ -309,9 +362,10 @@ if app_mode == "Admin Panel Configuration":
     st.title("⚙️ Admin Control Panel")
     pwd_input = st.text_input("Enter Master Admin Access Key Password", type="password")
     
-    if pwd_input == st.session_state.admin_lists.get("admin_password", "123"):
+    if pwd_input == st.session_state.admin_lists.get("admin_password", "AdminPassword123"):
         st.success("Access Verified. Secure Configuration Screen Unlocked.")
-        new_pwd = st.text_input("Modify System Admin Password Key", value=st.session_state.admin_lists.get("admin_password", "123"))
+        
+        new_pwd = st.text_input("Modify System Admin Password Key", value=st.session_state.admin_lists.get("admin_password", "AdminPassword123"))
         
         st.markdown("### 👑 Central Executive Authority Configuration (Global Overrides)")
         q_mal = st.text_input("Approved by Qaid Mal - Target Field Assignment Name", value=st.session_state.admin_lists.get("qaid_mal_name", "Tahir Mahmood Rana"))
@@ -372,6 +426,85 @@ if app_mode == "Admin Panel Configuration":
             st.session_state.admin_lists = updated_config
             st.success("Global application schema configuration matrix updated successfully!")
             st.rerun()
+# -------------------------------------------------------------------------
+# INTERACTIVE CLAIM FORM LAYOUT PANEL
+# -------------------------------------------------------------------------
+else:
+    st.title("📋 Online Expense Claim Submission System")
+    
+    col1, col2 = st.columns(2)
+    with col1:
+        name = st.text_input("Full Employee / Claimant Name (Payee Name)")
+        claimant_email = st.text_input("Your Personal/Employee Email Address (For confirmation copy)")
+        expense_event_desc = st.text_input("Description of Event (Expense Type)")
+        
+        configured_regions = st.session_state.admin_lists["regions"]
+        region = st.selectbox("Select Region / National Location", options=configured_regions)
+        
+        majlis_lookup_map = st.session_state.admin_lists["regional_majlis"]
+        available_majlis_options = majlis_lookup_map.get(region, [])
+        if not available_majlis_options:
+            available_majlis_options = ["No entries declared under this region boundary"]
+        
+        majlis = st.selectbox("Select Respective Residing Majlis / Office Destination", options=available_majlis_options)
+        account = st.text_input("General Ledger / Tracking Account Code (Account)")
+        
+    with col2:
+        total_receipts_input = st.number_input("Total Number of Receipts To Claim", min_value=1, max_value=50, value=1, step=1)
+        declared_total_input = st.number_input("Total Declared Claim Amount ($)", min_value=0.0, format="%.2f")
+        
+        st.markdown("**🏦 Direct Reimbursement Bank Segment**")
+        bsb = st.text_input("Bank BSB Code (e.g., 000-000)", max_chars=7)
+        acc_num = st.text_input("Account Number")
+
+    st.markdown("---")
+    st.subheader("📎 Individual Itemized Receipt Image/PDF Ingestion Block")
+    
+    receipt_records = []
+    raw_files_tracker = []
+    uploaded_files_count = 0
+    
+    for i in range(int(total_receipts_input)):
+        st.markdown(f"#### 📄 Receipt Section Item #{i+1}")
+        
+        r_col1, r_col2, r_col3, r_col4, r_col5 = st.columns([2.5, 2.5, 2, 1.5, 1.5])
+
+        with r_col1:
+            uploaded_file = st.file_uploader(
+                f"Upload Receipt #{i+1} (Image or PDF)",
+                type=["png", "jpg", "jpeg", "pdf"], key=f"file_{i}"
+            )
+            raw_files_tracker.append(uploaded_file)
+            if uploaded_file is not None:
+                uploaded_files_count += 1
+
+        if uploaded_file is not None:
+            sig = f"{uploaded_file.name}_{uploaded_file.size}"
+            if st.session_state.get(f"sig_{i}") != sig:
+                with st.spinner(f"Scanning document #{i+1}..."):
+                    d, t, g, dt, raw = parse_receipt_image_or_pdf(uploaded_file)
+                st.session_state[f"desc_{i}"] = d
+                st.session_state[f"amt_{i}"] = float(t)
+                st.session_state[f"gst_{i}"] = float(g)
+                st.session_state[f"date_{i}"] = dt
+                st.session_state[f"ocr_{i}"] = raw
+                st.session_state[f"sig_{i}"] = sig
+
+        with r_col2:
+            desc_val = st.text_input(f"Item Description #{i+1}", key=f"desc_{i}")
+        with r_col3:
+            date_val = st.text_input(f"Receipt Date (DD/MM/YYYY) #{i+1}", key=f"date_{i}")
+        with r_col4:
+            total_val = st.number_input(f"Amount ($) #{i+1}", min_value=0.0, format="%.2f", key=f"amt_{i}")
+        with r_col5:
+            gst_val = st.number_input(f"GST ($) #{i+1}", min_value=0.0, format="%.2f", key=f"gst_{i}")
+
+        if f"ocr_{i}" in st.session_state:
+            with st.expander(f"Debug: raw OCR text for receipt #{i+1}"):
+                st.text(st.session_state[f"ocr_{i}"])
+
+        receipt_records.append({"desc": desc_val, "date": date_val, "amount": total_val, "gst": gst_val})
+
     calculated_total_claim = sum(r["amount"] for r in receipt_records)
     calculated_total_gst = sum(r["gst"] for r in receipt_records)
     
@@ -381,14 +514,11 @@ if app_mode == "Admin Panel Configuration":
     st.markdown("---")
     st.markdown("### 📊 Dynamic Live Aggregated Verification Totals")
     
-    sum_col1, sum_col2, sum_col3 = st.columns(3)
+    sum_col1, sum_col2 = st.columns(2)
     with sum_col1:
-        st.metric(label="Total Aggregated Receipts Amount (Calculated)", value=f"${calculated_total_claim:,.2f}")
+        st.metric(label="Total Aggregated Claim Amount (Calculated)", value=f"${calculated_total_claim:,.2f}")
     with sum_col2:
         st.metric(label="Total Aggregated GST Amount (Calculated)", value=f"${calculated_total_gst:,.2f}")
-    with sum_col3:
-        net_payable_display = calculated_total_claim - advance_amount
-        st.metric(label="Net Reimbursement Balance Payable (After Advance Deduction)", value=f"${net_payable_display:,.2f}")
 
     st.markdown("---")
     st.markdown("### 🛡️ System Submission Safety Validation Checks")
@@ -430,7 +560,6 @@ if app_mode == "Admin Panel Configuration":
                     "total_receipts": len(receipt_records),
                     "total_amount": calculated_total_claim,
                     "total_gst": calculated_total_gst,
-                    "advance_amount": advance_amount,
                     "bsb": bsb,
                     "acc_num": acc_num,
                     "qaid_mal": st.session_state.admin_lists.get("qaid_mal_name", "Tahir Mahmood Rana"),
@@ -439,6 +568,7 @@ if app_mode == "Admin Panel Configuration":
                 }
 
                 output_filename = f"Expense_Voucher_{name.replace(' ', '_')}.pdf"
+
                 generate_official_voucher_pdf(output_filename, payload, receipt_records)
 
                 with st.spinner("Stitching receipts into the claim PDF..."):
@@ -449,6 +579,26 @@ if app_mode == "Admin Panel Configuration":
 
                 st.success("🎉 Claim pack compiled: summary page + all receipts!")
                 st.balloons()
+
+                target_email = nazim_info.get("email", "")
+                if target_email:
+                    recipient_emails = [target_email]
+                    subject = f"Expense Payment Voucher Submission - {name} ({region})"
+                    body = f"Assalam-o-Alaikum,\n\nA new expense payment voucher pack has been generated and submitted by {name} for the '{majlis}' branch of the '{region}' region.\n\nPlease find the comprehensive document statement bundle (Voucher Sheet + Attached Receipts) attached below for your immediate review.\n\nBest regards,\nAutomated Expense Portal Gateway"
+
+                    #with st.spinner("Sending the PDF bundle by email..."):
+                    #    success = dispatch_real_email(
+                    #        recipient_list=recipient_emails,
+                    #        subject_text=subject,
+                    #        body_text=body,
+                    #        attachment_path=output_filename,
+                    #        cc_recipient=claimant_email.strip()
+                    #    )
+
+                    #if success:
+                    #    st.success(f"📧 Email sent to Nazim e Ala ({target_email}) and CC'd to {claimant_email}")
+                #else:
+                #    st.warning("⚠️ Email delivery skipped: No Nazim e Ala email address configured for this region in admin settings.")
 
                 with open(output_filename, "rb") as f:
                     pdf_bytes = f.read()
