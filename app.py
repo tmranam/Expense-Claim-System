@@ -595,10 +595,10 @@ else:
                     #        cc_recipient=claimant_email.strip()
                     #    )
 
-                    if success:
-                        st.success(f"📧 Email sent to Nazim e Ala ({target_email}) and CC'd to {claimant_email}")
-                else:
-                    st.warning("⚠️ Email delivery skipped: No Nazim e Ala email address configured for this region in admin settings.")
+                    #if success:
+                    #    st.success(f"📧 Email sent to Nazim e Ala ({target_email}) and CC'd to {claimant_email}")
+                #else:
+                #    st.warning("⚠️ Email delivery skipped: No Nazim e Ala email address configured for this region in admin settings.")
 
                 with open(output_filename, "rb") as f:
                     pdf_bytes = f.read()
