@@ -139,6 +139,9 @@ def parse_receipt_image_or_pdf(uploaded_file):
         return description, total_amount, gst_amount, detected_date, raw_text
     except Exception as e:
         return "Scan failed", 0.0, 0.0, datetime.today().strftime('%d/%m/%Y'), f"ERROR: {e}"
+# -------------------------------------------------------------------------
+# COMPREHENSIVE DYNAMIC MULTI-PAGE REPORTLAB PDF BUILDER MODULE
+# -------------------------------------------------------------------------
 def generate_official_voucher_pdf(filename, data, receipts):
     doc = SimpleDocTemplate(filename, pagesize=letter, rightMargin=36, leftMargin=36, topMargin=36, bottomMargin=36)
     story = []
@@ -175,9 +178,11 @@ def generate_official_voucher_pdf(filename, data, receipts):
     ]))
     story.append(t_header)
     story.append(Spacer(1, 15))
+
     
-    receipt_table_data = [[Paragraph("<b>#</b>", cell_bold_style), Paragraph("<b>Date</b>", cell_bold_style), Paragraph("<b>Description</b>", cell_bold_style), Paragraph("<b>Total amount</b>", cell_bold_style), Paragraph("<b>GST</b>", cell_bold_style)]]
+        receipt_table_data = [[Paragraph("<b>#</b>", cell_bold_style), Paragraph("<b>Date</b>", cell_bold_style), Paragraph("<b>Description</b>", cell_bold_style), Paragraph("<b>Total amount</b>", cell_bold_style), Paragraph("<b>GST</b>", cell_bold_style)]]
     
+    # Calculate row padding layout space
     base_receipt_count = len(receipts)
     has_advance = data['advance_amount'] > 0
     total_functional_rows = base_receipt_count + (1 if has_advance else 0)
@@ -243,10 +248,11 @@ def generate_official_voucher_pdf(filename, data, receipts):
     
     story.append(Spacer(1, 10))
     story.append(Paragraph("<b>Acknowledgment</b>", header_subtitle_style))
-    story.append(Paragraph("I have received cash/cheque payment of $________________ as per details provided above.", cell_style))
+    story.append(Paragraph(f"I have received cash/cheque payment of $________________ as per details provided above.", cell_style))
     story.append(Paragraph("<b>Comments:</b> Hand written Receipt approved by Sadr Majlis. (Updated: 1-11-19)", cell_style))
     
     doc.build(story)
+
 def _image_to_pdf_buffer(u_file, label):
     img = Image.open(u_file)
     img = ImageOps.exif_transpose(img)
