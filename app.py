@@ -41,6 +41,7 @@ DEFAULT_CONFIG = {
         "Region North": ["Youth Majlis North", "Local Chapter A"],
         "Region South": ["Youth Majlis South", "Local Chapter B"]
     },
+    "accounts": ["1000 - General Operations", "2000 - Local Events", "3000 - Welfare Projects", "4000 - Office Admin"],
     "emails": ["finance@example.com", "approvals@example.com"],
     "admin_password": "123",
     "smtp_server": "://gmail.com",
@@ -184,7 +185,7 @@ def generate_official_voucher_pdf(filename, data, receipts):
     header_data = [
         [Paragraph("<b>Payee Name:</b>", cell_style), Paragraph(data['name'], cell_style), Paragraph("<b>Voucher No:</b>", cell_style), Paragraph("", cell_style)],
         [Paragraph("<b>Expense Type:</b>", cell_style), Paragraph(data['expense_type'], cell_style), Paragraph("<b>BSB:</b>", cell_style), Paragraph(data['bsb'], cell_style)],
-        [Paragraph("<b>Account:</b>", cell_style), Paragraph(data['account'], cell_style), Paragraph("<b>Account:</b>", cell_style), Paragraph(data['acc_num'], cell_style)],
+        [Paragraph("<b>Account:</b>", cell_style), Paragraph(data['account'], cell_style), Paragraph("<b>Account No:</b>", cell_style), Paragraph(data['acc_num'], cell_style)],
         [Paragraph("<b>Region:</b>", cell_style), Paragraph(data['region'], cell_style), Paragraph("<b>Total Claim:</b>", cell_bold_style), Paragraph(f"<b>$ {data['total_amount']:.2f}</b>", cell_bold_style)],
         [Paragraph("<b>Majlis:</b>", cell_style), Paragraph(data['majlis'], cell_style), Paragraph("<b>Advance Issued:</b>", cell_style), Paragraph(f"$ {data['advance']:.2f}" if data['advance'] > 0 else "", cell_red_bold_style)]
     ]
@@ -268,48 +269,11 @@ def generate_official_voucher_pdf(filename, data, receipts):
     story.append(Paragraph("<b>Comments:</b> Hand written Receipt approved by Sadr Majlis. (Updated: 1-11-19)", cell_style))
     
     doc.build(story)
-
 # -------------------------------------------------------------------------
-# DYNAMIC MULTI-FORMAT APPRENDIX BINDER STITCHING PIPELINE
-# -------------------------------------------------------------------------
-def stitch_files_to_pdf(voucher_pdf_path, uploaded_files_list):
-    """Stitches multi-format attachments directly onto the base voucher sheet."""
-    try:
-        merger = pypdf.PdfMerger()
-        merger.append(voucher_pdf_path)
-        
-        for idx, u_file in enumerate(uploaded_files_list):
-            if u_file is not None:
-                u_file.seek(0)
-                ext = os.path.splitext(u_file.name)[1].lower()
-                
-                # Directly merge PDF file submissions
-                if ext == ".pdf":
-                    merger.append(u_file)
-                # Convert and append image file submissions
-                else:
-                    img = Image.open(u_file)
-                    img = ImageOps.exif_transpose(img)
-                    if img.mode in ("RGBA", "P"):
-                        img = img.convert("RGB")
-                    
-                    tmp_img_pdf = f"tmp_stitch_{idx}.pdf"
-                    img.save(tmp_img_pdf, "PDF", resolution=100.0)
-                    merger.append(tmp_img_pdf)
-                    if os.path.exists(tmp_img_pdf):
-                        os.remove(tmp_img_pdf)
-                        
-        merger.write(voucher_pdf_path)
-        merger.close()
-        return True
-    except Exception as e:
-        st.error(f"⚠️ Appending engine notice: Attachment compilation encountered a restriction vector: {e}")
-        return False
-# -------------------------------------------------------------------------
-# DIRECT EMAIL OUTBOUND DISPATCH ENGINE (SMTP)
+# DUAL-FORMAT APPENDIX BINDER STITCHING PIPELINE
 # -------------------------------------------------------------------------
 def _image_to_pdf_buffer(u_file, label):
-    """Places an image receipt on a A4-size page, scaled to fit."""
+    """Places an image receipt on an A4-size page, scaled to fit."""
     img = Image.open(u_file)
     img = ImageOps.exif_transpose(img)
     if img.mode != "RGB":
@@ -367,7 +331,6 @@ def stitch_files_to_pdf(voucher_pdf_path, uploaded_files_list):
     except Exception as e:
         st.error(f"⚠️ Could not attach receipts to the voucher: {e}")
         return False
-
 # -------------------------------------------------------------------------
 # CORE FRONT-END SELECTION ROUTER
 # -------------------------------------------------------------------------
@@ -390,6 +353,11 @@ if app_mode == "Admin Panel Configuration":
         st.markdown("---")
         regions_text = st.text_area("Regions Master List Configuration (One entry per line)", value="\n".join(st.session_state.admin_lists["regions"]))
         parsed_regions_list = [line.strip() for line in regions_text.split("\n") if line.strip()]
+
+        st.markdown("---")
+        st.markdown("#### 📑 Ledger Accounts Master List Configuration")
+        accounts_text = st.text_area("Accounts Master List Configuration (One entry per line)", value="\n".join(st.session_state.admin_lists.get("accounts", DEFAULT_CONFIG["accounts"])))
+        parsed_accounts_list = [line.strip() for line in accounts_text.split("\n") if line.strip()]
         
         st.markdown("---")
         st.markdown("#### 🗺️ Regional Majlis & Nazim e Ala Configuration Matrix")
@@ -427,6 +395,7 @@ if app_mode == "Admin Panel Configuration":
             updated_config = {
                 "regions": parsed_regions_list,
                 "regional_majlis": updated_map,
+                "accounts": parsed_accounts_list,
                 "emails": [line.strip() for line in st.session_state.admin_lists.get("emails", [])],
                 "admin_password": new_pwd.strip(),
                 "smtp_server": smtp_srv.strip(),
@@ -463,7 +432,10 @@ else:
             available_majlis_options = ["No entries declared under this region boundary"]
         
         majlis = st.selectbox("Select your Majlis / Office", options=available_majlis_options)
-        account = st.text_input("Account")
+        
+        # --- REPLACED TEXT INPUT WITH DYNAMIC SELECTBOX DROPDOWN MATRIX ---
+        configured_accounts = st.session_state.admin_lists.get("accounts", DEFAULT_CONFIG["accounts"])
+        account = st.selectbox("Select Tracking Account Code", options=configured_accounts)
         
     with col2:
         total_receipts_input = st.number_input("Total Number of Receipts To Claim", min_value=1, max_value=50, value=1, step=1)
@@ -487,7 +459,6 @@ else:
     
     for i in range(int(total_receipts_input)):
         st.markdown(f"#### 📄 Receipt Section Item #{i+1}")
-        
         r_col1, r_col2, r_col3, r_col4, r_col5 = st.columns([2.5, 2.5, 2, 1.5, 1.5])
 
         with r_col1:
@@ -593,7 +564,6 @@ else:
                 }
 
                 output_filename = f"Expense_Voucher_{name.replace(' ', '_')}.pdf"
-
                 generate_official_voucher_pdf(output_filename, payload, receipt_records)
 
                 with st.spinner("Stitching receipts into the claim PDF..."):
@@ -604,26 +574,6 @@ else:
 
                 st.success("🎉 Claim pack compiled: summary page + all receipts!")
                 st.balloons()
-
-                target_email = nazim_info.get("email", "")
-                if target_email:
-                    recipient_emails = [target_email]
-                    subject = f"Expense Payment Voucher Submission - {name} ({region})"
-                    body = f"Assalam-o-Alaikum,\n\nA new expense payment voucher pack has been generated and submitted by {name} for the '{majlis}' branch of the '{region}' region.\n\nPlease find the comprehensive document statement bundle (Voucher Sheet + Attached Receipts) attached below for your immediate review.\n\nBest regards,\nAutomated Expense Portal Gateway"
-
-                    #with st.spinner("Sending the PDF bundle by email..."):
-                    #    success = dispatch_real_email(
-                    #        recipient_list=recipient_emails,
-                    #        subject_text=subject,
-                    #        body_text=body,
-                    #        attachment_path=output_filename,
-                    #        cc_recipient=claimant_email.strip()
-                    #    )
-
-                    #if success:
-                    #    st.success(f"📧 Email sent to Nazim e Ala ({target_email}) and CC'd to {claimant_email}")
-                #else:
-                #    st.warning("⚠️ Email delivery skipped: No Nazim e Ala email address configured for this region in admin settings.")
 
                 with open(output_filename, "rb") as f:
                     pdf_bytes = f.read()
