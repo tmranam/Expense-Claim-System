@@ -11,7 +11,7 @@ from email.mime.base import MIMEBase
 from email import encoders
 from PIL import Image, ImageOps
 import pytesseract
-from reportlab.lib.pagesizes import letter
+from reportlab.lib.pagesizes import A4
 from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle
 from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
 from reportlab.lib import colors
@@ -164,7 +164,7 @@ def parse_receipt_image_or_pdf(uploaded_file):
 # -------------------------------------------------------------------------
 def generate_official_voucher_pdf(filename, data, receipts):
     """Compiles a dynamic multi-page clone matching the Majlis Ansarullah Australia layout."""
-    doc = SimpleDocTemplate(filename, pagesize=letter, rightMargin=36, leftMargin=36, topMargin=36, bottomMargin=36)
+    doc = SimpleDocTemplate(filename, pagesize=A4, rightMargin=36, leftMargin=36, topMargin=36, bottomMargin=36)
     story = []
     
     header_title_style = ParagraphStyle('HeadTitle', fontName='Helvetica-Bold', fontSize=14, alignment=1, spaceAfter=2)
@@ -309,20 +309,20 @@ def stitch_files_to_pdf(voucher_pdf_path, uploaded_files_list):
 # DIRECT EMAIL OUTBOUND DISPATCH ENGINE (SMTP)
 # -------------------------------------------------------------------------
 def _image_to_pdf_buffer(u_file, label):
-    """Places an image receipt on a letter-size page, scaled to fit."""
+    """Places an image receipt on a A4-size page, scaled to fit."""
     img = Image.open(u_file)
     img = ImageOps.exif_transpose(img)
     if img.mode != "RGB":
         img = img.convert("RGB")
 
-    page_w, page_h = letter
+    page_w, page_h = A4
     margin = 36
     header_h = 20
     max_w = page_w - 2 * margin
     max_h = page_h - 2 * margin - header_h
 
     buf = io.BytesIO()
-    c = canvas.Canvas(buf, pagesize=letter)
+    c = canvas.Canvas(buf, pagesize=A4)
     c.setFont("Helvetica-Bold", 11)
     c.drawString(margin, page_h - margin, label)
 
