@@ -550,25 +550,25 @@ else:
                 st.error("Submission Denied: Profile details, Event Description, Claimant Email, BSB, and Account Numbers must be filled out completely.")
             else:
                 nazim_info = st.session_state.admin_lists.get("regional_nazims", {}).get(region, {"name": "Not Configured", "email": ""})
-                
+
                 payload = {
-                    "name": name, 
-                    "region": region, 
-                    "majlis": majlis, 
+                    "name": name,
+                    "region": region,
+                    "majlis": majlis,
                     "account": account,
                     "expense_type": expense_event_desc,
-                    "total_receipts": len(receipt_records), 
+                    "total_receipts": len(receipt_records),
                     "total_amount": calculated_total_claim,
                     "total_gst": calculated_total_gst,
-                    "bsb": bsb, 
+                    "bsb": bsb,
                     "acc_num": acc_num,
                     "qaid_mal": st.session_state.admin_lists.get("qaid_mal_name", "Tahir Mahmood Rana"),
                     "sadr_maa": st.session_state.admin_lists.get("sadr_maa_name", "Abdul Jamil Mubbashar"),
                     "nazim_name": nazim_info.get("name", "Not Configured")
                 }
-                
+
                 output_filename = f"Expense_Voucher_{name.replace(' ', '_')}.pdf"
-                
+
                 generate_official_voucher_pdf(output_filename, payload, receipt_records)
 
                 with st.spinner("Stitching receipts into the claim PDF..."):
@@ -577,30 +577,31 @@ else:
                 if not stitched_ok:
                     st.stop()
 
-            st.success("🎉 Claim pack compiled: summary page + all receipts!")
-            st.balloons()
-                
-            target_email = nazim_info.get("email", "")
-            if target_email:
-                recipient_emails = [target_email]
-                subject = f"Expense Payment Voucher Submission - {name} ({region})"
-                body = f"Assalam-o-Alaikum,\n\nA new expense payment voucher pack has been generated and submitted by {name} for the '{majlis}' branch of the '{region}' region.\n\nPlease find the comprehensive document statement bundle (Voucher Sheet + Attached Receipts) attached below for your immediate review.\n\nBest regards,\nAutomated Expense Portal Gateway"
-                    
-                with st.spinner("Transmitting secure PDF files bundle across outbound networks..."):
-                    success = dispatch_real_email(
-                        recipient_list=recipient_emails, 
-                        subject_text=subject, 
-                        body_text=body, 
-                        attachment_path=output_filename,
-                        cc_recipient=claimant_email.strip()
-                    )
-                    
-                if success:
-                    st.success(f"📧 Outbound Email Dispatched! Delivered directly to Nazim e Ala ({target_email}) and carbon-copied (CC) to claimant address: {claimant_email}")
+                st.success("🎉 Claim pack compiled: summary page + all receipts!")
+                st.balloons()
+
+                target_email = nazim_info.get("email", "")
+                if target_email:
+                    recipient_emails = [target_email]
+                    subject = f"Expense Payment Voucher Submission - {name} ({region})"
+                    body = f"Assalam-o-Alaikum,\n\nA new expense payment voucher pack has been generated and submitted by {name} for the '{majlis}' branch of the '{region}' region.\n\nPlease find the comprehensive document statement bundle (Voucher Sheet + Attached Receipts) attached below for your immediate review.\n\nBest regards,\nAutomated Expense Portal Gateway"
+
+                    with st.spinner("Sending the PDF bundle by email..."):
+                        success = dispatch_real_email(
+                            recipient_list=recipient_emails,
+                            subject_text=subject,
+                            body_text=body,
+                            attachment_path=output_filename,
+                            cc_recipient=claimant_email.strip()
+                        )
+
+                    if success:
+                        st.success(f"📧 Email sent to Nazim e Ala ({target_email}) and CC'd to {claimant_email}")
                 else:
                     st.warning("⚠️ Email delivery skipped: No Nazim e Ala email address configured for this region in admin settings.")
-                
-                pdf_bytes = open(output_filename, "rb").read()
+
+                with open(output_filename, "rb") as f:
+                    pdf_bytes = f.read()
                 st.download_button(
                     label="📥 Download Official Summary Voucher PDF File",
                     data=pdf_bytes,
