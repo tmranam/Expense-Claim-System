@@ -569,7 +569,7 @@ else:
                 
                 output_filename = f"Expense_Voucher_{name.replace(' ', '_')}.pdf"
                 
-               generate_official_voucher_pdf(output_filename, payload, receipt_records)
+                generate_official_voucher_pdf(output_filename, payload, receipt_records)
 
                 with st.spinner("Stitching receipts into the claim PDF..."):
                     stitched_ok = stitch_files_to_pdf(output_filename, raw_files_tracker)
