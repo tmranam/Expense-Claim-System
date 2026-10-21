@@ -4,3 +4,5 @@ pillow
 pytesseract
 pypdf
 pdf2image
+google-api-python-client
+google-auth
