@@ -17,6 +17,10 @@ from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
 from reportlab.lib import colors
 import pypdf
 from pdf2image import convert_from_path
+import io
+from pypdf import PdfReader, PdfWriter
+from reportlab.pdfgen import canvas
+from reportlab.lib.utils import ImageReader
 
 # -------------------------------------------------------------------------
 # DEFENSIVE LINUX PATH ANCHORING FOR STREAMLIT CLOUD INFRASTRUCTURE
@@ -288,47 +292,64 @@ def stitch_files_to_pdf(voucher_pdf_path, uploaded_files_list):
 # -------------------------------------------------------------------------
 # DIRECT EMAIL OUTBOUND DISPATCH ENGINE (SMTP)
 # -------------------------------------------------------------------------
-def dispatch_real_email(recipient_list, subject_text, body_text, attachment_path, cc_recipient=None):
-    """Logs into configured SMTP engine server to transmit automated summary file payloads with optional CC."""
-    smtp_info = st.session_state.admin_lists
-    
-    if not smtp_info.get("smtp_user") or not smtp_info.get("smtp_password"):
-        st.error("⚠️ Real Delivery Skipped: Outbound SMTP User Email and Password keys must be filled out on the Admin Configuration screen.")
-        return False
-        
+def _image_to_pdf_buffer(u_file, label):
+    """Places an image receipt on a letter-size page, scaled to fit."""
+    img = Image.open(u_file)
+    img = ImageOps.exif_transpose(img)
+    if img.mode != "RGB":
+        img = img.convert("RGB")
+
+    page_w, page_h = letter
+    margin = 36
+    header_h = 20
+    max_w = page_w - 2 * margin
+    max_h = page_h - 2 * margin - header_h
+
+    buf = io.BytesIO()
+    c = canvas.Canvas(buf, pagesize=letter)
+    c.setFont("Helvetica-Bold", 11)
+    c.drawString(margin, page_h - margin, label)
+
+    iw, ih = img.size
+    scale = min(max_w / iw, max_h / ih)
+    dw, dh = iw * scale, ih * scale
+    x = margin + (max_w - dw) / 2
+    y = page_h - margin - header_h - dh
+    c.drawImage(ImageReader(img), x, y, width=dw, height=dh)
+    c.showPage()
+    c.save()
+    buf.seek(0)
+    return buf
+
+def stitch_files_to_pdf(voucher_pdf_path, uploaded_files_list):
+    """Summary page first, then every uploaded receipt, as one PDF."""
     try:
-        msg = MIMEMultipart()
-        msg['From'] = smtp_info["smtp_user"]
-        msg['To'] = ", ".join(recipient_list)
-        msg['Subject'] = subject_text
-        
-        all_recipients = list(recipient_list)
-        if cc_recipient:
-            msg['Cc'] = cc_recipient
-            all_recipients.append(cc_recipient)
-        
-        msg.attach(MIMEText(body_text, 'plain'))
-        
-        if os.path.exists(attachment_path):
-            with open(attachment_path, "rb") as attachment:
-                part = MIMEBase("application", "octet-stream")
-                part.set_payload(attachment.read())
-                
-            encoders.encode_base64(part)
-            part.add_header(
-                "Content-Disposition",
-                f"attachment; filename= {os.path.basename(attachment_path)}",
-            )
-            msg.attach(part)
-        
-        server = smtplib.SMTP(smtp_info["smtp_server"], smtp_info["smtp_port"])
-        server.starttls()
-        server.login(smtp_info["smtp_user"], smtp_info["smtp_password"])
-        server.sendmail(smtp_info["smtp_user"], all_recipients, msg.as_string())
-        server.quit()
+        writer = PdfWriter()
+
+        for page in PdfReader(voucher_pdf_path).pages:
+            writer.add_page(page)
+
+        for idx, u_file in enumerate(uploaded_files_list):
+            if u_file is None:
+                continue
+            u_file.seek(0)
+            ext = os.path.splitext(u_file.name)[1].lower()
+
+            if ext == ".pdf":
+                reader = PdfReader(io.BytesIO(u_file.read()))
+            else:
+                reader = PdfReader(_image_to_pdf_buffer(u_file, f"Receipt #{idx + 1}"))
+
+            for page in reader.pages:
+                writer.add_page(page)
+
+        tmp_out = voucher_pdf_path + ".tmp"
+        with open(tmp_out, "wb") as f:
+            writer.write(f)
+        os.replace(tmp_out, voucher_pdf_path)
         return True
-    except Exception as email_err:
-        st.error(f"❌ Failed to dispatch email via mail network relay servers. Internal Error details: {email_err}")
+    except Exception as e:
+        st.error(f"⚠️ Could not attach receipts to the voucher: {e}")
         return False
 
 # -------------------------------------------------------------------------
@@ -548,13 +569,16 @@ else:
                 
                 output_filename = f"Expense_Voucher_{name.replace(' ', '_')}.pdf"
                 
-                generate_official_voucher_pdf(output_filename, payload, receipt_records)
-                
-                with st.spinner("Stitching file assets into multi-page formal PDF binder format..."):
-                    stitch_files_to_pdf(output_filename, raw_files_tracker)
-                    
-                st.success("🎉 Comprehensive Claim Payment Voucher Pack compiled successfully with attached file pages!")
-                st.balloons()
+               generate_official_voucher_pdf(output_filename, payload, receipt_records)
+
+with st.spinner("Stitching receipts into the claim PDF..."):
+    stitched_ok = stitch_files_to_pdf(output_filename, raw_files_tracker)
+
+if not stitched_ok:
+    st.stop()
+
+st.success("🎉 Claim pack compiled: summary page + all receipts!")
+st.balloons()
                 
                 target_email = nazim_info.get("email", "")
                 if target_email:
