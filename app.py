@@ -4,6 +4,9 @@ import json
 import os
 import io
 import uuid
+import copy
+import hmac
+import hashlib
 import shutil
 from datetime import datetime
 from zoneinfo import ZoneInfo
@@ -17,6 +20,7 @@ import pypdf
 from pdf2image import convert_from_path
 from pypdf import PdfReader, PdfWriter
 from reportlab.pdfgen import canvas
+from reportlab.pdfbase import pdfmetrics
 from reportlab.lib.utils import ImageReader
 from google.oauth2 import service_account
 from google.oauth2.credentials import Credentials as OAuthCredentials
@@ -39,6 +43,11 @@ STATUS_PENDING = "Pending"
 STATUS_HOLD = "On Hold"
 STATUS_APPROVED = "Approved"
 STATUS_REJECTED = "Rejected"
+STATUS_BYPASSED = "Bypassed"      # stage skipped (e.g. Admin skipped the Nazim e Ala)
+
+ROLE_ADMIN = "admin"
+ROLE_NAZIM = "nazim"
+ROLE_PRESIDENT = "president"
 
 REGISTER_NAME = "claims_register.json"
 DRIVE_SCOPES = ["https://www.googleapis.com/auth/drive"]
@@ -70,6 +79,10 @@ DEFAULT_CONFIG = {
         ]
     },
     "drive_folder_link": "",
+    "roles": {
+        "president": {"username": "President", "salt": "", "hash": ""},
+        "nazims": {}
+    },
     "emails": ["finance@example.com", "approvals@example.com"],
     "admin_password": "123",
     "smtp_server": "smtp.gmail.com",
@@ -96,13 +109,13 @@ def load_admin_settings():
                 data = json.load(f)
                 for key in DEFAULT_CONFIG:
                     if key not in data:
-                        data[key] = DEFAULT_CONFIG[key]
+                        data[key] = copy.deepcopy(DEFAULT_CONFIG[key])
                     elif not data[key] and key != "drive_folder_link":
-                        data[key] = DEFAULT_CONFIG[key]
+                        data[key] = copy.deepcopy(DEFAULT_CONFIG[key])
                 return data
         except Exception:
-            return dict(DEFAULT_CONFIG)
-    return dict(DEFAULT_CONFIG)
+            return copy.deepcopy(DEFAULT_CONFIG)
+    return copy.deepcopy(DEFAULT_CONFIG)
 
 
 def save_admin_settings(config_data):
@@ -202,7 +215,7 @@ def load_register(service, folder_id):
     if not fid:
         return [], None
     raw = service.files().get_media(fileId=fid, supportsAllDrives=True).execute()
-    return json.loads(raw.decode("utf-8")), fid
+    return [normalize_claim(c) for c in json.loads(raw.decode("utf-8"))], fid
 
 
 def save_register(service, folder_id, claims, fid):
@@ -242,19 +255,32 @@ def stamp_voucher_number(pdf_bytes, voucher_no):
         raise RuntimeError("Could not find the 'Voucher No:' box on the PDF.")
 
     label_x, base_y = found["pos"]
-    cell_left = label_x - 5 + 100          # label cell is 100pt wide, 5pt padding
+    # Measured layout: label text sits 6pt inside its 100pt-wide cell; value cell is 170pt wide.
+    # The row runs from base_y - 5 (bottom border) to base_y + 12 (top border).
+    cell_left = label_x - 6 + 100
+    cell_right = cell_left + 170
+    row_bottom, row_top = base_y - 5, base_y + 12
     page_w = float(first_page.mediabox.width)
     page_h = float(first_page.mediabox.height)
 
     buf = io.BytesIO()
     c = canvas.Canvas(buf, pagesize=(page_w, page_h))
+    # Cover only the text area, staying clear of the borders
     c.setFillColor(colors.white)
-    c.setStrokeColor(colors.white)
-    c.rect(cell_left + 2.5, base_y - 6.5, 170 - 5, 18, stroke=0, fill=1)
+    c.rect(cell_left + 3, base_y - 4, 170 - 6, 14, stroke=0, fill=1)
     if voucher_no:
+        font_size = 10
+        while font_size > 6 and pdfmetrics.stringWidth(voucher_no, "Helvetica-Bold", font_size) > 158:
+            font_size -= 0.5
         c.setFillColor(colors.black)
-        c.setFont("Helvetica-Bold", 10)
-        c.drawString(cell_left + 5, base_y - 1.5, voucher_no)
+        c.setFont("Helvetica-Bold", font_size)
+        c.drawString(cell_left + 6, base_y - 1.5, voucher_no)
+    # Redraw the cell borders so any earlier stamp that covered them is repaired
+    c.setStrokeColor(colors.black)
+    c.setLineWidth(1)
+    c.line(cell_left, row_bottom, cell_right, row_bottom)
+    c.line(cell_left, row_top, cell_right, row_top)
+    c.line(cell_right, row_bottom, cell_right, row_top)
     c.showPage()
     c.save()
     buf.seek(0)
@@ -274,31 +300,202 @@ def update_pdf_in_drive(service, file_id, pdf_bytes):
     service.files().update(fileId=file_id, media_body=media, supportsAllDrives=True).execute()
 
 
-def set_claim_status(service, folder_id, claim_id, new_status=None, voucher_no=None):
-    """Changes a claim's status and/or voucher number.
-    The voucher number is also stamped onto the PDF in Drive. Returns a warning message or ''."""
+# -------------------------------------------------------------------------
+# APPROVAL WORKFLOW:  Nazim e Ala  ->  Admin  ->  President
+# Each claim carries one status per stage: nazim_status, admin_status, president_status
+# -------------------------------------------------------------------------
+def _stage_done(status):
+    return status in (STATUS_APPROVED, STATUS_BYPASSED)
+
+
+def normalize_claim(c):
+    """Fills in workflow fields. Claims saved before roles existed skip the Nazim stage."""
+    c.setdefault("voucher_no", "")
+    if "nazim_status" not in c:
+        legacy = c.get("status", STATUS_PENDING)
+        c["nazim_status"] = STATUS_BYPASSED
+        c["admin_status"] = legacy if legacy in (STATUS_PENDING, STATUS_HOLD, STATUS_APPROVED, STATUS_REJECTED) else STATUS_PENDING
+        c["president_status"] = STATUS_BYPASSED if legacy == STATUS_APPROVED else STATUS_PENDING
+    c.setdefault("admin_status", STATUS_PENDING)
+    c.setdefault("president_status", STATUS_PENDING)
+    return c
+
+
+def claim_stage(c):
+    """Returns (stage_key, human readable status) for a claim."""
+    n, a, p = c["nazim_status"], c["admin_status"], c["president_status"]
+    nazim = f"Nazim e Ala {c.get('region', '')}".strip()
+
+    if n == STATUS_REJECTED:
+        return "rejected", f"Rejected by {nazim}"
+    if n == STATUS_HOLD:
+        return "hold", f"On hold by {nazim}"
+    if n == STATUS_PENDING:
+        return "await_nazim", f"Waiting for {nazim}"
+
+    if a == STATUS_REJECTED:
+        return "rejected", "Rejected by Admin"
+    if a == STATUS_HOLD:
+        return "hold", "On hold by Admin"
+    if a == STATUS_PENDING:
+        if n == STATUS_APPROVED:
+            return "to_process", f"Approved by {nazim}"
+        return "to_process", "Nazim e Ala skipped by Admin" if c.get("nazim_by") == "Admin" else "Ready for Admin"
+
+    if p == STATUS_REJECTED:
+        return "rejected", "Rejected by President"
+    if p == STATUS_HOLD:
+        return "hold", "On hold by President"
+    if p == STATUS_PENDING:
+        return "await_president", "Waiting approval from President"
+    return "approved", "Approved by President" if p == STATUS_APPROVED else "Approved by Admin"
+
+
+def actions_for(role, c):
+    """Buttons a role may use on a claim, as (label, status_field, new_value)."""
+    stage, _ = claim_stage(c)
+    full = lambda f: [("Approve", f, STATUS_APPROVED), ("Reject", f, STATUS_REJECTED), ("Hold", f, STATUS_HOLD)]
+    after_hold = lambda f: [("Approve", f, STATUS_APPROVED), ("Reject", f, STATUS_REJECTED)]
+
+    if role == ROLE_NAZIM:
+        if stage == "await_nazim":
+            return full("nazim_status")
+        if stage == "hold" and c["nazim_status"] == STATUS_HOLD:
+            return after_hold("nazim_status")
+        return []
+
+    if role == ROLE_PRESIDENT:
+        if stage == "await_president":
+            return full("president_status")
+        if stage == "hold" and c["president_status"] == STATUS_HOLD:
+            return after_hold("president_status")
+        return []
+
+    # Admin
+    if stage == "await_nazim":
+        return [("Skip Nazim", "nazim_status", STATUS_BYPASSED)]
+    if stage == "to_process":
+        return full("admin_status")
+    if stage == "hold":
+        if c["nazim_status"] == STATUS_HOLD:
+            return [("Skip Nazim", "nazim_status", STATUS_BYPASSED)]
+        if c["admin_status"] == STATUS_HOLD:
+            return after_hold("admin_status")
+        return []   # on hold with the President: only the President can release it
+    if stage == "await_president":
+        return [("Recall", "admin_status", STATUS_PENDING)]
+    if stage == "approved":
+        return [("Reopen", "president_status", STATUS_PENDING)]
+    if stage == "rejected":
+        for field in ("nazim_status", "admin_status", "president_status"):
+            if c[field] == STATUS_REJECTED:
+                return [("Reopen", field, STATUS_PENDING)]
+    return []
+
+
+def update_claim(service, folder_id, claim_id, role, actor, changes=None, voucher_no=None, region=None):
+    """Applies a status change and/or a voucher number to one claim, after checking the role is allowed.
+    changes = {"nazim_status": "Approved"} etc. Returns a warning message ('' if all fine)."""
+    changes = changes or {}
     claims, fid = load_register(service, folder_id)
+    claim = next((c for c in claims if c["id"] == claim_id), None)
+    if claim is None:
+        raise ValueError("That claim was not found. Please refresh the page.")
+
+    allowed_fields = {
+        ROLE_NAZIM: {"nazim_status"},
+        ROLE_PRESIDENT: {"president_status"},
+        ROLE_ADMIN: {"nazim_status", "admin_status", "president_status"},
+    }.get(role, set())
+
+    for field, value in changes.items():
+        if field not in allowed_fields:
+            raise PermissionError("You are not allowed to make that change.")
+        if role != ROLE_ADMIN and value not in (STATUS_APPROVED, STATUS_REJECTED, STATUS_HOLD):
+            raise PermissionError("You are not allowed to make that change.")
+        # Make sure the claim is still waiting on this person (the page may be out of date)
+        if role == ROLE_NAZIM and (claim.get("region") != region or claim["nazim_status"] not in (STATUS_PENDING, STATUS_HOLD)):
+            raise PermissionError("This claim is no longer waiting for your decision. Please refresh.")
+        if role == ROLE_PRESIDENT and (not _stage_done(claim["admin_status"]) or claim["president_status"] not in (STATUS_PENDING, STATUS_HOLD)):
+            raise PermissionError("This claim is no longer waiting for your decision. Please refresh.")
+        if role == ROLE_ADMIN and field == "admin_status" and value != STATUS_PENDING and not _stage_done(claim["nazim_status"]):
+            raise PermissionError("This claim is still with the Nazim e Ala.")
+
+    today = now_local().strftime('%d/%m/%Y')
+    for field, value in changes.items():
+        stage = field.replace("_status", "")
+        claim[field] = value
+        claim[f"{stage}_by"] = actor if value != STATUS_PENDING else ""
+        claim[f"{stage}_on"] = today if value != STATUS_PENDING else ""
+
     warning = ""
-    for c in claims:
-        if c["id"] != claim_id:
-            continue
+    if voucher_no is not None and role == ROLE_ADMIN:
+        new_no = voucher_no.strip()[:20]
+        if new_no != claim.get("voucher_no", ""):
+            try:
+                pdf_bytes = service.files().get_media(fileId=claim["file_id"], supportsAllDrives=True).execute()
+                update_pdf_in_drive(service, claim["file_id"], stamp_voucher_number(pdf_bytes, new_no))
+                claim["voucher_no"] = new_no
+            except Exception as e:
+                warning = f"The voucher number could not be written onto the PDF in Drive ({e})."
 
-        if voucher_no is not None:
-            new_no = voucher_no.strip()[:30]
-            if new_no != c.get("voucher_no", ""):
-                try:
-                    pdf_bytes = service.files().get_media(fileId=c["file_id"], supportsAllDrives=True).execute()
-                    update_pdf_in_drive(service, c["file_id"], stamp_voucher_number(pdf_bytes, new_no))
-                    c["voucher_no"] = new_no
-                except Exception as e:
-                    warning = f"The voucher number could not be written onto the PDF in Drive ({e})."
-
-        if new_status:
-            c["status"] = new_status
-            c["decided_on"] = now_local().strftime('%d/%m/%Y') if new_status in (STATUS_APPROVED, STATUS_REJECTED) else ""
-        break
     save_register(service, folder_id, claims, fid)
     return warning
+
+
+# -------------------------------------------------------------------------
+# ROLE LOGINS (passwords are stored as salted hashes, never as plain text)
+# -------------------------------------------------------------------------
+def hash_password(password, salt_hex=None):
+    salt = bytes.fromhex(salt_hex) if salt_hex else os.urandom(16)
+    digest = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), salt, 200_000)
+    return salt.hex(), digest.hex()
+
+
+def verify_password(password, salt_hex, hash_hex):
+    if not salt_hex or not hash_hex:
+        return False
+    _, digest = hash_password(password, salt_hex)
+    return hmac.compare_digest(digest, hash_hex)
+
+
+def get_roles_config():
+    roles = st.session_state.admin_lists.get("roles") or {}
+    roles.setdefault("president", {"username": "President", "salt": "", "hash": ""})
+    roles.setdefault("nazims", {})
+    return roles
+
+
+def region_has_nazim_login(region):
+    return bool((get_roles_config()["nazims"].get(region) or {}).get("hash"))
+
+
+def authenticate(role, username, password):
+    """Returns a session dict for a valid login, otherwise None."""
+    if role == ROLE_ADMIN:
+        if password == st.session_state.admin_lists.get("admin_password", "123"):
+            return {"role": ROLE_ADMIN, "name": "Admin"}
+        return None
+
+    roles = get_roles_config()
+    username = (username or "").strip().lower()
+    if not username or not password:
+        return None
+
+    if role == ROLE_PRESIDENT:
+        pres = roles["president"]
+        if username == (pres.get("username") or "President").strip().lower() \
+                and verify_password(password, pres.get("salt"), pres.get("hash")):
+            return {"role": ROLE_PRESIDENT, "name": "President"}
+        return None
+
+    for region, info in roles["nazims"].items():
+        if region not in st.session_state.admin_lists.get("regions", []):
+            continue
+        if username == (info.get("username") or region).strip().lower() \
+                and verify_password(password, info.get("salt"), info.get("hash")):
+            return {"role": ROLE_NAZIM, "name": f"Nazim e Ala {region}", "region": region}
+    return None
 
 # -------------------------------------------------------------------------
 # OCR ENGINE FOR IMAGE & PDF RECEIPTS
@@ -546,20 +743,25 @@ def stitch_files_to_pdf(voucher_pdf_path, uploaded_files_list):
         return False
 
 # -------------------------------------------------------------------------
-# ADMIN: CLAIMS DASHBOARD
+# CLAIMS TABLES (shared by Admin, Nazim e Ala and President)
 # -------------------------------------------------------------------------
-DASH_HEADERS = ["Claimant", "Date", "Event", "Total Claim", "GST", "Advance Adj.", "Amount To Pay", "Voucher No.", "File"]
-DASH_WIDTHS = [1.5, 1.0, 1.7, 1.0, 0.8, 1.0, 1.1, 1.2, 0.9]
+DASH_HEADERS = ["Claimant", "Date", "Event", "Total Claim", "GST", "Advance Adj.", "Amount To Pay", "Voucher No.", "Status", "File"]
+DASH_WIDTHS = [1.5, 0.9, 1.4, 0.9, 0.7, 0.9, 1.0, 1.0, 1.9, 0.8]
 
 
 def _cell(col, text):
     col.markdown(str(text).replace("$", "\\$"))
 
 
-def render_claim_rows(service, folder_id, claims_subset, actions):
+def render_claim_rows(service, folder_id, claims_subset, auth, tab_key):
+    """Draws the table for one tab. The buttons each role sees come from actions_for();
+    only the Admin gets the Voucher No. box."""
     if not claims_subset:
         st.info("No claims in this tab.")
         return
+
+    role = auth["role"]
+    actor = auth["name"]
 
     header_cols = st.columns(DASH_WIDTHS)
     for col, label in zip(header_cols, DASH_HEADERS):
@@ -567,8 +769,9 @@ def render_claim_rows(service, folder_id, claims_subset, actions):
     st.divider()
 
     for c in sorted(claims_subset, key=lambda x: x.get("submitted_ts", ""), reverse=True):
+        _, status_text = claim_stage(c)
         cols = st.columns(DASH_WIDTHS)
-        _cell(cols[0], c.get("name", ""))
+        _cell(cols[0], f"**{c.get('name', '')}**  \n:gray[{c.get('region', '')}]")
         _cell(cols[1], c.get("submitted_on", ""))
         _cell(cols[2], c.get("event", ""))
         _cell(cols[3], f"${c.get('total_claim', 0):,.2f}")
@@ -577,19 +780,18 @@ def render_claim_rows(service, folder_id, claims_subset, actions):
         _cell(cols[5], f"-${advance:,.2f}" if advance > 0 else "-")
         _cell(cols[6], f"**${c.get('amount_payable', 0):,.2f}**")
         _cell(cols[7], f"**{c['voucher_no']}**" if c.get("voucher_no") else "-")
-        cols[8].markdown(f"[Open PDF]({c.get('file_link', '')})")
+        _cell(cols[8], status_text)
+        cols[9].markdown(f"[Open PDF]({c.get('file_link', '')})")
 
-        # Second line: voucher number box + action buttons
-        key_base = f"{c['status']}_{c['id']}"
-        row_cols = st.columns([2.2, 1.2] + [1.2] * len(actions) + [4.0 - 1.2 * len(actions)])
-        voucher_input = row_cols[0].text_input(
-            "Voucher No.", value=c.get("voucher_no", ""), max_chars=30,
-            key=f"vno_{key_base}", placeholder="Enter Voucher No.", label_visibility="collapsed"
-        )
+        actions = actions_for(role, c)
+        key_base = f"{tab_key}_{c['id']}"
 
-        def _apply(new_status=None):
+        def _apply(changes, voucher=None, c=c):
             try:
-                warning = set_claim_status(service, folder_id, c["id"], new_status, voucher_no=voucher_input)
+                warning = update_claim(
+                    service, folder_id, c["id"], role, actor,
+                    changes=changes, voucher_no=voucher, region=auth.get("region")
+                )
             except Exception as e:
                 st.error(f"Could not update claim: {e}")
                 return
@@ -597,72 +799,227 @@ def render_claim_rows(service, folder_id, claims_subset, actions):
                 st.session_state["dash_warning"] = warning
             st.rerun()
 
-        if row_cols[1].button("Save No.", key=f"saveno_{key_base}", use_container_width=True):
-            _apply(None)
-        for b_col, (label, new_status) in zip(row_cols[2:2 + len(actions)], actions):
-            if b_col.button(label, key=f"{key_base}_{new_status}", use_container_width=True):
-                _apply(new_status)
+        if role == ROLE_ADMIN:
+            row_cols = st.columns([2.2, 1.2] + [1.4] * len(actions) + [max(0.3, 5.0 - 1.4 * len(actions))])
+            voucher_input = row_cols[0].text_input(
+                "Voucher No.", value=c.get("voucher_no", ""), max_chars=20,
+                key=f"vno_{key_base}", placeholder="Enter Voucher No.", label_visibility="collapsed"
+            )
+            if row_cols[1].button("Save No.", key=f"saveno_{key_base}", use_container_width=True):
+                _apply({}, voucher_input)
+            button_cols = row_cols[2:2 + len(actions)]
+            for b_col, (label, field, value) in zip(button_cols, actions):
+                if b_col.button(label, key=f"{key_base}_{field}_{value}", use_container_width=True):
+                    _apply({field: value}, voucher_input)
+        elif actions:
+            row_cols = st.columns([1.4] * len(actions) + [max(0.3, 8.0 - 1.4 * len(actions))])
+            for b_col, (label, field, value) in zip(row_cols, actions):
+                if b_col.button(label, key=f"{key_base}_{field}_{value}", use_container_width=True):
+                    _apply({field: value})
         st.divider()
 
 
-def render_claims_dashboard():
-    st.markdown("### 📊 Claims Dashboard")
+def load_dashboard_data(role):
+    """Connects to Drive and loads all claims, or shows a friendly message and returns None."""
     pending_warning = st.session_state.pop("dash_warning", None)
     if pending_warning:
         st.warning(f"Saved, but: {pending_warning} Use the Open PDF link to check the file in Drive.")
-    top_a, top_b, _ = st.columns([1, 1, 6])
-    if top_a.button("⚙️ Settings", use_container_width=True):
-        st.session_state.admin_view = "settings"
-        st.rerun()
-    if top_b.button("🔄 Refresh", use_container_width=True):
-        st.rerun()
 
-    folder_id = get_drive_folder_id()
     try:
         service = get_drive_service()
     except Exception as e:
         st.error(f"Google Drive credentials problem: {e}")
-        return
+        return None
+    folder_id = get_drive_folder_id()
 
+    fix = "Open Settings and paste your Drive folder link." if role == ROLE_ADMIN else "Please contact the administrator."
     if service is None:
-        st.warning("Google Drive credentials are not set up yet. Add them to the app secrets (see Settings for details).")
-        return
+        st.warning(f"Google Drive is not connected yet. {fix}")
+        return None
     if not folder_id:
-        st.warning("No Google Drive folder is configured. Open Settings and paste your Drive folder link.")
-        return
-
+        st.warning(f"No Google Drive folder is configured. {fix}")
+        return None
     try:
         claims, _ = load_register(service, folder_id)
     except Exception as e:
-        st.error(f"Could not read the claims register from Google Drive: {e}")
+        st.error(f"Could not read the claims from Google Drive: {e}")
+        return None
+    return service, folder_id, claims
+
+
+def render_tabs(service, folder_id, claims, auth, tab_specs, role_key):
+    """tab_specs = [(label, predicate)] - each tab shows the claims its predicate accepts."""
+    subsets = [[c for c in claims if pred(c)] for _, pred in tab_specs]
+    tabs = st.tabs([f"{label} ({len(sub)})" for (label, _), sub in zip(tab_specs, subsets)])
+    for tab, (label, _), sub in zip(tabs, tab_specs, subsets):
+        with tab:
+            render_claim_rows(service, folder_id, sub, auth, f"{role_key}_{label}")
+
+
+def _stage_is(*keys):
+    return lambda c: claim_stage(c)[0] in keys
+
+
+# ---------------------------- ADMIN ----------------------------
+def render_claims_dashboard(auth):
+    st.markdown("### 📊 Claims Dashboard")
+    top_a, top_b, top_c, _ = st.columns([1, 1, 1, 6])
+    if top_a.button("⚙️ Settings", use_container_width=True):
+        st.session_state.admin_view = "settings"
+        st.rerun()
+    if top_b.button("👥 Roles", use_container_width=True):
+        st.session_state.admin_view = "roles"
+        st.rerun()
+    if top_c.button("🔄 Refresh", use_container_width=True):
+        st.rerun()
+
+    data = load_dashboard_data(ROLE_ADMIN)
+    if data is None:
         return
+    service, folder_id, claims = data
 
-    by_status = {
-        STATUS_PENDING: [c for c in claims if c.get("status") == STATUS_PENDING],
-        STATUS_HOLD: [c for c in claims if c.get("status") == STATUS_HOLD],
-        STATUS_APPROVED: [c for c in claims if c.get("status") == STATUS_APPROVED],
-        STATUS_REJECTED: [c for c in claims if c.get("status") == STATUS_REJECTED],
-    }
+    render_tabs(service, folder_id, claims, auth, [
+        ("To Process", _stage_is("to_process")),
+        ("Awaiting Nazim", _stage_is("await_nazim")),
+        ("On Hold", _stage_is("hold")),
+        ("Waiting President", _stage_is("await_president")),
+        ("Approved", _stage_is("approved")),
+        ("Rejected", _stage_is("rejected")),
+    ], "admin")
 
-    tab_pending, tab_hold, tab_approved, tab_rejected = st.tabs([
-        f"Pending ({len(by_status[STATUS_PENDING])})",
-        f"On Hold ({len(by_status[STATUS_HOLD])})",
-        f"Approved ({len(by_status[STATUS_APPROVED])})",
-        f"Rejected ({len(by_status[STATUS_REJECTED])})",
-    ])
 
-    with tab_pending:
-        render_claim_rows(service, folder_id, by_status[STATUS_PENDING],
-                          [("Approve", STATUS_APPROVED), ("Reject", STATUS_REJECTED), ("Hold", STATUS_HOLD)])
-    with tab_hold:
-        render_claim_rows(service, folder_id, by_status[STATUS_HOLD],
-                          [("Approve", STATUS_APPROVED), ("Reject", STATUS_REJECTED)])
-    with tab_approved:
-        render_claim_rows(service, folder_id, by_status[STATUS_APPROVED],
-                          [("Reopen", STATUS_PENDING)])
-    with tab_rejected:
-        render_claim_rows(service, folder_id, by_status[STATUS_REJECTED],
-                          [("Reopen", STATUS_PENDING)])
+# ------------------------- NAZIM E ALA -------------------------
+def render_nazim_dashboard(auth):
+    region = auth["region"]
+    st.markdown(f"### 📋 {auth['name']} — Claims")
+    if st.button("🔄 Refresh"):
+        st.rerun()
+
+    data = load_dashboard_data(ROLE_NAZIM)
+    if data is None:
+        return
+    service, folder_id, claims = data
+    mine = [c for c in claims if c.get("region") == region]
+
+    in_progress = lambda c: _stage_done(c["nazim_status"]) and claim_stage(c)[0] not in ("approved", "rejected")
+    render_tabs(service, folder_id, mine, auth, [
+        ("To Review", _stage_is("await_nazim")),
+        ("On Hold", lambda c: c["nazim_status"] == STATUS_HOLD),
+        ("In Progress", in_progress),
+        ("Approved", _stage_is("approved")),
+        ("Rejected", _stage_is("rejected")),
+    ], "nazim")
+
+
+# --------------------------- PRESIDENT ---------------------------
+def render_president_dashboard(auth):
+    st.markdown("### 📋 President — Claims")
+    if st.button("🔄 Refresh"):
+        st.rerun()
+
+    data = load_dashboard_data(ROLE_PRESIDENT)
+    if data is None:
+        return
+    service, folder_id, claims = data
+    visible = [c for c in claims if _stage_done(c["nazim_status"]) and _stage_done(c["admin_status"])]
+
+    render_tabs(service, folder_id, visible, auth, [
+        ("To Approve", _stage_is("await_president")),
+        ("On Hold", lambda c: c["president_status"] == STATUS_HOLD),
+        ("Approved", _stage_is("approved")),
+        ("Rejected", lambda c: c["president_status"] == STATUS_REJECTED),
+    ], "president")
+
+
+# -------------------------------------------------------------------------
+# STAFF LOGIN
+# -------------------------------------------------------------------------
+def render_login():
+    st.title("🔐 Staff Login")
+    with st.form("staff_login"):
+        role_label = st.radio("Sign in as", ["Admin", "Nazim e Ala", "President"], horizontal=True)
+        username = st.text_input("Username (Nazim e Ala and President only — e.g. your region name)")
+        password = st.text_input("Password", type="password")
+        submitted = st.form_submit_button("Sign in", type="primary")
+
+    if submitted:
+        role = {"Admin": ROLE_ADMIN, "Nazim e Ala": ROLE_NAZIM, "President": ROLE_PRESIDENT}[role_label]
+        auth = authenticate(role, username, password)
+        if auth:
+            st.session_state.auth = auth
+            st.session_state.admin_view = "dashboard"
+            st.rerun()
+        else:
+            st.error("Incorrect username or password.")
+
+
+# -------------------------------------------------------------------------
+# ADMIN: ROLES PAGE
+# -------------------------------------------------------------------------
+def render_roles_page():
+    st.markdown("### 👥 Roles — Secondary Approvals")
+    if st.button("⬅ Back to Claims Dashboard"):
+        st.session_state.admin_view = "dashboard"
+        st.rerun()
+
+    if st.session_state.pop("roles_saved", False):
+        st.success("Roles saved.")
+
+    st.caption(
+        "Claims go to the Nazim e Ala of the claimant's region first, then to you (Admin), then to the President. "
+        "Passwords are stored scrambled, so they cannot be read back later. Leave a password box empty to keep the current one."
+    )
+
+    roles = get_roles_config()
+    regions = st.session_state.admin_lists.get("regions", [])
+    form_v = st.session_state.get("roles_form_v", 0)   # changes after saving so password boxes clear
+
+    st.markdown("#### 🏛️ President")
+    pres = roles["president"]
+    c1, c2, c3 = st.columns([2, 2, 2])
+    p_user = c1.text_input("Username", value=pres.get("username") or "President", key=f"role_pres_user_{form_v}")
+    p_pass = c2.text_input("New password", type="password", key=f"role_pres_pass_{form_v}")
+    c3.markdown("&nbsp;")
+    c3.caption("✅ Password is set" if pres.get("hash") else "⚠️ No password yet — the President cannot sign in")
+
+    st.markdown("#### 🗺️ Nazim e Ala — one login per region")
+    nazim_inputs = {}
+    for i, region in enumerate(regions):
+        info = roles["nazims"].get(region, {})
+        c1, c2, c3 = st.columns([2, 2, 2])
+        user = c1.text_input(f"Username for {region}", value=info.get("username") or region, key=f"role_nz_user_{i}_{form_v}")
+        pwd = c2.text_input(f"New password for {region}", type="password", key=f"role_nz_pass_{i}_{form_v}")
+        c3.markdown("&nbsp;")
+        c3.caption("✅ Password is set" if info.get("hash") else "⚠️ No password yet — claims from this region skip the Nazim e Ala")
+        nazim_inputs[region] = (user, pwd)
+
+    if st.button("Save Roles", type="primary"):
+        usernames = [p_user.strip().lower()] + [u.strip().lower() for u, _ in nazim_inputs.values()]
+        if any(not u for u in usernames):
+            st.error("Every username must be filled in.")
+            return
+        if len(set(usernames)) != len(usernames):
+            st.error("Each username must be different.")
+            return
+
+        new_roles = {"president": dict(pres), "nazims": {}}
+        new_roles["president"]["username"] = p_user.strip()
+        if p_pass:
+            new_roles["president"]["salt"], new_roles["president"]["hash"] = hash_password(p_pass)
+        for region, (user, pwd) in nazim_inputs.items():
+            entry = dict(roles["nazims"].get(region, {"salt": "", "hash": ""}))
+            entry["username"] = user.strip()
+            if pwd:
+                entry["salt"], entry["hash"] = hash_password(pwd)
+            new_roles["nazims"][region] = entry
+
+        updated = dict(st.session_state.admin_lists)
+        updated["roles"] = new_roles
+        save_admin_settings(updated)
+        st.session_state.admin_lists = updated
+        st.session_state["roles_saved"] = True
+        st.session_state["roles_form_v"] = form_v + 1
+        st.rerun()
 
 # -------------------------------------------------------------------------
 # ADMIN: SETTINGS PAGE
@@ -766,7 +1123,8 @@ def render_settings_page():
         updated_nazims[selected_admin_region] = {"name": nazim_name_input.strip(), "email": nazim_email_input.strip()}
         updated_nazims = {k: v for k, v in updated_nazims.items() if k in parsed_regions_list}
 
-        updated_config = {
+        updated_config = dict(st.session_state.admin_lists)   # keeps roles and any other saved keys
+        updated_config.update({
             "regions": parsed_regions_list,
             "regional_majlis": updated_map,
             "regional_accounts": {
@@ -783,7 +1141,7 @@ def render_settings_page():
             "qaid_mal_name": q_mal.strip(),
             "sadr_maa_name": s_maa.strip(),
             "regional_nazims": updated_nazims
-        }
+        })
 
         save_admin_settings(updated_config)
         st.session_state.admin_lists = updated_config
@@ -797,16 +1155,32 @@ st.set_page_config(page_title="Expense Portal (Official MAA Clone)", layout="wid
 app_mode = st.sidebar.selectbox("Navigate Mode", ["User Claim Portal", "Admin Panel Configuration"])
 
 if app_mode == "Admin Panel Configuration":
-    st.title("⚙️ Admin Control Panel")
-    pwd_input = st.text_input("Enter Master Admin Access Key Password", type="password")
+    auth = st.session_state.get("auth")
 
-    if pwd_input == st.session_state.admin_lists.get("admin_password", "123"):
-        if st.session_state.get("admin_view", "dashboard") == "settings":
-            render_settings_page()
+    if not auth:
+        render_login()
+    else:
+        st.sidebar.markdown(f"Signed in as **{auth['name']}**")
+        if st.sidebar.button("Sign out"):
+            st.session_state.auth = None
+            st.session_state.admin_view = "dashboard"
+            st.rerun()
+
+        if auth["role"] == ROLE_ADMIN:
+            st.title("⚙️ Admin Control Panel")
+            view = st.session_state.get("admin_view", "dashboard")
+            if view == "settings":
+                render_settings_page()
+            elif view == "roles":
+                render_roles_page()
+            else:
+                render_claims_dashboard(auth)
+        elif auth["role"] == ROLE_NAZIM:
+            st.title("📋 Nazim e Ala Approvals")
+            render_nazim_dashboard(auth)
         else:
-            render_claims_dashboard()
-    elif pwd_input:
-        st.error("Incorrect password.")
+            st.title("📋 President Approvals")
+            render_president_dashboard(auth)
 
 # -------------------------------------------------------------------------
 # INTERACTIVE CLAIM FORM LAYOUT PANEL
@@ -1008,9 +1382,13 @@ else:
                             "file_name": output_filename,
                             "file_id": file_id,
                             "file_link": file_link,
-                            "status": STATUS_PENDING,
                             "voucher_no": "",
-                            "decided_on": ""
+                            # Approval workflow: Nazim e Ala -> Admin -> President.
+                            # Regions with no Nazim e Ala login go straight to the Admin.
+                            "nazim_status": STATUS_PENDING if region_has_nazim_login(region) else STATUS_BYPASSED,
+                            "nazim_by": "" if region_has_nazim_login(region) else "Auto",
+                            "admin_status": STATUS_PENDING,
+                            "president_status": STATUS_PENDING
                         }
                         add_claim_to_register(service, folder_id, record)
                         saved_to_drive = True
