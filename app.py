@@ -26,6 +26,7 @@ from google.oauth2 import service_account
 from google.oauth2.credentials import Credentials as OAuthCredentials
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaIoBaseUpload
+from googleapiclient.errors import HttpError
 
 # -------------------------------------------------------------------------
 # DEFENSIVE LINUX PATH ANCHORING FOR STREAMLIT CLOUD INFRASTRUCTURE
@@ -318,6 +319,8 @@ def normalize_claim(c):
         c["president_status"] = STATUS_BYPASSED if legacy == STATUS_APPROVED else STATUS_PENDING
     c.setdefault("admin_status", STATUS_PENDING)
     c.setdefault("president_status", STATUS_PENDING)
+    c.setdefault("paid", False)
+    c.setdefault("history", [])
     return c
 
 
@@ -348,6 +351,8 @@ def claim_stage(c):
         return "hold", "On hold by President"
     if p == STATUS_PENDING:
         return "await_president", "Waiting approval from President"
+    if c.get("paid"):
+        return "paid", f"Paid on {c.get('paid_on', '')}".strip()
     return "approved", "Approved by President" if p == STATUS_APPROVED else "Approved by Admin"
 
 
@@ -385,7 +390,9 @@ def actions_for(role, c):
     if stage == "await_president":
         return [("Recall", "admin_status", STATUS_PENDING)]
     if stage == "approved":
-        return [("Reopen", "president_status", STATUS_PENDING)]
+        return [("Mark Paid", "paid", True), ("Reopen", "president_status", STATUS_PENDING)]
+    if stage == "paid":
+        return [("Undo Paid", "paid", False)]
     if stage == "rejected":
         for field in ("nazim_status", "admin_status", "president_status"):
             if c[field] == STATUS_REJECTED:
