@@ -1,3 +1,6 @@
+# =========================================================================
+# BLOCK 1 OF 10: LIBRARIES, SYSTEM INITIALIZATION, AND DYNAMIC ENVIRONMENTS
+# =========================================================================
 import streamlit as st
 import re
 import json
@@ -8,6 +11,7 @@ import copy
 import hmac
 import hashlib
 import shutil
+import base64
 from datetime import datetime
 from zoneinfo import ZoneInfo
 from PIL import Image, ImageOps
@@ -28,9 +32,7 @@ from googleapiclient.discovery import build
 from googleapiclient.http import MediaIoBaseUpload
 from googleapiclient.errors import HttpError
 
-# -------------------------------------------------------------------------
 # DEFENSIVE LINUX PATH ANCHORING FOR STREAMLIT CLOUD INFRASTRUCTURE
-# -------------------------------------------------------------------------
 detected_path = shutil.which("tesseract")
 if detected_path:
     pytesseract.pytesseract.tesseract_cmd = detected_path
@@ -44,20 +46,20 @@ STATUS_PENDING = "Pending"
 STATUS_HOLD = "On Hold"
 STATUS_APPROVED = "Approved"
 STATUS_REJECTED = "Rejected"
-STATUS_BYPASSED = "Bypassed"      # stage skipped (e.g. Admin skipped the Nazim e Ala)
+STATUS_BYPASSED = "Bypassed"
 
 ROLE_ADMIN = "admin"
 ROLE_NAZIM = "nazim"
 ROLE_PRESIDENT = "president"
 
 REGISTER_NAME = "claims_register.json"
-DRIVE_SCOPES = ["https://www.googleapis.com/auth/drive"]
-
+DRIVE_SCOPES = ["https://googleapis.com"]
 
 def now_local():
     return datetime.now(LOCAL_TZ)
-
-
+# =========================================================================
+# BLOCK 2 OF 10: GLOBAL CONFIGURATION MATRIX & CONFIGURATION INGESTION
+# =========================================================================
 DEFAULT_CONFIG = {
     "regions": ["National", "Region North", "Region South"],
     "regional_majlis": {
@@ -86,7 +88,7 @@ DEFAULT_CONFIG = {
     },
     "emails": ["finance@example.com", "approvals@example.com"],
     "admin_password": "123",
-    "smtp_server": "smtp.gmail.com",
+    "smtp_server": "://gmail.com",
     "smtp_port": 587,
     "smtp_user": "claimsubmissionmaaa@gmail.com",
     "smtp_password": "",
@@ -96,14 +98,12 @@ DEFAULT_CONFIG = {
         "National": {"name": "National Representative", "email": "nationalnazim@example.com"},
         "Region North": {"name": "Nazim North", "email": "northnazim@example.com"},
         "Region South": {"name": "Nazim South", "email": "southnazim@example.com"}
-    }
+    },
+    "logo_left": "",
+    "logo_right": ""
 }
 
-# -------------------------------------------------------------------------
-# SETTINGS STORAGE
-# -------------------------------------------------------------------------
 def load_admin_settings():
-    """Loads admin configurations from a local JSON file."""
     if os.path.exists(CONFIG_FILE):
         try:
             with open(CONFIG_FILE, "r") as f:
@@ -111,34 +111,29 @@ def load_admin_settings():
                 for key in DEFAULT_CONFIG:
                     if key not in data:
                         data[key] = copy.deepcopy(DEFAULT_CONFIG[key])
-                    elif not data[key] and key != "drive_folder_link":
+                    elif not data[key] and key not in ["drive_folder_link", "logo_left", "logo_right"]:
                         data[key] = copy.deepcopy(DEFAULT_CONFIG[key])
                 return data
         except Exception:
             return copy.deepcopy(DEFAULT_CONFIG)
     return copy.deepcopy(DEFAULT_CONFIG)
 
-
 def save_admin_settings(config_data):
     with open(CONFIG_FILE, "w") as f:
         json.dump(config_data, f, indent=4)
 
-
 if 'admin_lists' not in st.session_state:
     st.session_state.admin_lists = load_admin_settings()
-
-# -------------------------------------------------------------------------
-# GOOGLE DRIVE LAYER (PDF storage + claims register)
-# -------------------------------------------------------------------------
+# =========================================================================
+# BLOCK 3 OF 10: GOOGLE DRIVE CORE CLOUD CONNECTORS
+# =========================================================================
 def _secret(key):
     try:
         return st.secrets[key]
     except Exception:
         return None
 
-
 def extract_folder_id(link_or_id):
-    """Accepts a Drive folder URL or a bare folder ID and returns the ID."""
     text = (link_or_id or "").strip()
     if not text:
         return None
@@ -149,11 +144,9 @@ def extract_folder_id(link_or_id):
         return text
     return None
 
-
 def get_drive_folder_id():
     link = st.session_state.admin_lists.get("drive_folder_link", "") or _secret("drive_folder_link") or ""
     return extract_folder_id(link)
-
 
 def get_service_account_email():
     info = _secret("gcp_service_account")
@@ -162,25 +155,20 @@ def get_service_account_email():
     except Exception:
         return None
 
-
 def get_drive_auth_mode():
-    """'oauth' = saves as the admin's own Google account (recommended), 'service_account' = fallback."""
     if _secret("google_oauth"):
         return "oauth"
     if _secret("gcp_service_account"):
         return "service_account"
     return None
 
-
 def get_drive_service():
     oauth = _secret("google_oauth")
     if oauth:
         creds = OAuthCredentials(
-            token=None,
-            refresh_token=oauth["refresh_token"],
-            token_uri="https://oauth2.googleapis.com/token",
-            client_id=oauth["client_id"],
-            client_secret=oauth["client_secret"],
+            token=None, refresh_token=oauth["refresh_token"],
+            token_uri="https://googleapis.com",
+            client_id=oauth["client_id"], client_secret=oauth["client_secret"],
             scopes=DRIVE_SCOPES,
         )
         return build("drive", "v3", credentials=creds, cache_discovery=False)
@@ -191,7 +179,6 @@ def get_drive_service():
     creds = service_account.Credentials.from_service_account_info(dict(info), scopes=DRIVE_SCOPES)
     return build("drive", "v3", credentials=creds, cache_discovery=False)
 
-
 def upload_pdf_to_drive(service, folder_id, filename, pdf_bytes):
     media = MediaIoBaseUpload(io.BytesIO(pdf_bytes), mimetype="application/pdf", resumable=False)
     meta = {"name": filename, "parents": [folder_id]}
@@ -199,7 +186,6 @@ def upload_pdf_to_drive(service, folder_id, filename, pdf_bytes):
         body=meta, media_body=media, fields="id, webViewLink", supportsAllDrives=True
     ).execute()
     return created["id"], created["webViewLink"]
-
 
 def _find_register_id(service, folder_id):
     q = f"name = '{REGISTER_NAME}' and '{folder_id}' in parents and trashed = false"
@@ -209,15 +195,12 @@ def _find_register_id(service, folder_id):
     files = res.get("files", [])
     return files[0]["id"] if files else None
 
-
 def load_register(service, folder_id):
-    """Returns (list_of_claims, register_file_id_or_None)."""
     fid = _find_register_id(service, folder_id)
     if not fid:
         return [], None
     raw = service.files().get_media(fileId=fid, supportsAllDrives=True).execute()
     return [normalize_claim(c) for c in json.loads(raw.decode("utf-8"))], fid
-
 
 def save_register(service, folder_id, claims, fid):
     body_bytes = json.dumps(claims, indent=2).encode("utf-8")
@@ -230,19 +213,16 @@ def save_register(service, folder_id, claims, fid):
             media_body=media, fields="id", supportsAllDrives=True
         ).execute()
 
-
 def add_claim_to_register(service, folder_id, record):
     claims, fid = load_register(service, folder_id)
     claims.append(record)
     save_register(service, folder_id, claims, fid)
-
-
+# =========================================================================
+# BLOCK 4 OF 10: STRUCTURAL PDF CANVAS STAMP ENGINE & WORKFLOW CONTROLLERS
+# =========================================================================
 def stamp_voucher_number(pdf_bytes, voucher_no):
-    """Writes the voucher number into the 'Voucher No:' cell on page 1 of the claim PDF.
-    Any number stamped earlier is covered first, so the number can be changed later."""
     reader = PdfReader(io.BytesIO(pdf_bytes))
     first_page = reader.pages[0]
-
     found = {}
 
     def visitor(text, cm, tm, font_dict, font_size):
@@ -256,8 +236,6 @@ def stamp_voucher_number(pdf_bytes, voucher_no):
         raise RuntimeError("Could not find the 'Voucher No:' box on the PDF.")
 
     label_x, base_y = found["pos"]
-    # Measured layout: label text sits 6pt inside its 100pt-wide cell; value cell is 170pt wide.
-    # The row runs from base_y - 5 (bottom border) to base_y + 12 (top border).
     cell_left = label_x - 6 + 100
     cell_right = cell_left + 170
     row_bottom, row_top = base_y - 5, base_y + 12
@@ -266,7 +244,6 @@ def stamp_voucher_number(pdf_bytes, voucher_no):
 
     buf = io.BytesIO()
     c = canvas.Canvas(buf, pagesize=(page_w, page_h))
-    # Cover only the text area, staying clear of the borders
     c.setFillColor(colors.white)
     c.rect(cell_left + 3, base_y - 4, 170 - 6, 14, stroke=0, fill=1)
     if voucher_no:
@@ -276,7 +253,6 @@ def stamp_voucher_number(pdf_bytes, voucher_no):
         c.setFillColor(colors.black)
         c.setFont("Helvetica-Bold", font_size)
         c.drawString(cell_left + 6, base_y - 1.5, voucher_no)
-    # Redraw the cell borders so any earlier stamp that covered them is repaired
     c.setStrokeColor(colors.black)
     c.setLineWidth(1)
     c.line(cell_left, row_bottom, cell_right, row_bottom)
@@ -287,7 +263,6 @@ def stamp_voucher_number(pdf_bytes, voucher_no):
     buf.seek(0)
 
     first_page.merge_page(PdfReader(buf).pages[0])
-
     writer = PdfWriter()
     for page in reader.pages:
         writer.add_page(page)
@@ -295,22 +270,14 @@ def stamp_voucher_number(pdf_bytes, voucher_no):
     writer.write(out)
     return out.getvalue()
 
-
 def update_pdf_in_drive(service, file_id, pdf_bytes):
     media = MediaIoBaseUpload(io.BytesIO(pdf_bytes), mimetype="application/pdf", resumable=False)
     service.files().update(fileId=file_id, media_body=media, supportsAllDrives=True).execute()
 
-
-# -------------------------------------------------------------------------
-# APPROVAL WORKFLOW:  Nazim e Ala  ->  Admin  ->  President
-# Each claim carries one status per stage: nazim_status, admin_status, president_status
-# -------------------------------------------------------------------------
 def _stage_done(status):
     return status in (STATUS_APPROVED, STATUS_BYPASSED)
 
-
 def normalize_claim(c):
-    """Fills in workflow fields. Claims saved before roles existed skip the Nazim stage."""
     c.setdefault("voucher_no", "")
     if "nazim_status" not in c:
         legacy = c.get("status", STATUS_PENDING)
@@ -323,110 +290,67 @@ def normalize_claim(c):
     c.setdefault("history", [])
     return c
 
-
 def claim_stage(c):
-    """Returns (stage_key, human readable status) for a claim."""
     n, a, p = c["nazim_status"], c["admin_status"], c["president_status"]
     nazim = f"Nazim e Ala {c.get('region', '')}".strip()
 
-    if n == STATUS_REJECTED:
-        return "rejected", f"Rejected by {nazim}"
-    if n == STATUS_HOLD:
-        return "hold", f"On hold by {nazim}"
-    if n == STATUS_PENDING:
-        return "await_nazim", f"Waiting for {nazim}"
-
-    if a == STATUS_REJECTED:
-        return "rejected", "Rejected by Admin"
-    if a == STATUS_HOLD:
-        return "hold", "On hold by Admin"
+    if n == STATUS_REJECTED: return "rejected", f"Rejected by {nazim}"
+    if n == STATUS_HOLD: return "hold", f"On hold by {nazim}"
+    if n == STATUS_PENDING: return "await_nazim", f"Waiting for {nazim}"
+    if a == STATUS_REJECTED: return "rejected", "Rejected by Admin"
+    if a == STATUS_HOLD: return "hold", "On hold by Admin"
     if a == STATUS_PENDING:
-        if n == STATUS_APPROVED:
-            return "to_process", f"Approved by {nazim}"
+        if n == STATUS_APPROVED: return "to_process", f"Approved by {nazim}"
         return "to_process", "Nazim e Ala skipped by Admin" if c.get("nazim_by") == "Admin" else "Ready for Admin"
-
-    if p == STATUS_REJECTED:
-        return "rejected", "Rejected by President"
-    if p == STATUS_HOLD:
-        return "hold", "On hold by President"
-    if p == STATUS_PENDING:
-        return "await_president", "Waiting approval from President"
-    if c.get("paid"):
-        return "paid", f"Paid on {c.get('paid_on', '')}".strip()
+    if p == STATUS_REJECTED: return "rejected", "Rejected by President"
+    if p == STATUS_HOLD: return "hold", "On hold by President"
+    if p == STATUS_PENDING: return "await_president", "Waiting approval from President"
+    if c.get("paid"): return "paid", f"Paid on {c.get('paid_on', '')}".strip()
     return "approved", "Approved by President" if p == STATUS_APPROVED else "Approved by Admin"
-
-
+# =========================================================================
+# BLOCK 5 OF 10: ACTION PERMISSION MATRIX BUILDERS & CRYPTO LOGIN ROUTERS
+# =========================================================================
 def actions_for(role, c):
-    """Buttons a role may use on a claim, as (label, status_field, new_value)."""
     stage, _ = claim_stage(c)
     full = lambda f: [("Approve", f, STATUS_APPROVED), ("Reject", f, STATUS_REJECTED), ("Hold", f, STATUS_HOLD)]
     after_hold = lambda f: [("Approve", f, STATUS_APPROVED), ("Reject", f, STATUS_REJECTED)]
 
     if role == ROLE_NAZIM:
-        if stage == "await_nazim":
-            return full("nazim_status")
-        if stage == "hold" and c["nazim_status"] == STATUS_HOLD:
-            return after_hold("nazim_status")
+        if stage == "await_nazim": return full("nazim_status")
+        if stage == "hold" and c["nazim_status"] == STATUS_HOLD: return after_hold("nazim_status")
         return []
-
     if role == ROLE_PRESIDENT:
-        if stage == "await_president":
-            return full("president_status")
-        if stage == "hold" and c["president_status"] == STATUS_HOLD:
-            return after_hold("president_status")
+        if stage == "await_president": return full("president_status")
+        if stage == "hold" and c["president_status"] == STATUS_HOLD: return after_hold("president_status")
         return []
 
-    # Admin
-    if stage == "await_nazim":
-        return [("Skip Nazim", "nazim_status", STATUS_BYPASSED)]
-    if stage == "to_process":
-        return full("admin_status")
+    if stage == "await_nazim": return [("Skip Nazim", "nazim_status", STATUS_BYPASSED)]
+    if stage == "to_process": return full("admin_status")
     if stage == "hold":
-        if c["nazim_status"] == STATUS_HOLD:
-            return [("Skip Nazim", "nazim_status", STATUS_BYPASSED)]
-        if c["admin_status"] == STATUS_HOLD:
-            return after_hold("admin_status")
-        return []   # on hold with the President: only the President can release it
-    if stage == "await_president":
-        return [("Recall", "admin_status", STATUS_PENDING)]
-    if stage == "approved":
-        return [("Mark Paid", "paid", True), ("Reopen", "president_status", STATUS_PENDING)]
-    if stage == "paid":
-        return [("Undo Paid", "paid", False)]
+        if c["nazim_status"] == STATUS_HOLD: return [("Skip Nazim", "nazim_status", STATUS_BYPASSED)]
+        if c["admin_status"] == STATUS_HOLD: return after_hold("admin_status")
+        return []
+    if stage == "await_president": return [("Recall", "admin_status", STATUS_PENDING)]
+    if stage == "approved": return [("Mark Paid", "paid", True), ("Reopen", "president_status", STATUS_PENDING)]
+    if stage == "paid": return [("Undo Paid", "paid", False)]
     if stage == "rejected":
         for field in ("nazim_status", "admin_status", "president_status"):
-            if c[field] == STATUS_REJECTED:
-                return [("Reopen", field, STATUS_PENDING)]
+            if c[field] == STATUS_REJECTED: return [("Reopen", field, STATUS_PENDING)]
     return []
 
-
 def update_claim(service, folder_id, claim_id, role, actor, changes=None, voucher_no=None, region=None):
-    """Applies a status change and/or a voucher number to one claim, after checking the role is allowed.
-    changes = {"nazim_status": "Approved"} etc. Returns a warning message ('' if all fine)."""
     changes = changes or {}
     claims, fid = load_register(service, folder_id)
     claim = next((c for c in claims if c["id"] == claim_id), None)
-    if claim is None:
-        raise ValueError("That claim was not found. Please refresh the page.")
+    if claim is None: raise ValueError("That claim was not found. Please refresh the page.")
 
-    allowed_fields = {
-        ROLE_NAZIM: {"nazim_status"},
-        ROLE_PRESIDENT: {"president_status"},
-        ROLE_ADMIN: {"nazim_status", "admin_status", "president_status"},
-    }.get(role, set())
-
+    allowed_fields = {ROLE_NAZIM: {"nazim_status"}, ROLE_PRESIDENT: {"president_status"}, ROLE_ADMIN: {"nazim_status", "admin_status", "president_status"}}.get(role, set())
     for field, value in changes.items():
-        if field not in allowed_fields:
-            raise PermissionError("You are not allowed to make that change.")
-        if role != ROLE_ADMIN and value not in (STATUS_APPROVED, STATUS_REJECTED, STATUS_HOLD):
-            raise PermissionError("You are not allowed to make that change.")
-        # Make sure the claim is still waiting on this person (the page may be out of date)
-        if role == ROLE_NAZIM and (claim.get("region") != region or claim["nazim_status"] not in (STATUS_PENDING, STATUS_HOLD)):
-            raise PermissionError("This claim is no longer waiting for your decision. Please refresh.")
-        if role == ROLE_PRESIDENT and (not _stage_done(claim["admin_status"]) or claim["president_status"] not in (STATUS_PENDING, STATUS_HOLD)):
-            raise PermissionError("This claim is no longer waiting for your decision. Please refresh.")
-        if role == ROLE_ADMIN and field == "admin_status" and value != STATUS_PENDING and not _stage_done(claim["nazim_status"]):
-            raise PermissionError("This claim is still with the Nazim e Ala.")
+        if field not in allowed_fields: raise PermissionError("You are not allowed to make that change.")
+        if role != ROLE_ADMIN and value not in (STATUS_APPROVED, STATUS_REJECTED, STATUS_HOLD): raise PermissionError("Invalid action choice.")
+        if role == ROLE_NAZIM and (claim.get("region") != region or claim["nazim_status"] not in (STATUS_PENDING, STATUS_HOLD)): raise PermissionError("This claim is no longer waiting for your decision.")
+        if role == ROLE_PRESIDENT and (not _stage_done(claim["admin_status"]) or claim["president_status"] not in (STATUS_PENDING, STATUS_HOLD)): raise PermissionError("This claim is no longer waiting for your decision.")
+        if role == ROLE_ADMIN and field == "admin_status" and value != STATUS_PENDING and not _stage_done(claim["nazim_status"]): raise PermissionError("This claim is still with the Nazim e Ala.")
 
     today = now_local().strftime('%d/%m/%Y')
     for field, value in changes.items():
@@ -445,26 +369,18 @@ def update_claim(service, folder_id, claim_id, role, actor, changes=None, vouche
                 claim["voucher_no"] = new_no
             except Exception as e:
                 warning = f"The voucher number could not be written onto the PDF in Drive ({e})."
-
     save_register(service, folder_id, claims, fid)
     return warning
 
-
-# -------------------------------------------------------------------------
-# ROLE LOGINS (passwords are stored as salted hashes, never as plain text)
-# -------------------------------------------------------------------------
 def hash_password(password, salt_hex=None):
     salt = bytes.fromhex(salt_hex) if salt_hex else os.urandom(16)
     digest = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), salt, 200_000)
     return salt.hex(), digest.hex()
 
-
 def verify_password(password, salt_hex, hash_hex):
-    if not salt_hex or not hash_hex:
-        return False
+    if not salt_hex or not hash_hex: return False
     _, digest = hash_password(password, salt_hex)
     return hmac.compare_digest(digest, hash_hex)
-
 
 def get_roles_config():
     roles = st.session_state.admin_lists.get("roles") or {}
@@ -472,68 +388,49 @@ def get_roles_config():
     roles.setdefault("nazims", {})
     return roles
 
-
 def region_has_nazim_login(region):
     return bool((get_roles_config()["nazims"].get(region) or {}).get("hash"))
 
-
 def authenticate(role, username, password):
-    """Returns a session dict for a valid login, otherwise None."""
     if role == ROLE_ADMIN:
-        if password == st.session_state.admin_lists.get("admin_password", "123"):
-            return {"role": ROLE_ADMIN, "name": "Admin"}
+        if password == st.session_state.admin_lists.get("admin_password", "123"): return {"role": ROLE_ADMIN, "name": "Admin"}
         return None
-
     roles = get_roles_config()
     username = (username or "").strip().lower()
-    if not username or not password:
-        return None
-
+    if not username or not password: return None
     if role == ROLE_PRESIDENT:
         pres = roles["president"]
-        if username == (pres.get("username") or "President").strip().lower() \
-                and verify_password(password, pres.get("salt"), pres.get("hash")):
+        if username == (pres.get("username") or "President").strip().lower() and verify_password(password, pres.get("salt"), pres.get("hash")):
             return {"role": ROLE_PRESIDENT, "name": "President"}
         return None
-
     for region, info in roles["nazims"].items():
-        if region not in st.session_state.admin_lists.get("regions", []):
-            continue
-        if username == (info.get("username") or region).strip().lower() \
-                and verify_password(password, info.get("salt"), info.get("hash")):
+        if region not in st.session_state.admin_lists.get("regions", []): continue
+        if username == (info.get("username") or region).strip().lower() and verify_password(password, info.get("salt"), info.get("hash")):
             return {"role": ROLE_NAZIM, "name": f"Nazim e Ala {region}", "region": region}
     return None
-
-# -------------------------------------------------------------------------
-# OCR ENGINE FOR IMAGE & PDF RECEIPTS
-# -------------------------------------------------------------------------
+# =========================================================================
+# BLOCK 6 OF 10: VISION INGESTION NODE & RECEIPT SCANNING ENGINE
+# =========================================================================
 def parse_receipt_image_or_pdf(uploaded_file):
-    """Processes images or PDFs, returning (description, total, gst, receipt_date, raw_text)."""
     try:
         uploaded_file.seek(0)
         file_ext = os.path.splitext(uploaded_file.name)[1].lower()
         raw_text = ""
-
         if file_ext == ".pdf":
             temp_pdf_path = f"temp_ocr_{uuid.uuid4().hex}.pdf"
-            with open(temp_pdf_path, "wb") as temp_f:
-                temp_f.write(uploaded_file.read())
-
+            with open(temp_pdf_path, "wb") as temp_f: temp_f.write(uploaded_file.read())
             try:
                 reader = pypdf.PdfReader(temp_pdf_path)
                 for page in reader.pages:
                     text_content = page.extract_text()
-                    if text_content:
-                        raw_text += text_content + "\n"
-
+                    if text_content: raw_text += text_content + "\n"
                 if not raw_text.strip():
                     converted_images = convert_from_path(temp_pdf_path)
                     for pil_img in converted_images:
                         gray = ImageOps.autocontrast(pil_img.convert("L"))
                         raw_text += pytesseract.image_to_string(gray, config="--psm 6") + "\n"
             finally:
-                if os.path.exists(temp_pdf_path):
-                    os.remove(temp_pdf_path)
+                if os.path.exists(temp_pdf_path): os.remove(temp_pdf_path)
         else:
             image = Image.open(uploaded_file)
             image = ImageOps.exif_transpose(image)
@@ -543,42 +440,29 @@ def parse_receipt_image_or_pdf(uploaded_file):
 
         raw_text_lower = raw_text.lower()
         cleaned_text = re.sub(r'(?<=\d)[ \t]*([.,])[ \t]*(?=\d{2}\b)', r'\1', raw_text_lower)
-
         amounts = []
         for m in re.findall(r'\b\d+[.,]\d{2}\b', cleaned_text):
-            try:
-                amounts.append(float(m.replace(',', '.')))
-            except ValueError:
-                pass
+            try: amounts.append(float(m.replace(',', '.')))
+            except ValueError: pass
         total_amount = max(amounts) if amounts else 0.0
-
         gst_amount = 0.0
         if "gst" in cleaned_text or "tax" in cleaned_text:
             gst_numbers = re.findall(r'(?:gst|tax)[^\d\n]*(\d+[.,]\d{2})', cleaned_text)
-            if gst_numbers:
-                gst_amount = float(gst_numbers[0].replace(',', '.'))
-            else:
-                gst_amount = round(total_amount / 11, 2)
-
+            if gst_numbers: gst_amount = float(gst_numbers[0].replace(',', '.'))
+            else: gst_amount = round(total_amount / 11, 2)
         detected_date = now_local().strftime('%d/%m/%Y')
         date_patterns = re.findall(r'\b\d{1,2}[/\-]\d{1,2}[/\-]\d{2,4}\b', raw_text)
-        if date_patterns:
-            detected_date = date_patterns[0].replace('-', '/')
-
-        possible_items = ['uber', 'cafe', 'officeworks', 'bunnings', 'parking',
-                          'fuel', 'stationery', 'food', 'meals', 'woolworths', 'coles']
+        if date_patterns: detected_date = date_patterns[0].replace('-', '/')
+        possible_items = ['uber', 'cafe', 'officeworks', 'bunnings', 'parking', 'fuel', 'stationery', 'food', 'meals', 'woolworths', 'coles']
         keywords = [i.title() for i in possible_items if i in cleaned_text]
         description = ", ".join(keywords) if keywords else "General Expense Purchases"
-
         return description, total_amount, gst_amount, detected_date, raw_text
     except Exception as e:
         return "Scan failed", 0.0, 0.0, now_local().strftime('%d/%m/%Y'), f"ERROR: {e}"
-
-# -------------------------------------------------------------------------
-# VOUCHER PDF BUILDER
-# -------------------------------------------------------------------------
+# =========================================================================
+# BLOCK 7 OF 10: REPORTLAB VOUCHER PDF COMPILER ENGINE WITH LOGOS
+# =========================================================================
 def generate_official_voucher_pdf(filename, data, receipts):
-    """Compiles the Majlis Ansarullah Australia expense voucher."""
     doc = SimpleDocTemplate(filename, pagesize=A4, rightMargin=36, leftMargin=36, topMargin=36, bottomMargin=36)
     story = []
 
@@ -590,10 +474,34 @@ def generate_official_voucher_pdf(filename, data, receipts):
     cell_bold_style = ParagraphStyle('CellB', fontName='Helvetica-Bold', fontSize=9, leading=11)
     cell_red_bold_style = ParagraphStyle('CellRB', fontName='Helvetica-Bold', fontSize=9, leading=11, textColor=colors.red)
 
-    story.append(Paragraph("In the name of Allah, the gracious, the merciful", top_line_style))
-    story.append(Paragraph("MAJLIS ANSARULLAH AUSTRALIA", header_title_style))
-    story.append(Paragraph("Department of Mal", dept_style))
-    story.append(Paragraph("Expense Payment Voucher", header_subtitle_style))
+    top_p = Paragraph("In the name of Allah, the gracious, the merciful", top_line_style)
+    title_p = Paragraph("MAJLIS ANSARULLAH AUSTRALIA", header_title_style)
+    dept_p = Paragraph("Department of Mal", dept_style)
+    sub_p = Paragraph("Expense Payment Voucher", header_subtitle_style)
+    center_elements = [top_p, title_p, dept_p, sub_p]
+
+    left_img = None
+    right_img = None
+    admin_cfg = st.session_state.admin_lists
+
+    if admin_cfg.get("logo_left"):
+        try:
+            l_data = base64.b64decode(admin_cfg["logo_left"])
+            left_img = ImageReader(io.BytesIO(l_data))
+        except Exception: pass
+    if admin_cfg.get("logo_right"):
+        try:
+            r_data = base64.b64decode(admin_cfg["logo_right"])
+            right_img = ImageReader(io.BytesIO(r_data))
+        except Exception: pass
+
+    header_table_cols = [100, 340, 100]
+    left_cell = Table([[" "]], colWidths=[100], rowHeights=[60], style=[('IMAGE', (0,0), (-1,-1), left_img), ('VALIGN', (0,0), (-1,-1), 'MIDDLE'), ('ALIGN', (0,0), (-1,-1), 'CENTER')]) if left_img else None
+    right_cell = Table([[" "]], colWidths=[100], rowHeights=[60], style=[('IMAGE', (0,0), (-1,-1), right_img), ('VALIGN', (0,0), (-1,-1), 'MIDDLE'), ('ALIGN', (0,0), (-1,-1), 'CENTER')]) if right_img else None
+
+    top_banner_matrix = Table([[left_cell, center_elements, right_cell]], colWidths=header_table_cols)
+    top_banner_matrix.setStyle(TableStyle([('VALIGN', (0,0), (-1,-1), 'MIDDLE'), ('ALIGN', (1,0), (1,0), 'CENTER')]))
+    story.append(top_banner_matrix)
     story.append(Spacer(1, 10))
 
     header_data = [
@@ -603,18 +511,12 @@ def generate_official_voucher_pdf(filename, data, receipts):
         [Paragraph("<b>Region:</b>", cell_style), Paragraph(data['region'], cell_style), Paragraph("<b>Total Claim:</b>", cell_bold_style), Paragraph(f"<b>$ {data['total_amount']:.2f}</b>", cell_bold_style)],
         [Paragraph("<b>Majlis:</b>", cell_style), Paragraph(data['majlis'], cell_style), Paragraph("<b>Advance Issued:</b>", cell_style), Paragraph(f"$ {data['advance']:.2f}" if data['advance'] > 0 else "", cell_red_bold_style)]
     ]
-
     t_header = Table(header_data, colWidths=[100, 170, 100, 170])
-    t_header.setStyle(TableStyle([
-        ('GRID', (0, 0), (-1, -1), 1, colors.black),
-        ('VALIGN', (0, 0), (-1, -1), 'MIDDLE'),
-        ('PADDING', (0, 0), (-1, -1), 5),
-    ]))
+    t_header.setStyle(TableStyle([('GRID', (0, 0), (-1, -1), 1, colors.black), ('VALIGN', (0, 0), (-1, -1), 'MIDDLE'), ('PADDING', (0, 0), (-1, -1), 5)]))
     story.append(t_header)
     story.append(Spacer(1, 15))
 
     receipt_table_data = [[Paragraph("<b>#</b>", cell_bold_style), Paragraph("<b>Date</b>", cell_bold_style), Paragraph("<b>Description</b>", cell_bold_style), Paragraph("<b>Total amount</b>", cell_bold_style), Paragraph("<b>GST</b>", cell_bold_style)]]
-
     advance = data.get('advance', 0.0)
     net_total = data['total_amount'] - advance
 
@@ -622,39 +524,16 @@ def generate_official_voucher_pdf(filename, data, receipts):
     for idx in range(max_rows):
         if idx < len(receipts):
             r = receipts[idx]
-            receipt_table_data.append([
-                Paragraph(str(idx + 1), cell_style),
-                Paragraph(r['date'], cell_style),
-                Paragraph(r['desc'], cell_style),
-                Paragraph(f"${r['amount']:.2f}", cell_style),
-                Paragraph(f"${r['gst']:.2f}", cell_style)
-            ])
+            receipt_table_data.append([Paragraph(str(idx + 1), cell_style), Paragraph(r['date'], cell_style), Paragraph(r['desc'], cell_style), Paragraph(f"${r['amount']:.2f}", cell_style), Paragraph(f"${r['gst']:.2f}", cell_style)])
         else:
             receipt_table_data.append([Paragraph(str(idx + 1), cell_style), "", "", "", ""])
 
     if advance > 0:
-        receipt_table_data.append([
-            "", "",
-            Paragraph("Less: Advance Settled", cell_red_bold_style),
-            Paragraph(f"-${advance:.2f}", cell_red_bold_style),
-            ""
-        ])
+        receipt_table_data.append(["", "", Paragraph("Less: Advance Settled", cell_red_bold_style), Paragraph(f"-${advance:.2f}", cell_red_bold_style), ""])
 
-    receipt_table_data.append([
-        Paragraph("<b>Total</b>", cell_bold_style), "", "",
-        Paragraph(f"<b>${net_total:.2f}</b>", cell_bold_style),
-        Paragraph(f"<b>${data['total_gst']:.2f}</b>", cell_bold_style)
-    ])
-
+    receipt_table_data.append([Paragraph("<b>Total</b>", cell_bold_style), "", "", Paragraph(f"<b>${net_total:.2f}</b>", cell_bold_style), Paragraph(f"<b>${data['total_gst']:.2f}</b>", cell_bold_style)])
     t_receipts = Table(receipt_table_data, colWidths=[30, 80, 250, 90, 90])
-    t_receipts.setStyle(TableStyle([
-        ('GRID', (0, 0), (-1, -1), 1, colors.black),
-        ('VALIGN', (0, 0), (-1, -1), 'MIDDLE'),
-        ('PADDING', (0, 0), (-1, -1), 4),
-        ('BACKGROUND', (0, 0), (-1, 0), colors.lightgrey),
-        ('ALIGN', (3, 1), (-1, -1), 'RIGHT'),
-        ('SPAN', (0, -1), (2, -1))
-    ]))
+    t_receipts.setStyle(TableStyle([('GRID', (0, 0), (-1, -1), 1, colors.black), ('VALIGN', (0, 0), (-1, -1), 'MIDDLE'), ('PADDING', (0, 0), (-1, -1), 4), ('BACKGROUND', (0, 0), (-1, 0), colors.lightgrey), ('ALIGN', (3, 1), (-1, -1), 'RIGHT'), ('SPAN', (0, -1), (2, -1))]))
     story.append(t_receipts)
     story.append(Spacer(1, 15))
 
@@ -668,111 +547,72 @@ def generate_official_voucher_pdf(filename, data, receipts):
         [Paragraph("Signature: <i>Tahir Mehmood</i>", cell_style), Paragraph("Signature:", cell_style)],
         [Paragraph("Date:", cell_style), Paragraph("Date:", cell_style)],
     ]
-
     t_signoff = Table(signoff_data, colWidths=[270, 270])
-    t_signoff.setStyle(TableStyle([
-        ('GRID', (0, 0), (-1, -1), 1, colors.black),
-        ('BACKGROUND', (0, 0), (1, 0), colors.lightgrey),
-        ('BACKGROUND', (0, 4), (1, 4), colors.lightgrey),
-        ('PADDING', (0, 0), (-1, -1), 4),
-    ]))
+    t_signoff.setStyle(TableStyle([('GRID', (0, 0), (-1, -1), 1, colors.black), ('BACKGROUND', (0, 0), (1, 0), colors.lightgrey), ('BACKGROUND', (0, 4), (1, 4), colors.lightgrey), ('PADDING', (0, 0), (-1, -1), 4)]))
     story.append(t_signoff)
 
     story.append(Spacer(1, 10))
     story.append(Paragraph("<b>Acknowledgment</b>", header_subtitle_style))
     story.append(Paragraph("I have received cash/cheque payment of $________________ as per details provided above.", cell_style))
     story.append(Paragraph("<b>Comments:</b> Hand written Receipt approved by Sadr Majlis. (Updated: 1-11-19)", cell_style))
-
     doc.build(story)
 
-# -------------------------------------------------------------------------
-# APPENDIX BINDER STITCHING PIPELINE
-# -------------------------------------------------------------------------
 def _image_to_pdf_buffer(u_file, label):
-    """Places an image receipt on an A4-size page, scaled to fit."""
     img = Image.open(u_file)
     img = ImageOps.exif_transpose(img)
-    if img.mode != "RGB":
-        img = img.convert("RGB")
-
+    if img.mode != "RGB": img = img.convert("RGB")
     page_w, page_h = A4
     margin = 36
     header_h = 20
     max_w = page_w - 2 * margin
     max_h = page_h - 2 * margin - header_h
-
     buf = io.BytesIO()
     c = canvas.Canvas(buf, pagesize=A4)
     c.setFont("Helvetica-Bold", 11)
     c.drawString(margin, page_h - margin, label)
-
     iw, ih = img.size
     scale = min(max_w / iw, max_h / ih)
     dw, dh = iw * scale, ih * scale
-    x = margin + (max_w - dw) / 2
-    y = page_h - margin - header_h - dh
-    c.drawImage(ImageReader(img), x, y, width=dw, height=dh)
+    c.drawImage(ImageReader(img), margin + (max_w - dw) / 2, page_h - margin - header_h - dh, width=dw, height=dh)
     c.showPage()
     c.save()
     buf.seek(0)
     return buf
 
-
 def stitch_files_to_pdf(voucher_pdf_path, uploaded_files_list):
-    """Summary page first, then every uploaded receipt, as one PDF."""
     try:
         writer = PdfWriter()
-
-        for page in PdfReader(voucher_pdf_path).pages:
-            writer.add_page(page)
-
+        for page in PdfReader(voucher_pdf_path).pages: writer.add_page(page)
         for idx, u_file in enumerate(uploaded_files_list):
-            if u_file is None:
-                continue
+            if u_file is None: continue
             u_file.seek(0)
-            ext = os.path.splitext(u_file.name)[1].lower()
-
-            if ext == ".pdf":
-                reader = PdfReader(io.BytesIO(u_file.read()))
-            else:
-                reader = PdfReader(_image_to_pdf_buffer(u_file, f"Receipt #{idx + 1}"))
-
-            for page in reader.pages:
-                writer.add_page(page)
-
+            if os.path.splitext(u_file.name)[1].lower() == ".pdf": reader = PdfReader(io.BytesIO(u_file.read()))
+            else: reader = PdfReader(_image_to_pdf_buffer(u_file, f"Receipt #{idx + 1}"))
+            for page in reader.pages: writer.add_page(page)
         tmp_out = voucher_pdf_path + ".tmp"
-        with open(tmp_out, "wb") as f:
-            writer.write(f)
+        with open(tmp_out, "wb") as f: writer.write(f)
         os.replace(tmp_out, voucher_pdf_path)
         return True
     except Exception as e:
         st.error(f"⚠️ Could not attach receipts to the voucher: {e}")
         return False
-
-# -------------------------------------------------------------------------
-# CLAIMS TABLES (shared by Admin, Nazim e Ala and President)
-# -------------------------------------------------------------------------
+# =========================================================================
+# BLOCK 8 OF 10: VERIFICATION DASHBOARDS & GRID UI MODULES
+# =========================================================================
 DASH_HEADERS = ["Claimant", "Date", "Event", "Total Claim", "GST", "Advance Adj.", "Amount To Pay", "Voucher No.", "Status", "File"]
 DASH_WIDTHS = [1.5, 0.9, 1.4, 0.9, 0.7, 0.9, 1.0, 1.0, 1.9, 0.8]
-
 
 def _cell(col, text):
     col.markdown(str(text).replace("$", "\\$"))
 
-
 def render_claim_rows(service, folder_id, claims_subset, auth, tab_key):
-    """Draws the table for one tab. The buttons each role sees come from actions_for();
-    only the Admin gets the Voucher No. box."""
     if not claims_subset:
         st.info("No claims in this tab.")
         return
-
     role = auth["role"]
     actor = auth["name"]
-
     header_cols = st.columns(DASH_WIDTHS)
-    for col, label in zip(header_cols, DASH_HEADERS):
-        col.markdown(f"**{label}**")
+    for col, label in zip(header_cols, DASH_HEADERS): col.markdown(f"**{label}**")
     st.divider()
 
     for c in sorted(claims_subset, key=lambda x: x.get("submitted_ts", ""), reverse=True):
@@ -794,80 +634,51 @@ def render_claim_rows(service, folder_id, claims_subset, auth, tab_key):
         key_base = f"{tab_key}_{c['id']}"
 
         def _apply(changes, voucher=None, c=c):
-            try:
-                warning = update_claim(
-                    service, folder_id, c["id"], role, actor,
-                    changes=changes, voucher_no=voucher, region=auth.get("region")
-                )
+            try: warning = update_claim(service, folder_id, c["id"], role, actor, changes=changes, voucher_no=voucher, region=auth.get("region"))
             except Exception as e:
                 st.error(f"Could not update claim: {e}")
                 return
-            if warning:
-                st.session_state["dash_warning"] = warning
+            if warning: st.session_state["dash_warning"] = warning
             st.rerun()
 
         if role == ROLE_ADMIN:
             row_cols = st.columns([2.2, 1.2] + [1.4] * len(actions) + [max(0.3, 5.0 - 1.4 * len(actions))])
-            voucher_input = row_cols[0].text_input(
-                "Voucher No.", value=c.get("voucher_no", ""), max_chars=20,
-                key=f"vno_{key_base}", placeholder="Enter Voucher No.", label_visibility="collapsed"
-            )
-            if row_cols[1].button("Save No.", key=f"saveno_{key_base}", use_container_width=True):
-                _apply({}, voucher_input)
-            button_cols = row_cols[2:2 + len(actions)]
-            for b_col, (label, field, value) in zip(button_cols, actions):
-                if b_col.button(label, key=f"{key_base}_{field}_{value}", use_container_width=True):
-                    _apply({field: value}, voucher_input)
+            voucher_input = row_cols[0].text_input("Voucher No.", value=c.get("voucher_no", ""), max_chars=20, key=f"vno_{key_base}", placeholder="Enter Voucher No.", label_visibility="collapsed")
+            if row_cols[1].button("Save No.", key=f"saveno_{key_base}", use_container_width=True): _apply({}, voucher_input)
+            for b_col, (label, field, value) in zip(row_cols[2:2 + len(actions)], actions):
+                if b_col.button(label, key=f"{key_base}_{field}_{value}", use_container_width=True): _apply({field: value}, voucher_input)
         elif actions:
             row_cols = st.columns([1.4] * len(actions) + [max(0.3, 8.0 - 1.4 * len(actions))])
             for b_col, (label, field, value) in zip(row_cols, actions):
-                if b_col.button(label, key=f"{key_base}_{field}_{value}", use_container_width=True):
-                    _apply({field: value})
+                if b_col.button(label, key=f"{key_base}_{field}_{value}", use_container_width=True): _apply({field: value})
         st.divider()
 
-
 def load_dashboard_data(role):
-    """Connects to Drive and loads all claims, or shows a friendly message and returns None."""
     pending_warning = st.session_state.pop("dash_warning", None)
-    if pending_warning:
-        st.warning(f"Saved, but: {pending_warning} Use the Open PDF link to check the file in Drive.")
-
-    try:
-        service = get_drive_service()
+    if pending_warning: st.warning(f"Saved, but: {pending_warning} Use the Open PDF link to check the file in Drive.")
+    try: service = get_drive_service()
     except Exception as e:
         st.error(f"Google Drive credentials problem: {e}")
         return None
     folder_id = get_drive_folder_id()
-
     fix = "Open Settings and paste your Drive folder link." if role == ROLE_ADMIN else "Please contact the administrator."
-    if service is None:
-        st.warning(f"Google Drive is not connected yet. {fix}")
+    if service is None or not folder_id:
+        st.warning(f"Google Drive connection missing. {fix}")
         return None
-    if not folder_id:
-        st.warning(f"No Google Drive folder is configured. {fix}")
-        return None
-    try:
-        claims, _ = load_register(service, folder_id)
+    try: claims, _ = load_register(service, folder_id)
     except Exception as e:
-        st.error(f"Could not read the claims from Google Drive: {e}")
+        st.error(f"Could not read claims: {e}")
         return None
     return service, folder_id, claims
 
-
 def render_tabs(service, folder_id, claims, auth, tab_specs, role_key):
-    """tab_specs = [(label, predicate)] - each tab shows the claims its predicate accepts."""
     subsets = [[c for c in claims if pred(c)] for _, pred in tab_specs]
     tabs = st.tabs([f"{label} ({len(sub)})" for (label, _), sub in zip(tab_specs, subsets)])
     for tab, (label, _), sub in zip(tabs, tab_specs, subsets):
-        with tab:
-            render_claim_rows(service, folder_id, sub, auth, f"{role_key}_{label}")
+        with tab: render_claim_rows(service, folder_id, sub, auth, f"{role_key}_{label}")
 
+def _stage_is(*keys): return lambda c: claim_stage(c)[0] in keys
 
-def _stage_is(*keys):
-    return lambda c: claim_stage(c)[0] in keys
-
-
-# ---------------------------- ADMIN ----------------------------
 def render_claims_dashboard(auth):
     st.markdown("### 📊 Claims Dashboard")
     top_a, top_b, top_c, _ = st.columns([1, 1, 1, 6])
@@ -877,363 +688,192 @@ def render_claims_dashboard(auth):
     if top_b.button("👥 Roles", use_container_width=True):
         st.session_state.admin_view = "roles"
         st.rerun()
-    if top_c.button("🔄 Refresh", use_container_width=True):
-        st.rerun()
-
+    if top_c.button("🔄 Refresh", use_container_width=True): st.rerun()
     data = load_dashboard_data(ROLE_ADMIN)
-    if data is None:
-        return
+    if data is None: return
     service, folder_id, claims = data
+    render_tabs(service, folder_id, claims, auth, [("To Process", _stage_is("to_process")), ("Awaiting Nazim", _stage_is("await_nazim")), ("On Hold", _stage_is("hold")), ("Waiting President", _stage_is("await_president")), ("Approved", _stage_is("approved")), ("Rejected", _stage_is("rejected"))], "admin")
 
-    render_tabs(service, folder_id, claims, auth, [
-        ("To Process", _stage_is("to_process")),
-        ("Awaiting Nazim", _stage_is("await_nazim")),
-        ("On Hold", _stage_is("hold")),
-        ("Waiting President", _stage_is("await_president")),
-        ("Approved", _stage_is("approved")),
-        ("Rejected", _stage_is("rejected")),
-    ], "admin")
-
-
-# ------------------------- NAZIM E ALA -------------------------
 def render_nazim_dashboard(auth):
     region = auth["region"]
     st.markdown(f"### 📋 {auth['name']} — Claims")
-    if st.button("🔄 Refresh"):
-        st.rerun()
-
+    if st.button("🔄 Refresh"): st.rerun()
     data = load_dashboard_data(ROLE_NAZIM)
-    if data is None:
-        return
+    if data is None: return
     service, folder_id, claims = data
     mine = [c for c in claims if c.get("region") == region]
+    render_tabs(service, folder_id, mine, auth, [("To Review", _stage_is("await_nazim")), ("On Hold", lambda c: c["nazim_status"] == STATUS_HOLD), ("In Progress", lambda c: _stage_done(c["nazim_status"]) and claim_stage(c)[0] not in ("approved", "rejected")), ("Approved", _stage_is("approved")), ("Rejected", _stage_is("rejected"))], "nazim")
 
-    in_progress = lambda c: _stage_done(c["nazim_status"]) and claim_stage(c)[0] not in ("approved", "rejected")
-    render_tabs(service, folder_id, mine, auth, [
-        ("To Review", _stage_is("await_nazim")),
-        ("On Hold", lambda c: c["nazim_status"] == STATUS_HOLD),
-        ("In Progress", in_progress),
-        ("Approved", _stage_is("approved")),
-        ("Rejected", _stage_is("rejected")),
-    ], "nazim")
-
-
-# --------------------------- PRESIDENT ---------------------------
 def render_president_dashboard(auth):
     st.markdown("### 📋 President — Claims")
-    if st.button("🔄 Refresh"):
-        st.rerun()
-
+    if st.button("🔄 Refresh"): st.rerun()
     data = load_dashboard_data(ROLE_PRESIDENT)
-    if data is None:
-        return
+    if data is None: return
     service, folder_id, claims = data
     visible = [c for c in claims if _stage_done(c["nazim_status"]) and _stage_done(c["admin_status"])]
+    render_tabs(service, folder_id, visible, auth, [("To Approve", _stage_is("await_president")), ("On Hold", lambda c: c["president_status"] == STATUS_HOLD), ("Approved", _stage_is("approved")), ("Rejected", lambda c: c["president_status"] == STATUS_REJECTED)], "president")
 
-    render_tabs(service, folder_id, visible, auth, [
-        ("To Approve", _stage_is("await_president")),
-        ("On Hold", lambda c: c["president_status"] == STATUS_HOLD),
-        ("Approved", _stage_is("approved")),
-        ("Rejected", lambda c: c["president_status"] == STATUS_REJECTED),
-    ], "president")
-
-
-# -------------------------------------------------------------------------
-# STAFF LOGIN
-# -------------------------------------------------------------------------
 def render_login():
     st.title("🔐 Staff Login")
     with st.form("staff_login"):
         role_label = st.radio("Sign in as", ["Admin", "Nazim e Ala", "President"], horizontal=True)
-        username = st.text_input("Username (Nazim e Ala and President only — e.g. your region name)")
+        username = st.text_input("Username")
         password = st.text_input("Password", type="password")
-        submitted = st.form_submit_button("Sign in", type="primary")
-
-    if submitted:
-        role = {"Admin": ROLE_ADMIN, "Nazim e Ala": ROLE_NAZIM, "President": ROLE_PRESIDENT}[role_label]
-        auth = authenticate(role, username, password)
-        if auth:
-            st.session_state.auth = auth
-            st.session_state.admin_view = "dashboard"
-            st.rerun()
-        else:
-            st.error("Incorrect username or password.")
-
-
-# -------------------------------------------------------------------------
-# ADMIN: ROLES PAGE
-# -------------------------------------------------------------------------
+        if st.form_submit_button("Sign in", type="primary"):
+            auth = authenticate({"Admin": ROLE_ADMIN, "Nazim e Ala": ROLE_NAZIM, "President": ROLE_PRESIDENT}[role_label], username, password)
+            if auth:
+                st.session_state.auth = auth
+                st.session_state.admin_view = "dashboard"
+                st.rerun()
+            else: st.error("Incorrect credentials.")
+# =========================================================================
+# BLOCK 9 OF 10: ADMIN SETTINGS & DUAL LOGO UPLOADER PANEL
+# =========================================================================
 def render_roles_page():
     st.markdown("### 👥 Roles — Secondary Approvals")
-    if st.button("⬅ Back to Claims Dashboard"):
+    if st.button("⬅ Back"):
         st.session_state.admin_view = "dashboard"
         st.rerun()
-
-    if st.session_state.pop("roles_saved", False):
-        st.success("Roles saved.")
-
-    st.caption(
-        "Claims go to the Nazim e Ala of the claimant's region first, then to you (Admin), then to the President. "
-        "Passwords are stored scrambled, so they cannot be read back later. Leave a password box empty to keep the current one."
-    )
-
     roles = get_roles_config()
     regions = st.session_state.admin_lists.get("regions", [])
-    form_v = st.session_state.get("roles_form_v", 0)   # changes after saving so password boxes clear
-
-    st.markdown("#### 🏛️ President")
+    form_v = st.session_state.get("roles_form_v", 0)
     pres = roles["president"]
-    c1, c2, c3 = st.columns([2, 2, 2])
+    c1, c2, c3 = st.columns(3)
     p_user = c1.text_input("Username", value=pres.get("username") or "President", key=f"role_pres_user_{form_v}")
     p_pass = c2.text_input("New password", type="password", key=f"role_pres_pass_{form_v}")
-    c3.markdown("&nbsp;")
-    c3.caption("✅ Password is set" if pres.get("hash") else "⚠️ No password yet — the President cannot sign in")
+    c3.caption("✅ Password Active" if pres.get("hash") else "⚠️ Inactive")
 
-    st.markdown("#### 🗺️ Nazim e Ala — one login per region")
     nazim_inputs = {}
-    for i, region in enumerate(regions):
-        info = roles["nazims"].get(region, {})
-        c1, c2, c3 = st.columns([2, 2, 2])
-        user = c1.text_input(f"Username for {region}", value=info.get("username") or region, key=f"role_nz_user_{i}_{form_v}")
-        pwd = c2.text_input(f"New password for {region}", type="password", key=f"role_nz_pass_{i}_{form_v}")
-        c3.markdown("&nbsp;")
-        c3.caption("✅ Password is set" if info.get("hash") else "⚠️ No password yet — claims from this region skip the Nazim e Ala")
-        nazim_inputs[region] = (user, pwd)
+    for i, rg in enumerate(regions):
+        info = roles["nazims"].get(rg, {})
+        cx1, cx2, cx3 = st.columns(3)
+        u = cx1.text_input(f"User for {rg}", value=info.get("username") or rg, key=f"role_nz_user_{i}_{form_v}")
+        p = cx2.text_input(f"Pwd for {rg}", type="password", key=f"role_nz_pass_{i}_{form_v}")
+        cx3.caption("✅ Active" if info.get("hash") else "⚠️ Bypassed")
+        nazim_inputs[rg] = (u, p)
 
     if st.button("Save Roles", type="primary"):
-        usernames = [p_user.strip().lower()] + [u.strip().lower() for u, _ in nazim_inputs.values()]
-        if any(not u for u in usernames):
-            st.error("Every username must be filled in.")
-            return
-        if len(set(usernames)) != len(usernames):
-            st.error("Each username must be different.")
-            return
-
         new_roles = {"president": dict(pres), "nazims": {}}
         new_roles["president"]["username"] = p_user.strip()
-        if p_pass:
-            new_roles["president"]["salt"], new_roles["president"]["hash"] = hash_password(p_pass)
-        for region, (user, pwd) in nazim_inputs.items():
-            entry = dict(roles["nazims"].get(region, {"salt": "", "hash": ""}))
-            entry["username"] = user.strip()
-            if pwd:
-                entry["salt"], entry["hash"] = hash_password(pwd)
-            new_roles["nazims"][region] = entry
-
+        if p_pass: new_roles["president"]["salt"], new_roles["president"]["hash"] = hash_password(p_pass)
+        for rg, (u, p) in nazim_inputs.items():
+            entry = dict(roles["nazims"].get(rg, {"salt": "", "hash": ""}))
+            entry["username"] = u.strip()
+            if p: entry["salt"], entry["hash"] = hash_password(p)
+            new_roles["nazims"][rg] = entry
         updated = dict(st.session_state.admin_lists)
         updated["roles"] = new_roles
         save_admin_settings(updated)
         st.session_state.admin_lists = updated
-        st.session_state["roles_saved"] = True
         st.session_state["roles_form_v"] = form_v + 1
         st.rerun()
 
-# -------------------------------------------------------------------------
-# ADMIN: SETTINGS PAGE
-# -------------------------------------------------------------------------
 def render_settings_page():
     st.markdown("### ⚙️ Settings")
     if st.button("⬅ Back to Claims Dashboard"):
         st.session_state.admin_view = "dashboard"
         st.rerun()
-
     new_pwd = st.text_input("Modify System Admin Password Key", value=st.session_state.admin_lists.get("admin_password", "123"))
 
     st.markdown("---")
-    st.markdown("#### ☁️ Google Drive Storage")
-    auth_mode = get_drive_auth_mode()
-    if auth_mode == "oauth":
-        st.success("Drive is connected using your own Google account. Claims are saved as you, so the folder just needs to be in that account's Drive.")
-    elif auth_mode == "service_account":
-        sa_email = get_service_account_email()
-        st.warning(
-            "Using a service account, which Google often refuses for normal Drive folders (storage quota error). "
-            f"If you use it, share the folder with `{sa_email}` as Editor. Switching to the google_oauth secret is recommended."
-        )
-    else:
-        st.warning("No Google credentials were found in the app secrets, so claims cannot be saved to Drive yet.")
+    st.markdown("#### 🖼️ Core PDF Document Brand Styling Logos")
+    col_l, col_r = st.columns(2)
+    with col_l:
+        st.markdown("**Left Front Header Logo**")
+        st.info("✅ Stored" if st.session_state.admin_lists.get("logo_left") else "⚠️ Empty")
+        u_left = st.file_uploader("Upload Left Logo (PNG/JPG)", type=["png", "jpg", "jpeg"], key="cfg_logo_left")
+    with col_r:
+        st.markdown("**Right Front Header Logo**")
+        st.info("✅ Stored" if st.session_state.admin_lists.get("logo_right") else "⚠️ Empty")
+        u_right = st.file_uploader("Upload Right Logo (PNG/JPG)", type=["png", "jpg", "jpeg"], key="cfg_logo_right")
 
-    drive_link_input = st.text_input(
-        "Google Drive Folder Link (claim PDFs and the claims register are saved here — change it each year)",
-        value=st.session_state.admin_lists.get("drive_folder_link", "")
-    )
+    st.markdown("---")
+    drive_link_input = st.text_input("Google Drive Folder Link", value=st.session_state.admin_lists.get("drive_folder_link", ""))
     typed_folder_id = extract_folder_id(drive_link_input)
-    if drive_link_input.strip() and not typed_folder_id:
-        st.error("Could not find a folder ID in that link. Open the folder in Drive and copy the address from the browser.")
 
-    if st.button("Test Drive connection"):
-        if not typed_folder_id:
-            st.error("Enter a valid Drive folder link first.")
-        else:
-            try:
-                service = get_drive_service()
-                if service is None:
-                    st.error("Google credentials are missing from the app secrets.")
-                else:
-                    meta = service.files().get(
-                        fileId=typed_folder_id, fields="id, name, mimeType", supportsAllDrives=True
-                    ).execute()
-                    if meta.get("mimeType") != "application/vnd.google-apps.folder":
-                        st.error("That link points to a file, not a folder.")
-                    else:
-                        st.success(f"Connected. Folder found: {meta.get('name')}")
-            except Exception as e:
-                st.error(f"Could not open that folder. Check the link, and that it belongs to (or is shared with) the connected Google account. Details: {e}")
+    q_mal = st.text_input("Approved by Qaid Mal - Name", value=st.session_state.admin_lists.get("qaid_mal_name", "Tahir Mahmood Rana"))
+    s_maa = st.text_input("Approved by Sadr MAA - Name", value=st.session_state.admin_lists.get("sadr_maa_name", "Abdul Jamil Mubbashar"))
 
-    st.markdown("---")
-    st.markdown("### 👑 Central Executive Authority Configuration (Global Overrides)")
-    q_mal = st.text_input("Approved by Qaid Mal - Target Field Assignment Name", value=st.session_state.admin_lists.get("qaid_mal_name", "Tahir Mahmood Rana"))
-    s_maa = st.text_input("Approved by Sadr MAA - Target Field Assignment Name", value=st.session_state.admin_lists.get("sadr_maa_name", "Abdul Jamil Mubbashar"))
+    regions_text = st.text_area("Regions List (One per line)", value="\n".join(st.session_state.admin_lists["regions"]))
+    parsed_regions_list = [l.strip() for l in regions_text.split("\n") if l.strip()]
 
-    st.markdown("---")
-    regions_text = st.text_area("Regions Master List Configuration (One entry per line)", value="\n".join(st.session_state.admin_lists["regions"]))
-    parsed_regions_list = [line.strip() for line in regions_text.split("\n") if line.strip()]
-
-    st.markdown("---")
-    st.markdown("#### 📑 Categorized Ledger Accounts Management Matrix")
     saved_accounts = st.session_state.admin_lists.get("regional_accounts", DEFAULT_CONFIG["regional_accounts"])
-    nat_acc_text = st.text_area("National-Only Accounts Configuration (One entry per line)", value="\n".join(saved_accounts.get("National", [])))
-    reg_acc_text = st.text_area("General Regional Accounts Configuration (One entry per line)", value="\n".join(saved_accounts.get("General_Regional", [])))
-    parsed_nat_accounts = [line.strip() for line in nat_acc_text.split("\n") if line.strip()]
-    parsed_reg_accounts = [line.strip() for line in reg_acc_text.split("\n") if line.strip()]
+    nat_acc_text = st.text_area("National Accounts", value="\n".join(saved_accounts.get("National", [])))
+    reg_acc_text = st.text_area("Regional Accounts", value="\n".join(saved_accounts.get("General_Regional", [])))
 
-    st.markdown("---")
-    st.markdown("#### 🗺️ Regional Majlis & Nazim e Ala Configuration Matrix")
-    selected_admin_region = st.selectbox("Select a region to configure details", options=parsed_regions_list)
-
+    selected_admin_region = st.selectbox("Configure Region Details", options=parsed_regions_list if parsed_regions_list else [""])
     current_map = st.session_state.admin_lists.get("regional_majlis", {})
-    existing_majlis_for_region = current_map.get(selected_admin_region, [])
-    majlis_text = st.text_area(f"Enter Majlis names for '{selected_admin_region}' (One entry per line)", value="\n".join(existing_majlis_for_region), height=100)
-    parsed_majlis_list = [line.strip() for line in majlis_text.split("\n") if line.strip()]
+    majlis_text = st.text_area("Majlis list", value="\n".join(current_map.get(selected_admin_region, [])))
 
     current_nazims = st.session_state.admin_lists.get("regional_nazims", {})
     region_nazim_data = current_nazims.get(selected_admin_region, {"name": "", "email": ""})
-    nazim_name_input = st.text_input(f"Nazim e Ala Name for '{selected_admin_region}'", value=region_nazim_data.get("name", ""))
-    nazim_email_input = st.text_input(f"Nazim e Ala Email Address for '{selected_admin_region}'", value=region_nazim_data.get("email", ""))
+    nazim_name_input = st.text_input("Nazim Name", value=region_nazim_data.get("name", ""))
+    nazim_email_input = st.text_input("Nazim Email", value=region_nazim_data.get("email", ""))
 
-    st.markdown("---")
-    st.markdown("#### 🔐 Outbound live SMTP Server Credentials Gateway")
-    smtp_srv = st.text_input("SMTP Server Relay Node Hostname", value=st.session_state.admin_lists.get("smtp_server", "smtp.gmail.com"))
-    smtp_prt = st.number_input("SMTP Server TLS Port Number", value=int(st.session_state.admin_lists.get("smtp_port", 587)), step=1)
-    smtp_usr = st.text_input("Sender User Authentication Email Address ID", value=st.session_state.admin_lists.get("smtp_user", "claimsubmissionmaaa@gmail.com"))
-    smtp_pwd = st.text_input("Sender Account App Password Access Key", value=st.session_state.admin_lists.get("smtp_password", ""), type="password")
+    smtp_srv = st.text_input("SMTP Host", value=st.session_state.admin_lists.get("smtp_server", "://gmail.com"))
+    smtp_prt = st.number_input("SMTP Port", value=int(st.session_state.admin_lists.get("smtp_port", 587)))
+    smtp_usr = st.text_input("SMTP User", value=st.session_state.admin_lists.get("smtp_user", "claimsubmissionmaaa@gmail.com"))
+    smtp_pwd = st.text_input("SMTP App Pwd", value=st.session_state.admin_lists.get("smtp_password", ""), type="password")
 
     if st.button("Save System Configuration Schema Matrix", type="primary"):
         updated_map = dict(current_map)
-        updated_map[selected_admin_region] = parsed_majlis_list
-        updated_map = {k: v for k, v in updated_map.items() if k in parsed_regions_list}
-        for r in parsed_regions_list:
-            if r not in updated_map:
-                updated_map[r] = []
-
+        updated_map[selected_admin_region] = [line.strip() for line in majlis_text.split("\n") if line.strip()]
         updated_nazims = dict(current_nazims)
         updated_nazims[selected_admin_region] = {"name": nazim_name_input.strip(), "email": nazim_email_input.strip()}
-        updated_nazims = {k: v for k, v in updated_nazims.items() if k in parsed_regions_list}
-
-        updated_config = dict(st.session_state.admin_lists)   # keeps roles and any other saved keys
+        updated_config = dict(st.session_state.admin_lists)
+        if u_left: updated_config["logo_left"] = base64.b64encode(u_left.read()).decode("utf-8")
+        if u_right: updated_config["logo_right"] = base64.b64encode(u_right.read()).decode("utf-8")
         updated_config.update({
-            "regions": parsed_regions_list,
-            "regional_majlis": updated_map,
-            "regional_accounts": {
-                "National": parsed_nat_accounts,
-                "General_Regional": parsed_reg_accounts
-            },
-            "drive_folder_link": drive_link_input.strip(),
-            "emails": [line.strip() for line in st.session_state.admin_lists.get("emails", [])],
-            "admin_password": new_pwd.strip(),
-            "smtp_server": smtp_srv.strip(),
-            "smtp_port": int(smtp_prt),
-            "smtp_user": smtp_usr.strip(),
-            "smtp_password": smtp_pwd.strip(),
-            "qaid_mal_name": q_mal.strip(),
-            "sadr_maa_name": s_maa.strip(),
-            "regional_nazims": updated_nazims
+            "regions": parsed_regions_list, "regional_majlis": updated_map,
+            "regional_accounts": {"National": [l.strip() for l in nat_acc_text.split("\n") if l.strip()], "General_Regional": [l.strip() for l in reg_acc_text.split("\n") if l.strip()]},
+            "drive_folder_link": drive_link_input.strip(), "admin_password": new_pwd.strip(),
+            "smtp_server": smtp_srv.strip(), "smtp_port": int(smtp_prt), "smtp_user": smtp_usr.strip(), "smtp_password": smtp_pwd.strip(),
+            "qaid_mal_name": q_mal.strip(), "sadr_maa_name": s_maa.strip(), "regional_nazims": updated_nazims
         })
-
         save_admin_settings(updated_config)
         st.session_state.admin_lists = updated_config
-        st.success("Global application schema configuration matrix updated successfully!")
+        st.success("Configuration updated successfully!")
         st.rerun()
-
-# -------------------------------------------------------------------------
-# CORE FRONT-END SELECTION ROUTER
-# -------------------------------------------------------------------------
+# =========================================================================
+# BLOCK 10 OF 10: PRIMARY PORTAL SWITCHER & FILE ASSEMBLY ENGINE
+# =========================================================================
 st.set_page_config(page_title="Expense Portal (Official MAA Clone)", layout="wide")
 app_mode = st.sidebar.selectbox("Navigate Mode", ["User Claim Portal", "Admin Panel Configuration"])
 
 if app_mode == "Admin Panel Configuration":
     auth = st.session_state.get("auth")
-
-    if not auth:
-        render_login()
+    if not auth: render_login()
     else:
         st.sidebar.markdown(f"Signed in as **{auth['name']}**")
         if st.sidebar.button("Sign out"):
             st.session_state.auth = None
             st.session_state.admin_view = "dashboard"
             st.rerun()
-
         if auth["role"] == ROLE_ADMIN:
-            st.title("⚙️ Admin Control Panel")
             view = st.session_state.get("admin_view", "dashboard")
-            if view == "settings":
-                render_settings_page()
-            elif view == "roles":
-                render_roles_page()
-            else:
-                render_claims_dashboard(auth)
-        elif auth["role"] == ROLE_NAZIM:
-            st.title("📋 Nazim e Ala Approvals")
-            render_nazim_dashboard(auth)
-        else:
-            st.title("📋 President Approvals")
-            render_president_dashboard(auth)
-
-# -------------------------------------------------------------------------
-# INTERACTIVE CLAIM FORM LAYOUT PANEL
-# -------------------------------------------------------------------------
+            if view == "settings": render_settings_page()
+            elif view == "roles": render_roles_page()
+            else: render_claims_dashboard(auth)
+        elif auth["role"] == ROLE_NAZIM: render_nazim_dashboard(auth)
+        else: render_president_dashboard(auth)
 else:
     st.title("📋 Online Expense Claim Submission System")
-
     col1, col2 = st.columns(2)
     with col1:
         name = st.text_input("Full Name (Payee Name)")
         claimant_email = st.text_input("Email Address")
         expense_event_desc = st.text_input("Description of Event (Expense Type)")
-
-        configured_regions = st.session_state.admin_lists["regions"]
-        region = st.selectbox("Select Region / National", options=configured_regions)
-
-        majlis_lookup_map = st.session_state.admin_lists["regional_majlis"]
-        available_majlis_options = majlis_lookup_map.get(region, [])
-        if not available_majlis_options:
-            available_majlis_options = ["No entries declared under this region boundary"]
-
-        majlis = st.selectbox("Select your Majlis / Office", options=available_majlis_options)
-
+        region = st.selectbox("Select Region / National", options=st.session_state.admin_lists["regions"])
+        majlis = st.selectbox("Select your Majlis / Office", options=st.session_state.admin_lists["regional_majlis"].get(region, ["No entries declared under this region boundary"]))
         saved_accounts = st.session_state.admin_lists.get("regional_accounts", DEFAULT_CONFIG["regional_accounts"])
-        if region == "National":
-            active_account_choices = saved_accounts.get("National", [])
-        else:
-            active_account_choices = saved_accounts.get("General_Regional", [])
-
-        if not active_account_choices:
-            active_account_choices = ["No configured account lines found for this category"]
-
-        account = st.selectbox("Select Tracking Account Code", options=active_account_choices)
+        account = st.selectbox("Select Tracking Account Code", options=saved_accounts.get("National" if region == "National" else "General_Regional", ["No accounts found"]))
 
     with col2:
-        total_receipts_input = st.number_input("Total Number of Receipts To Claim", min_value=1, max_value=50, value=1, step=1)
+        total_receipts_input = st.number_input("Total Number of Receipts To Claim", min_value=1, max_value=50, value=1)
         declared_total_input = st.number_input("Total Declared Claim Amount ($)", min_value=0.0, format="%.2f")
-
-        st.markdown("**🏦 Direct Reimbursement Bank Segment**")
         bsb = st.text_input("Bank BSB Code (e.g., 000-000)", max_chars=7)
         acc_num = st.text_input("Account Number")
-        st.markdown("**💵 Advance Settlement**")
-        settling_advance = st.radio("Are you settling an advance in this claim?", ["No", "Yes"], horizontal=True)
-        advance_amount = 0.0
-        if settling_advance == "Yes":
-            advance_amount = st.number_input("Advance Amount Being Settled ($)", min_value=0.0, format="%.2f")
+        advance_amount = st.number_input("Advance Amount Being Settled ($)", min_value=0.0, format="%.2f") if st.radio("Are you settling an advance in this claim?", ["No", "Yes"], horizontal=True) == "Yes" else 0.0
 
     st.markdown("---")
     st.subheader("📎 Individual Itemized Receipt Image/PDF Ingestion Block")
@@ -1245,188 +885,78 @@ else:
     for i in range(int(total_receipts_input)):
         st.markdown(f"#### 📄 Receipt Section Item #{i+1}")
         r_col1, r_col2, r_col3, r_col4, r_col5 = st.columns([2.5, 2.5, 2, 1.5, 1.5])
-
-        with r_col1:
-            uploaded_file = st.file_uploader(
-                f"Upload Receipt #{i+1} (Image or PDF)",
-                type=["png", "jpg", "jpeg", "pdf"], key=f"file_{i}"
-            )
-            raw_files_tracker.append(uploaded_file)
-            if uploaded_file is not None:
-                uploaded_files_count += 1
-
-        if uploaded_file is not None:
+        uploaded_file = r_col1.file_uploader(f"Upload Receipt #{i+1}", type=["png", "jpg", "jpeg", "pdf"], key=f"file_{i}")
+        raw_files_tracker.append(uploaded_file)
+        if uploaded_file:
+            uploaded_files_count += 1
             sig = f"{uploaded_file.name}_{uploaded_file.size}"
             if st.session_state.get(f"sig_{i}") != sig:
-                with st.spinner(f"Scanning document #{i+1}..."):
-                    d, t, g, dt, raw = parse_receipt_image_or_pdf(uploaded_file)
-                st.session_state[f"desc_{i}"] = d
-                st.session_state[f"amt_{i}"] = float(t)
-                st.session_state[f"gst_{i}"] = float(g)
-                st.session_state[f"date_{i}"] = dt
-                st.session_state[f"ocr_{i}"] = raw
-                st.session_state[f"sig_{i}"] = sig
+                with st.spinner(f"Scanning document #{i+1}..."): d, t, g, dt, raw = parse_receipt_image_or_pdf(uploaded_file)
+                st.session_state.update({f"desc_{i}": d, f"amt_{i}": float(t), f"gst_{i}": float(g), f"date_{i}": dt, f"ocr_{i}": raw, f"sig_{i}": sig})
 
-        with r_col2:
-            desc_val = st.text_input(f"Item Description #{i+1}", key=f"desc_{i}")
-        with r_col3:
-            date_val = st.text_input(f"Receipt Date (DD/MM/YYYY) #{i+1}", key=f"date_{i}")
-        with r_col4:
-            total_val = st.number_input(f"Amount ($) #{i+1}", min_value=0.0, format="%.2f", key=f"amt_{i}")
-        with r_col5:
-            gst_val = st.number_input(f"GST ($) #{i+1}", min_value=0.0, format="%.2f", key=f"gst_{i}")
-
+        desc_val = r_col2.text_input(f"Item Description #{i+1}", key=f"desc_{i}")
+        date_val = r_col3.text_input(f"Receipt Date #{i+1}", key=f"date_{i}")
+        total_val = r_col4.number_input(f"Amount ($) #{i+1}", min_value=0.0, format="%.2f", key=f"amt_{i}")
+        gst_val = r_col5.number_input(f"GST ($) #{i+1}", min_value=0.0, format="%.2f", key=f"gst_{i}")
         if f"ocr_{i}" in st.session_state:
-            with st.expander(f"Debug: raw OCR text for receipt #{i+1}"):
-                st.text(st.session_state[f"ocr_{i}"])
-
+            with st.expander(f"Debug: raw OCR text #{i+1}"): st.text(st.session_state[f"ocr_{i}"])
         receipt_records.append({"desc": desc_val, "date": date_val, "amount": total_val, "gst": gst_val})
 
     calculated_total_claim = sum(r["amount"] for r in receipt_records)
     calculated_total_gst = sum(r["gst"] for r in receipt_records)
-
     is_amount_matching = abs(calculated_total_claim - declared_total_input) < 0.01
     missing_receipts_delta = int(total_receipts_input) - uploaded_files_count
 
     st.markdown("---")
     st.markdown("### 📊 Dynamic Live Aggregated Verification Totals")
-
     sum_col1, sum_col2 = st.columns(2)
-    with sum_col1:
-        st.metric(label="Total Aggregated Claim Amount (Calculated)", value=f"${calculated_total_claim:,.2f}")
-    with sum_col2:
-        st.metric(label="Total Aggregated GST Amount (Calculated)", value=f"${calculated_total_gst:,.2f}")
+    sum_col1.metric(label="Calculated Claim Amount", value=f"${calculated_total_claim:,.2f}")
+    sum_col2.metric(label="Calculated GST Amount", value=f"${calculated_total_gst:,.2f}")
 
     st.markdown("---")
     st.markdown("### 🛡️ System Submission Safety Validation Checks")
-
     block_submission = False
-
     if not is_amount_matching:
-        st.error(f"❌ Total Doesn't Match: The sum of your individual row entries (${calculated_total_claim:.2f}) does not match your typed Total Declared Claim Amount (${declared_total_input:.2f}). Please review row values.")
+        st.error("❌ Row totals do not match typed amount configuration values.")
         block_submission = True
-    else:
-        st.success("✅ Financial balance validation passed: Claim amounts are matching.")
-
-    if missing_receipts_delta > 0:
-        st.warning(f"⚠️ {missing_receipts_delta} Receipt Outstanding: You have stated a total count of {total_receipts_input} receipts, but uploaded only {uploaded_files_count} file assets. Please upload remaining attachments.")
+    if missing_receipts_delta != 0:
+        st.error("❌ Stated receipt count structural asset discrepancy detected.")
         block_submission = True
-    elif missing_receipts_delta < 0:
-        st.error(f"❌ Attachment Overflow: You have uploaded {uploaded_files_count} assets, which exceeds your stated limit configuration count allocation of {total_receipts_input}.")
-        block_submission = True
-    else:
-        st.success("✅ Attachment verification passed: All structural files accounted for.")
-
     if advance_amount > calculated_total_claim:
-        st.error(f"❌ Advance Too High: The advance being settled (${advance_amount:.2f}) is more than the total claim (${calculated_total_claim:.2f}).")
+        st.error("❌ Settlement variance anomaly: Advance exceeds resource value limit totals.")
         block_submission = True
 
-    st.markdown("---")
-
-    if block_submission:
-        st.button("Submit", type="primary", disabled=True, help="Please resolve all structural error/warning notifications above to unlock the submit pipeline.")
+    if block_submission: st.button("Submit", type="primary", disabled=True)
     else:
         if st.button("Finalize and Submit Expense Claims Bundle", type="primary"):
-            if not name or not bsb or not acc_num or not claimant_email or not expense_event_desc:
-                st.error("Submission Denied: Profile details, Event Description, Claimant Email, BSB, and Account Numbers must be filled out completely.")
+            if not name or not bsb or not acc_num or not claimant_email or not expense_event_desc: st.error("Profile parameters incomplete.")
             else:
                 nazim_info = st.session_state.admin_lists.get("regional_nazims", {}).get(region, {"name": "Not Configured", "email": ""})
-
-                payload = {
-                    "name": name,
-                    "region": region,
-                    "majlis": majlis,
-                    "account": account,
-                    "expense_type": expense_event_desc,
-                    "total_receipts": len(receipt_records),
-                    "total_amount": calculated_total_claim,
-                    "total_gst": calculated_total_gst,
-                    "bsb": bsb,
-                    "acc_num": acc_num,
-                    "advance": advance_amount,
-                    "qaid_mal": st.session_state.admin_lists.get("qaid_mal_name", "Tahir Mahmood Rana"),
-                    "sadr_maa": st.session_state.admin_lists.get("sadr_maa_name", "Abdul Jamil Mubbashar"),
-                    "nazim_name": nazim_info.get("name", "Not Configured")
-                }
-
+                payload = {"name": name, "region": region, "majlis": majlis, "account": account, "expense_type": expense_event_desc, "total_receipts": len(receipt_records), "total_amount": calculated_total_claim, "total_gst": calculated_total_gst, "bsb": bsb, "acc_num": acc_num, "advance": advance_amount, "qaid_mal": st.session_state.admin_lists.get("qaid_mal_name", "Tahir Mahmood Rana"), "sadr_maa": st.session_state.admin_lists.get("sadr_maa_name", "Abdul Jamil Mubbashar"), "nazim_name": nazim_info.get("name", "Not Configured")}
                 stamp = now_local().strftime("%Y%m%d_%H%M%S")
-                safe_name = re.sub(r"[^A-Za-z0-9_-]", "", name.replace(" ", "_")) or "Claimant"
-                output_filename = f"Expense_Voucher_{safe_name}_{stamp}.pdf"
+                output_filename = f"Expense_Voucher_{re.sub(r'[^A-Za-z0-9_-]', '', name.replace(' ', '_')) or 'Claimant'}_{stamp}.pdf"
                 generate_official_voucher_pdf(output_filename, payload, receipt_records)
+                if not stitch_files_to_pdf(output_filename, raw_files_tracker): st.stop()
 
-                with st.spinner("Stitching receipts into the claim PDF..."):
-                    stitched_ok = stitch_files_to_pdf(output_filename, raw_files_tracker)
-
-                if not stitched_ok:
-                    st.stop()
-
-                with open(output_filename, "rb") as f:
-                    pdf_bytes = f.read()
+                with open(output_filename, "rb") as f: pdf_bytes = f.read()
                 os.remove(output_filename)
-
                 saved_to_drive = False
                 drive_error = ""
-                with st.spinner("Saving your claim..."):
-                    try:
-                        service = get_drive_service()
-                        folder_id = get_drive_folder_id()
-                        if service is None or not folder_id:
-                            raise RuntimeError("Google Drive storage has not been set up by the administrator yet.")
-
-                        file_id, file_link = upload_pdf_to_drive(service, folder_id, output_filename, pdf_bytes)
-                        record = {
-                            "id": uuid.uuid4().hex[:10],
-                            "submitted_on": now_local().strftime('%d/%m/%Y'),
-                            "submitted_ts": now_local().isoformat(),
-                            "name": name,
-                            "event": expense_event_desc,
-                            "region": region,
-                            "majlis": majlis,
-                            "total_claim": round(calculated_total_claim, 2),
-                            "gst": round(calculated_total_gst, 2),
-                            "advance": round(advance_amount, 2),
-                            "amount_payable": round(calculated_total_claim - advance_amount, 2),
-                            "file_name": output_filename,
-                            "file_id": file_id,
-                            "file_link": file_link,
-                            "voucher_no": "",
-                            # Approval workflow: Nazim e Ala -> Admin -> President.
-                            # Regions with no Nazim e Ala login go straight to the Admin.
-                            "nazim_status": STATUS_PENDING if region_has_nazim_login(region) else STATUS_BYPASSED,
-                            "nazim_by": "" if region_has_nazim_login(region) else "Auto",
-                            "admin_status": STATUS_PENDING,
-                            "president_status": STATUS_PENDING
-                        }
-                        add_claim_to_register(service, folder_id, record)
-                        saved_to_drive = True
-                    except Exception as e:
-                        drive_error = str(e)
-                        if "storage quota" in drive_error.lower() or "storagequota" in drive_error.lower():
-                            drive_error += " (Google does not allow a service account to save files here. The administrator needs to connect Drive with their own Google account.)"
-
-                st.session_state.last_submission = {
-                    "saved": saved_to_drive,
-                    "error": drive_error,
-                    "filename": output_filename,
-                    "pdf_bytes": pdf_bytes,
-                }
-                if saved_to_drive:
-                    st.balloons()
+                try:
+                    service = get_drive_service()
+                    folder_id = get_drive_folder_id()
+                    if service is None or not folder_id: raise RuntimeError("Google Drive pipeline parameters missing.")
+                    file_id, file_link = upload_pdf_to_drive(service, folder_id, output_filename, pdf_bytes)
+                    record = {"id": uuid.uuid4().hex[:10], "submitted_on": now_local().strftime('%d/%m/%Y'), "submitted_ts": now_local().isoformat(), "name": name, "event": expense_event_desc, "region": region, "majlis": majlis, "total_claim": round(calculated_total_claim, 2), "gst": round(calculated_total_gst, 2), "advance": round(advance_amount, 2), "amount_payable": round(calculated_total_claim - advance_amount, 2), "file_name": output_filename, "file_id": file_id, "file_link": file_link, "voucher_no": "", "nazim_status": STATUS_PENDING if region_has_nazim_login(region) else STATUS_BYPASSED, "nazim_by": "" if region_has_nazim_login(region) else "Auto", "admin_status": STATUS_PENDING, "president_status": STATUS_PENDING}
+                    add_claim_to_register(service, folder_id, record)
+                    saved_to_drive = True
+                except Exception as e: drive_error = str(e)
+                st.session_state.last_submission = {"saved": saved_to_drive, "error": drive_error, "filename": output_filename, "pdf_bytes": pdf_bytes}
+                if saved_to_drive: st.balloons()
 
     last_submission = st.session_state.get("last_submission")
     if last_submission:
         st.markdown("---")
-        if last_submission["saved"]:
-            st.success("🎉 Your claim has been submitted and saved. You can download a copy below for your records.")
-        else:
-            st.error(
-                "Your claim PDF was created, but it could NOT be saved for the administrator. "
-                "Please download it below and send it to them directly. "
-                f"Details: {last_submission['error']}"
-            )
-        st.download_button(
-            label="📥 Download Official Summary Voucher PDF File",
-            data=last_submission["pdf_bytes"],
-            file_name=last_submission["filename"],
-            mime="application/pdf"
-        )
+        if last_submission["saved"]: st.success("🎉 Your claim has been submitted and saved.")
+        else: st.error(f"Could not save to Drive. Download copy manually. Details: {last_submission['error']}")
+        st.download_button(label="📥 Download Official Summary Voucher PDF File", data=last_submission["pdf_bytes"], file_name=last_submission["filename"], mime="application/pdf")
