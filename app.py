@@ -223,14 +223,82 @@ def add_claim_to_register(service, folder_id, record):
     save_register(service, folder_id, claims, fid)
 
 
-def set_claim_status(service, folder_id, claim_id, new_status):
+def stamp_voucher_number(pdf_bytes, voucher_no):
+    """Writes the voucher number into the 'Voucher No:' cell on page 1 of the claim PDF.
+    Any number stamped earlier is covered first, so the number can be changed later."""
+    reader = PdfReader(io.BytesIO(pdf_bytes))
+    first_page = reader.pages[0]
+
+    found = {}
+
+    def visitor(text, cm, tm, font_dict, font_size):
+        if "Voucher No" in text and "pos" not in found:
+            x = tm[4] * cm[0] + tm[5] * cm[2] + cm[4]
+            y = tm[4] * cm[1] + tm[5] * cm[3] + cm[5]
+            found["pos"] = (x, y)
+
+    first_page.extract_text(visitor_text=visitor)
+    if "pos" not in found:
+        raise RuntimeError("Could not find the 'Voucher No:' box on the PDF.")
+
+    label_x, base_y = found["pos"]
+    cell_left = label_x - 5 + 100          # label cell is 100pt wide, 5pt padding
+    page_w = float(first_page.mediabox.width)
+    page_h = float(first_page.mediabox.height)
+
+    buf = io.BytesIO()
+    c = canvas.Canvas(buf, pagesize=(page_w, page_h))
+    c.setFillColor(colors.white)
+    c.setStrokeColor(colors.white)
+    c.rect(cell_left + 2.5, base_y - 6.5, 170 - 5, 18, stroke=0, fill=1)
+    if voucher_no:
+        c.setFillColor(colors.black)
+        c.setFont("Helvetica-Bold", 10)
+        c.drawString(cell_left + 5, base_y - 1.5, voucher_no)
+    c.showPage()
+    c.save()
+    buf.seek(0)
+
+    first_page.merge_page(PdfReader(buf).pages[0])
+
+    writer = PdfWriter()
+    for page in reader.pages:
+        writer.add_page(page)
+    out = io.BytesIO()
+    writer.write(out)
+    return out.getvalue()
+
+
+def update_pdf_in_drive(service, file_id, pdf_bytes):
+    media = MediaIoBaseUpload(io.BytesIO(pdf_bytes), mimetype="application/pdf", resumable=False)
+    service.files().update(fileId=file_id, media_body=media, supportsAllDrives=True).execute()
+
+
+def set_claim_status(service, folder_id, claim_id, new_status=None, voucher_no=None):
+    """Changes a claim's status and/or voucher number.
+    The voucher number is also stamped onto the PDF in Drive. Returns a warning message or ''."""
     claims, fid = load_register(service, folder_id)
+    warning = ""
     for c in claims:
-        if c["id"] == claim_id:
+        if c["id"] != claim_id:
+            continue
+
+        if voucher_no is not None:
+            new_no = voucher_no.strip()[:30]
+            if new_no != c.get("voucher_no", ""):
+                try:
+                    pdf_bytes = service.files().get_media(fileId=c["file_id"], supportsAllDrives=True).execute()
+                    update_pdf_in_drive(service, c["file_id"], stamp_voucher_number(pdf_bytes, new_no))
+                    c["voucher_no"] = new_no
+                except Exception as e:
+                    warning = f"The voucher number could not be written onto the PDF in Drive ({e})."
+
+        if new_status:
             c["status"] = new_status
             c["decided_on"] = now_local().strftime('%d/%m/%Y') if new_status in (STATUS_APPROVED, STATUS_REJECTED) else ""
-            break
+        break
     save_register(service, folder_id, claims, fid)
+    return warning
 
 # -------------------------------------------------------------------------
 # OCR ENGINE FOR IMAGE & PDF RECEIPTS
@@ -380,7 +448,8 @@ def generate_official_voucher_pdf(filename, data, receipts):
         ('VALIGN', (0, 0), (-1, -1), 'MIDDLE'),
         ('PADDING', (0, 0), (-1, -1), 4),
         ('BACKGROUND', (0, 0), (-1, 0), colors.lightgrey),
-        ('ALIGN', (3, 1), (-1, -1), 'RIGHT')
+        ('ALIGN', (3, 1), (-1, -1), 'RIGHT'),
+        ('SPAN', (0, -1), (2, -1))
     ]))
     story.append(t_receipts)
     story.append(Spacer(1, 15))
@@ -479,8 +548,8 @@ def stitch_files_to_pdf(voucher_pdf_path, uploaded_files_list):
 # -------------------------------------------------------------------------
 # ADMIN: CLAIMS DASHBOARD
 # -------------------------------------------------------------------------
-DASH_HEADERS = ["Claimant", "Date", "Event", "Total Claim", "GST", "Advance Adj.", "Amount To Pay", "File", "Action"]
-DASH_WIDTHS = [1.5, 1.0, 1.6, 1.0, 0.8, 1.0, 1.1, 0.8, 2.6]
+DASH_HEADERS = ["Claimant", "Date", "Event", "Total Claim", "GST", "Advance Adj.", "Amount To Pay", "Voucher No.", "File"]
+DASH_WIDTHS = [1.5, 1.0, 1.7, 1.0, 0.8, 1.0, 1.1, 1.2, 0.9]
 
 
 def _cell(col, text):
@@ -507,23 +576,40 @@ def render_claim_rows(service, folder_id, claims_subset, actions):
         advance = c.get("advance", 0)
         _cell(cols[5], f"-${advance:,.2f}" if advance > 0 else "-")
         _cell(cols[6], f"**${c.get('amount_payable', 0):,.2f}**")
-        cols[7].markdown(f"[Open PDF]({c.get('file_link', '')})")
+        _cell(cols[7], f"**{c['voucher_no']}**" if c.get("voucher_no") else "-")
+        cols[8].markdown(f"[Open PDF]({c.get('file_link', '')})")
 
-        with cols[8]:
-            btn_cols = st.columns(len(actions))
-            for b_col, (label, new_status) in zip(btn_cols, actions):
-                if b_col.button(label, key=f"{c['status']}_{new_status}_{c['id']}", use_container_width=True):
-                    try:
-                        set_claim_status(service, folder_id, c["id"], new_status)
-                    except Exception as e:
-                        st.error(f"Could not update claim: {e}")
-                    else:
-                        st.rerun()
+        # Second line: voucher number box + action buttons
+        key_base = f"{c['status']}_{c['id']}"
+        row_cols = st.columns([2.2, 1.2] + [1.2] * len(actions) + [4.0 - 1.2 * len(actions)])
+        voucher_input = row_cols[0].text_input(
+            "Voucher No.", value=c.get("voucher_no", ""), max_chars=30,
+            key=f"vno_{key_base}", placeholder="Enter Voucher No.", label_visibility="collapsed"
+        )
+
+        def _apply(new_status=None):
+            try:
+                warning = set_claim_status(service, folder_id, c["id"], new_status, voucher_no=voucher_input)
+            except Exception as e:
+                st.error(f"Could not update claim: {e}")
+                return
+            if warning:
+                st.session_state["dash_warning"] = warning
+            st.rerun()
+
+        if row_cols[1].button("Save No.", key=f"saveno_{key_base}", use_container_width=True):
+            _apply(None)
+        for b_col, (label, new_status) in zip(row_cols[2:2 + len(actions)], actions):
+            if b_col.button(label, key=f"{key_base}_{new_status}", use_container_width=True):
+                _apply(new_status)
         st.divider()
 
 
 def render_claims_dashboard():
     st.markdown("### 📊 Claims Dashboard")
+    pending_warning = st.session_state.pop("dash_warning", None)
+    if pending_warning:
+        st.warning(f"Saved, but: {pending_warning} Use the Open PDF link to check the file in Drive.")
     top_a, top_b, _ = st.columns([1, 1, 6])
     if top_a.button("⚙️ Settings", use_container_width=True):
         st.session_state.admin_view = "settings"
@@ -923,6 +1009,7 @@ else:
                             "file_id": file_id,
                             "file_link": file_link,
                             "status": STATUS_PENDING,
+                            "voucher_no": "",
                             "decided_on": ""
                         }
                         add_claim_to_register(service, folder_id, record)
