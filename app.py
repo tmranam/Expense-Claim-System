@@ -400,9 +400,30 @@ def actions_for(role, c):
     return []
 
 
+def _log(claim, actor, text):
+    """Adds one line to the claim's history."""
+    claim.setdefault("history", []).append(
+        {"when": now_local().strftime('%d/%m/%Y %H:%M'), "by": actor, "what": text}
+    )
+
+
+def _change_text(field, value):
+    if field == "paid":
+        return "Marked as paid" if value else "Payment mark removed (back to Approved)"
+    who = {"nazim_status": "Nazim e Ala", "admin_status": "Admin", "president_status": "President"}.get(field, field)
+    if value == STATUS_BYPASSED:
+        return "Nazim e Ala stage skipped"
+    if value == STATUS_PENDING:
+        return f"{who} decision reopened"
+    if field == "admin_status" and value == STATUS_APPROVED:
+        return "Approved by Admin and sent to President"
+    return f"{value} by {who}"
+
+
 def update_claim(service, folder_id, claim_id, role, actor, changes=None, voucher_no=None, region=None):
     """Applies a status change and/or a voucher number to one claim, after checking the role is allowed.
-    changes = {"nazim_status": "Approved"} etc. Returns a warning message ('' if all fine)."""
+    changes = {"nazim_status": "Approved"} etc. Every change is written to the claim's history.
+    Returns a warning message ('' if all fine)."""
     changes = changes or {}
     claims, fid = load_register(service, folder_id)
     claim = next((c for c in claims if c["id"] == claim_id), None)
@@ -412,12 +433,18 @@ def update_claim(service, folder_id, claim_id, role, actor, changes=None, vouche
     allowed_fields = {
         ROLE_NAZIM: {"nazim_status"},
         ROLE_PRESIDENT: {"president_status"},
-        ROLE_ADMIN: {"nazim_status", "admin_status", "president_status"},
+        ROLE_ADMIN: {"nazim_status", "admin_status", "president_status", "paid"},
     }.get(role, set())
 
     for field, value in changes.items():
         if field not in allowed_fields:
             raise PermissionError("You are not allowed to make that change.")
+        if field == "paid":
+            if value and claim_stage(claim)[0] != "approved":
+                raise PermissionError("Only approved claims can be marked as paid. Please refresh.")
+            if not value and not claim.get("paid"):
+                raise PermissionError("This claim is not marked as paid. Please refresh.")
+            continue
         if role != ROLE_ADMIN and value not in (STATUS_APPROVED, STATUS_REJECTED, STATUS_HOLD):
             raise PermissionError("You are not allowed to make that change.")
         # Make sure the claim is still waiting on this person (the page may be out of date)
@@ -430,24 +457,53 @@ def update_claim(service, folder_id, claim_id, role, actor, changes=None, vouche
 
     today = now_local().strftime('%d/%m/%Y')
     for field, value in changes.items():
-        stage = field.replace("_status", "")
-        claim[field] = value
-        claim[f"{stage}_by"] = actor if value != STATUS_PENDING else ""
-        claim[f"{stage}_on"] = today if value != STATUS_PENDING else ""
+        if field == "paid":
+            claim["paid"] = bool(value)
+            claim["paid_by"] = actor if value else ""
+            claim["paid_on"] = today if value else ""
+        else:
+            stage = field.replace("_status", "")
+            claim[field] = value
+            claim[f"{stage}_by"] = actor if value != STATUS_PENDING else ""
+            claim[f"{stage}_on"] = today if value != STATUS_PENDING else ""
+        _log(claim, actor, _change_text(field, value))
 
     warning = ""
     if voucher_no is not None and role == ROLE_ADMIN:
         new_no = voucher_no.strip()[:20]
-        if new_no != claim.get("voucher_no", ""):
+        old_no = claim.get("voucher_no", "")
+        if new_no != old_no:
             try:
                 pdf_bytes = service.files().get_media(fileId=claim["file_id"], supportsAllDrives=True).execute()
                 update_pdf_in_drive(service, claim["file_id"], stamp_voucher_number(pdf_bytes, new_no))
                 claim["voucher_no"] = new_no
+                if not old_no:
+                    _log(claim, actor, f"Voucher No. set to {new_no}")
+                elif not new_no:
+                    _log(claim, actor, f"Voucher No. {old_no} removed")
+                else:
+                    _log(claim, actor, f"Voucher No. changed from {old_no} to {new_no}")
             except Exception as e:
                 warning = f"The voucher number could not be written onto the PDF in Drive ({e})."
 
     save_register(service, folder_id, claims, fid)
     return warning
+
+
+def delete_claim(service, folder_id, claim_id, role):
+    """Admin only. Moves the claim's PDF to the Google Drive Trash and removes the claim from the register."""
+    if role != ROLE_ADMIN:
+        raise PermissionError("Only the Admin can delete claims.")
+    claims, fid = load_register(service, folder_id)
+    claim = next((c for c in claims if c["id"] == claim_id), None)
+    if claim is None:
+        raise ValueError("That claim was not found. Please refresh the page.")
+    try:
+        service.files().update(fileId=claim["file_id"], body={"trashed": True}, supportsAllDrives=True).execute()
+    except HttpError as e:
+        if getattr(e.resp, "status", None) != 404:      # 404 = the file is already gone, carry on
+            raise
+    save_register(service, folder_id, [c for c in claims if c["id"] != claim_id], fid)
 
 
 # -------------------------------------------------------------------------
@@ -760,9 +816,19 @@ def _cell(col, text):
     col.markdown(str(text).replace("$", "\\$"))
 
 
-def render_claim_rows(service, folder_id, claims_subset, auth, tab_key):
-    """Draws the table for one tab. The buttons each role sees come from actions_for();
-    only the Admin gets the Voucher No. box."""
+def _history_lines(c):
+    events = c.get("history") or []
+    if not events:
+        return [
+            f"- {c.get('submitted_on', '')} — Claim submitted",
+            "- _No detailed history was recorded for this claim because it was submitted before history logging was added._",
+        ]
+    return [f"- **{e.get('when', '')}** — {e.get('by', '')}: {e.get('what', '')}" for e in events]
+
+
+def render_claim_rows(service, folder_id, claims_subset, auth, tab_key, newest_first=False, show_history=False):
+    """Draws the table for one tab, oldest claim first (newest first when newest_first is set).
+    The buttons each role sees come from actions_for(); only the Admin gets the Voucher No. box and Delete."""
     if not claims_subset:
         st.info("No claims in this tab.")
         return
@@ -775,7 +841,7 @@ def render_claim_rows(service, folder_id, claims_subset, auth, tab_key):
         col.markdown(f"**{label}**")
     st.divider()
 
-    for c in sorted(claims_subset, key=lambda x: x.get("submitted_ts", ""), reverse=True):
+    for c in sorted(claims_subset, key=lambda x: x.get("submitted_ts", ""), reverse=newest_first):
         _, status_text = claim_stage(c)
         cols = st.columns(DASH_WIDTHS)
         _cell(cols[0], f"**{c.get('name', '')}**  \n:gray[{c.get('region', '')}]")
@@ -807,22 +873,46 @@ def render_claim_rows(service, folder_id, claims_subset, auth, tab_key):
             st.rerun()
 
         if role == ROLE_ADMIN:
-            row_cols = st.columns([2.2, 1.2] + [1.4] * len(actions) + [max(0.3, 5.0 - 1.4 * len(actions))])
+            n = len(actions)
+            row_cols = st.columns([2.2, 1.2] + [1.4] * n + [max(0.3, 4.0 - 1.4 * n), 1.3])
             voucher_input = row_cols[0].text_input(
                 "Voucher No.", value=c.get("voucher_no", ""), max_chars=20,
                 key=f"vno_{key_base}", placeholder="Enter Voucher No.", label_visibility="collapsed"
             )
             if row_cols[1].button("Save No.", key=f"saveno_{key_base}", use_container_width=True):
                 _apply({}, voucher_input)
-            button_cols = row_cols[2:2 + len(actions)]
-            for b_col, (label, field, value) in zip(button_cols, actions):
+            for b_col, (label, field, value) in zip(row_cols[2:2 + n], actions):
                 if b_col.button(label, key=f"{key_base}_{field}_{value}", use_container_width=True):
                     _apply({field: value}, voucher_input)
+            if row_cols[-1].button("🗑 Delete", key=f"del_{key_base}", use_container_width=True):
+                st.session_state[f"confirm_del_{c['id']}"] = True
+
+            if st.session_state.get(f"confirm_del_{c['id']}"):
+                st.warning(
+                    f"Delete the claim from **{c.get('name', '')}** ({c.get('event', '')})? "
+                    "Its PDF will be moved to the Google Drive Trash and the claim removed from every screen."
+                )
+                yes_col, no_col, _ = st.columns([1.3, 1, 6])
+                if yes_col.button("Yes, delete", key=f"delyes_{key_base}", type="primary"):
+                    try:
+                        delete_claim(service, folder_id, c["id"], role)
+                    except Exception as e:
+                        st.error(f"Could not delete the claim: {e}")
+                    else:
+                        st.session_state.pop(f"confirm_del_{c['id']}", None)
+                        st.rerun()
+                if no_col.button("Cancel", key=f"delno_{key_base}"):
+                    st.session_state.pop(f"confirm_del_{c['id']}", None)
+                    st.rerun()
         elif actions:
             row_cols = st.columns([1.4] * len(actions) + [max(0.3, 8.0 - 1.4 * len(actions))])
             for b_col, (label, field, value) in zip(row_cols, actions):
                 if b_col.button(label, key=f"{key_base}_{field}_{value}", use_container_width=True):
                     _apply({field: value})
+
+        if show_history:
+            with st.expander("📜 History"):
+                st.markdown("\n".join(_history_lines(c)).replace("$", "\\$"))
         st.divider()
 
 
@@ -855,12 +945,14 @@ def load_dashboard_data(role):
 
 
 def render_tabs(service, folder_id, claims, auth, tab_specs, role_key):
-    """tab_specs = [(label, predicate)] - each tab shows the claims its predicate accepts."""
-    subsets = [[c for c in claims if pred(c)] for _, pred in tab_specs]
-    tabs = st.tabs([f"{label} ({len(sub)})" for (label, _), sub in zip(tab_specs, subsets)])
-    for tab, (label, _), sub in zip(tabs, tab_specs, subsets):
+    """tab_specs = [(label, predicate)] or [(label, predicate, options)].
+    Each tab shows the claims its predicate accepts; options are passed to render_claim_rows."""
+    specs = [(s[0], s[1], s[2] if len(s) > 2 else {}) for s in tab_specs]
+    subsets = [[c for c in claims if pred(c)] for _, pred, _ in specs]
+    tabs = st.tabs([f"{label} ({len(sub)})" for (label, _, _), sub in zip(specs, subsets)])
+    for tab, (label, _, opts), sub in zip(tabs, specs, subsets):
         with tab:
-            render_claim_rows(service, folder_id, sub, auth, f"{role_key}_{label}")
+            render_claim_rows(service, folder_id, sub, auth, f"{role_key}_{label}", **opts)
 
 
 def _stage_is(*keys):
@@ -891,6 +983,7 @@ def render_claims_dashboard(auth):
         ("On Hold", _stage_is("hold")),
         ("Waiting President", _stage_is("await_president")),
         ("Approved", _stage_is("approved")),
+        ("Paid", _stage_is("paid"), {"newest_first": True, "show_history": True}),
         ("Rejected", _stage_is("rejected")),
     ], "admin")
 
@@ -908,12 +1001,12 @@ def render_nazim_dashboard(auth):
     service, folder_id, claims = data
     mine = [c for c in claims if c.get("region") == region]
 
-    in_progress = lambda c: _stage_done(c["nazim_status"]) and claim_stage(c)[0] not in ("approved", "rejected")
+    in_progress = lambda c: _stage_done(c["nazim_status"]) and claim_stage(c)[0] not in ("approved", "paid", "rejected")
     render_tabs(service, folder_id, mine, auth, [
         ("To Review", _stage_is("await_nazim")),
         ("On Hold", lambda c: c["nazim_status"] == STATUS_HOLD),
         ("In Progress", in_progress),
-        ("Approved", _stage_is("approved")),
+        ("Approved", _stage_is("approved", "paid")),
         ("Rejected", _stage_is("rejected")),
     ], "nazim")
 
@@ -933,7 +1026,7 @@ def render_president_dashboard(auth):
     render_tabs(service, folder_id, visible, auth, [
         ("To Approve", _stage_is("await_president")),
         ("On Hold", lambda c: c["president_status"] == STATUS_HOLD),
-        ("Approved", _stage_is("approved")),
+        ("Approved", _stage_is("approved", "paid")),
         ("Rejected", lambda c: c["president_status"] == STATUS_REJECTED),
     ], "president")
 
@@ -1395,7 +1488,15 @@ else:
                             "nazim_status": STATUS_PENDING if region_has_nazim_login(region) else STATUS_BYPASSED,
                             "nazim_by": "" if region_has_nazim_login(region) else "Auto",
                             "admin_status": STATUS_PENDING,
-                            "president_status": STATUS_PENDING
+                            "president_status": STATUS_PENDING,
+                            "paid": False,
+                            "history": [{
+                                "when": now_local().strftime('%d/%m/%Y %H:%M'),
+                                "by": name,
+                                "what": "Claim submitted" + (
+                                    "" if region_has_nazim_login(region)
+                                    else f" (no Nazim e Ala login for {region}, sent straight to Admin)")
+                            }]
                         }
                         add_claim_to_register(service, folder_id, record)
                         saved_to_drive = True
