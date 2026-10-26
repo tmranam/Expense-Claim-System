@@ -1839,17 +1839,23 @@ def render_settings_page():
 
     st.markdown("---")
     st.markdown("#### 🗺️ Regional Majlis & Nazim e Ala Configuration Matrix")
-    selected_admin_region = st.selectbox("Select a region to configure details", options=parsed_regions_list)
+    selected_admin_region = st.selectbox("Select a region to configure details", options=parsed_regions_list, key="cfg_region_pick")
+
+    with st.expander("👀 Majlis currently saved for every region"):
+        for r_name in parsed_regions_list:
+            saved_list = st.session_state.admin_lists.get("regional_majlis", {}).get(r_name, [])
+            st.markdown(f"**{_md_escape(r_name)}**: " + (", ".join(_md_escape(x) for x in saved_list) if saved_list else "_none saved_"))
 
     current_map = st.session_state.admin_lists.get("regional_majlis", {})
     existing_majlis_for_region = current_map.get(selected_admin_region, [])
-    majlis_text = st.text_area(f"Enter Majlis names for '{selected_admin_region}' (One entry per line)", value="\n".join(existing_majlis_for_region), height=100)
+    majlis_text = st.text_area(f"Enter Majlis names for '{selected_admin_region}' (One entry per line)", value="\n".join(existing_majlis_for_region), height=100,
+                             key=f"cfg_majlis_{selected_admin_region}")
     parsed_majlis_list = [line.strip() for line in majlis_text.split("\n") if line.strip()]
 
     current_nazims = st.session_state.admin_lists.get("regional_nazims", {})
     region_nazim_data = current_nazims.get(selected_admin_region, {"name": "", "email": ""})
-    nazim_name_input = st.text_input(f"Nazim e Ala Name for '{selected_admin_region}'", value=region_nazim_data.get("name", ""))
-    nazim_email_input = st.text_input(f"Nazim e Ala Email Address for '{selected_admin_region}'", value=region_nazim_data.get("email", ""))
+    nazim_name_input = st.text_input(f"Nazim e Ala Name for '{selected_admin_region}'", value=region_nazim_data.get("name", ""), key=f"cfg_nz_name_{selected_admin_region}")
+    nazim_email_input = st.text_input(f"Nazim e Ala Email Address for '{selected_admin_region}'", value=region_nazim_data.get("email", ""), key=f"cfg_nz_email_{selected_admin_region}")
 
     st.markdown("---")
     st.markdown("#### 🔐 Outbound live SMTP Server Credentials Gateway")
