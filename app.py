@@ -824,9 +824,47 @@ def _ocr_image(img):
     return pytesseract.image_to_string(gray, config="--psm 6")
 
 
-def extract_page_texts(data, ext, progress=None):
+def _page_images(page):
+    """Pictures embedded in a PDF page (a scanned page is normally one big picture). Needs no extra programs."""
+    out = []
+    try:
+        for im in page.images:
+            out.append(im.image)
+    except Exception:
+        pass
+    return out
+
+
+def _ocr_pdf_page(data, page, idx):
+    """OCR for a PDF page with no text layer. Tries the picture inside the page first, then rendering the page.
+    Returns (text, problem) where problem explains a failure (or '')."""
+    problem = ""
+    for img in sorted(_page_images(page), key=lambda i: i.size[0] * i.size[1], reverse=True)[:1]:
+        try:
+            img = ImageOps.exif_transpose(img)
+            img.thumbnail((2400, 2400))
+            return _ocr_image(img), ""
+        except pytesseract.TesseractNotFoundError:
+            return "", "the text-recognition program (Tesseract) is not installed on the server"
+        except Exception as e:
+            problem = str(e)
+    try:
+        imgs = convert_from_bytes(data, dpi=200, first_page=idx + 1, last_page=idx + 1)
+        if imgs:
+            return _ocr_image(imgs[0]), ""
+    except pytesseract.TesseractNotFoundError:
+        return "", "the text-recognition program (Tesseract) is not installed on the server"
+    except Exception as e:
+        problem = problem or f"could not turn the page into a picture ({str(e)[:80]}); the server may be missing poppler-utils"
+    return "", problem or "no readable text or picture found on the page"
+
+
+def extract_page_texts(data, ext, progress=None, errors=None):
     """Text of each receipt: one entry for an image, one entry per page for a PDF.
-    Text-based PDFs are read directly, scanned pages are read with OCR. Returns (texts, total_pages)."""
+    Text-based PDFs are read directly, scanned pages are read with OCR. Returns (texts, total_pages).
+    Pages that could not be read are described in `errors` (a list) when one is given."""
+    if errors is None:
+        errors = []
     if ext == ".pdf":
         reader = PdfReader(io.BytesIO(data))
         total = len(reader.pages)
@@ -838,11 +876,9 @@ def extract_page_texts(data, ext, progress=None):
             except Exception:
                 txt = ""
             if len(txt.strip()) < 15:      # no real text layer: a scanned page, read it with OCR
-                try:
-                    imgs = convert_from_bytes(data, dpi=200, first_page=idx + 1, last_page=idx + 1)
-                    txt = _ocr_image(imgs[0]) if imgs else ""
-                except Exception:
-                    txt = ""
+                txt, problem = _ocr_pdf_page(data, page, idx)
+                if len(txt.strip()) < 15:
+                    errors.append(f"Page {idx + 1}: {problem or 'almost no text could be read'}")
             texts.append(txt)
             if progress:
                 progress(idx + 1, limit)
@@ -850,7 +886,12 @@ def extract_page_texts(data, ext, progress=None):
     image = Image.open(io.BytesIO(data))
     image = ImageOps.exif_transpose(image)
     image.thumbnail((2000, 2000))
-    return [_ocr_image(image)], 1
+    try:
+        text = _ocr_image(image)
+    except pytesseract.TesseractNotFoundError:
+        errors.append("the text-recognition program (Tesseract) is not installed on the server")
+        text = ""
+    return [text], 1
 
 
 def _amounts_in(line):
@@ -1010,7 +1051,8 @@ def analyse_upload(name, data, split_pages, progress=None):
     """Reads an uploaded receipt file. A PDF with several pages is split into one receipt per page when
     split_pages is true. Returns {"pages": n, "read_pages": n, "items": [receipt dicts]}."""
     ext = os.path.splitext(name)[1].lower()
-    texts, total_pages = extract_page_texts(data, ext, progress)
+    problems = []
+    texts, total_pages = extract_page_texts(data, ext, progress, problems)
     file_hash = hashlib.sha256(data).hexdigest()[:20]
     items = []
     if ext == ".pdf" and split_pages and len(texts) > 1:
@@ -1022,7 +1064,7 @@ def analyse_upload(name, data, split_pages, progress=None):
     else:
         full = "\n".join(texts)
         items.append({**parse_receipt_text(full), "exact": file_hash, "sig": text_signature(full), "text": full})
-    return {"pages": total_pages, "read_pages": len(texts), "items": items}
+    return {"pages": total_pages, "read_pages": len(texts), "items": items, "problems": problems}
 
 
 # -------------------------------------------------------------------------
@@ -1170,9 +1212,10 @@ def _image_to_pdf_buffer(u_file, label):
     return buf
 
 
-def stitch_files_to_pdf(voucher_pdf_path, uploaded_files_list, labels=None):
+def stitch_files_to_pdf(voucher_pdf_path, uploaded_files_list, labels=None, skip_pages=None):
     """Summary page first, then every uploaded receipt, as one PDF.
-    labels = the text printed above each image receipt (default Receipt #1, #2 ...)."""
+    labels = the text printed above each image receipt (default Receipt #1, #2 ...).
+    skip_pages = {file position: set of 0-based page numbers to leave out of that PDF}."""
     try:
         writer = PdfWriter()
 
@@ -1191,8 +1234,10 @@ def stitch_files_to_pdf(voucher_pdf_path, uploaded_files_list, labels=None):
                 label = labels[idx] if labels else f"Receipt #{idx + 1}"
                 reader = PdfReader(_image_to_pdf_buffer(u_file, label))
 
-            for page in reader.pages:
-                writer.add_page(page)
+            skip = (skip_pages or {}).get(idx, set())
+            for n, page in enumerate(reader.pages):
+                if n not in skip:
+                    writer.add_page(page)
 
         tmp_out = voucher_pdf_path + ".tmp"
         with open(tmp_out, "wb") as f:
@@ -1907,6 +1952,7 @@ def render_settings_page():
 # Every receipt line has a stable id (r0, r1 ...). Widget keys look like  fm{version}_{field}_{id}.
 # "Clear form" bumps the version, so every widget starts again from empty.
 EARLIER_CACHE_SECONDS = 120
+PAGE_MODES = ["Separate receipt", "Continues previous receipt (attach only)", "Skip this page (leave it out)"]
 
 
 def _K(field, rid=""):
@@ -2004,6 +2050,7 @@ def _read_upload_into_row(rid, uploaded, split):
         _set_row_values(rid)
         return
     bar.empty()
+    st.session_state[_K("problems", rid)] = analysis.get("problems", [])
 
     _drop_children(rid)
     rows, meta = st.session_state["rows"], st.session_state["row_meta"]
@@ -2123,6 +2170,8 @@ def render_claim_form():
     meta = st.session_state["row_meta"]
     receipt_records = []        # one per receipt line, in order
     upload_files = []           # (uploaded file or None, first line number it covers)
+    parent_positions = {}       # row id of an uploaded file -> its position in upload_files
+    skip_pages = {}             # file position -> set of page numbers (0-based) left out of the PDF
     missing_files = 0
     line_no = 0
     i = 0
@@ -2157,11 +2206,14 @@ def render_claim_form():
                     m = meta[rid]
 
             upload_files.append((uploaded, first_line))
+            parent_positions[rid] = len(upload_files) - 1
+            for problem in st.session_state.get(_K("problems", rid), []):
+                st.warning(f"⚠️ {problem}. Please type that receipt's details in by hand.")
             if uploaded is None:
                 missing_files += 1
 
             if m.get("split"):
-                st.info(f"📑 {uploaded.name} has {m['pages']} pages. Each page is listed below as its own receipt.")
+                st.info(f"📑 {uploaded.name} has {m['pages']} pages. Choose what each page is below: a separate receipt (default), a continuation of the receipt before it, or a page to skip.")
                 st.checkbox(f"Treat each of the {m['pages']} pages as a separate receipt", key=split_key)
                 if m["pages"] > m["read"]:
                     st.warning(f"Only the first {m['read']} pages were read. Please split the file or add the rest as another file.")
@@ -2174,12 +2226,20 @@ def render_claim_form():
                     with st.expander(f"Show the text read from receipt #{line_no}"):
                         st.text(st.session_state[_K("ocr", rid)])
         else:
-            line_no += 1
-            st.markdown(f"**🧾 Receipt #{line_no}** — page {m['page']} of {m['of']} from {m['fname']}")
-            receipt_records.append(_value_inputs(rid, f"#{line_no}"))
-            if _K("ocr", rid) in st.session_state:
-                with st.expander(f"Show the text read from receipt #{line_no}"):
-                    st.text(st.session_state[_K("ocr", rid)])
+            parent_pos = parent_positions.get(m["parent"], len(upload_files) - 1)
+            mode = st.radio(
+                f"Page {m['page']} of {m['of']} ({m['fname']})", PAGE_MODES, horizontal=True, key=_K("pgmode", rid),
+                help="Choose 'Continues previous receipt' when a bill runs over several pages, or 'Skip' to leave the page out of the PDF.")
+            if mode == PAGE_MODES[2]:
+                skip_pages.setdefault(parent_pos, set()).add(m["page"] - 1)
+            elif mode == PAGE_MODES[0]:
+                line_no += 1
+                receipt_records.append(_value_inputs(rid, f"#{line_no}"))
+                if _K("ocr", rid) in st.session_state:
+                    with st.expander(f"Show the text read from receipt #{line_no} (page {m['page']})"):
+                        st.text(st.session_state[_K("ocr", rid)])
+            else:
+                st.caption("This page is attached to the claim PDF after the receipt above it, with no separate line.")
 
     btn_a, btn_b, _ = st.columns([1.6, 1.3, 6])
     btn_a.button("➕ Add receipt", key="add_receipt", on_click=_add_receipt_row)
@@ -2266,7 +2326,7 @@ def render_claim_form():
     files_in_order = [f for f, _ in upload_files]
     labels = [f"Receipt #{first}" for _, first in upload_files]
     with st.spinner("Stitching receipts into the claim PDF..."):
-        stitched_ok = stitch_files_to_pdf(output_filename, files_in_order, labels)
+        stitched_ok = stitch_files_to_pdf(output_filename, files_in_order, labels, skip_pages)
     if not stitched_ok:
         st.stop()
 
