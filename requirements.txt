@@ -6,3 +6,6 @@ pypdf
 pdf2image
 google-api-python-client
 google-auth
+numpy
+opencv-python-headless
+pillow-heif and anthropic
