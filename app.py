@@ -9,12 +9,22 @@ import time
 import hmac
 import hashlib
 import shutil
-from datetime import datetime
+import base64
+import csv
+from datetime import datetime, date, timedelta
 from xml.sax.saxutils import escape as xml_escape
 from zoneinfo import ZoneInfo
 from PIL import Image, ImageOps
 import pytesseract
-from reportlab.lib.pagesizes import A4
+import numpy as np
+import cv2
+import pandas as pd
+try:                                    # lets phones that send HEIC/HEIF photos upload them
+    from pillow_heif import register_heif_opener
+    register_heif_opener()
+except Exception:
+    pass
+from reportlab.lib.pagesizes import A4, landscape
 from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle
 from reportlab.lib.styles import ParagraphStyle
 from reportlab.lib import colors
@@ -322,6 +332,7 @@ def normalize_claim(c):
     c.setdefault("admin_status", STATUS_PENDING)
     c.setdefault("president_status", STATUS_PENDING)
     c.setdefault("paid", False)
+    c.setdefault("complete", False)  # Admin ticks this when nothing more is needed on the claim
     c.setdefault("history", [])
     c.setdefault("comments", [])
     c.setdefault("receipts", [])     # receipt lines + fingerprints (claims saved from now on)
@@ -419,6 +430,8 @@ def _log(claim, actor, text):
 def _change_text(field, value):
     if field == "paid":
         return "Marked as paid" if value else "Payment mark removed (back to Approved)"
+    if field == "complete":
+        return "Marked as complete (moved to Completed)" if value else "Marked as not complete (back in Open Claims)"
     who = {"nazim_status": "Nazim e Ala", "admin_status": "Admin", "president_status": "President"}.get(field, field)
     if value == STATUS_BYPASSED:
         return "Nazim e Ala stage skipped"
@@ -471,12 +484,22 @@ def update_claim(service, folder_id, claim_id, role, actor, changes=None, vouche
     allowed_fields = {
         ROLE_NAZIM: {"nazim_status"},
         ROLE_PRESIDENT: {"president_status"},
-        ROLE_ADMIN: {"nazim_status", "admin_status", "president_status", "paid"},
+        ROLE_ADMIN: {"nazim_status", "admin_status", "president_status", "paid", "complete"},
     }.get(role, set())
+
+    # The voucher number the claim will have once this request is saved
+    if voucher_no is not None and role == ROLE_ADMIN:
+        effective_voucher = voucher_no.strip()[:20]
+    else:
+        effective_voucher = (claim.get("voucher_no") or "").strip()
 
     for field, value in changes.items():
         if field not in allowed_fields:
             raise PermissionError("You are not allowed to make that change.")
+        if field == "complete":
+            continue
+        if role == ROLE_ADMIN and field == "admin_status" and value == STATUS_APPROVED and not effective_voucher:
+            raise PermissionError("Enter a Voucher No. before approving this claim.")
         if field == "paid":
             if value and claim_stage(claim)[0] != "approved":
                 raise PermissionError("Only approved claims can be marked as paid. Please refresh.")
@@ -494,31 +517,16 @@ def update_claim(service, folder_id, claim_id, role, actor, changes=None, vouche
             raise PermissionError("This claim is still with the Nazim e Ala.")
 
     changed = False
-    today = now_local().strftime('%d/%m/%Y')
-    labels = []
-    for field, value in changes.items():
-        if field == "paid":
-            claim["paid"] = bool(value)
-            claim["paid_by"] = actor if value else ""
-            claim["paid_on"] = today if value else ""
-        else:
-            stage = field.replace("_status", "")
-            claim[field] = value
-            claim[f"{stage}_by"] = actor if value != STATUS_PENDING else ""
-            claim[f"{stage}_on"] = today if value != STATUS_PENDING else ""
-        text = _change_text(field, value)
-        labels.append(text)
-        _log(claim, actor, text)
-        changed = True
-
-    if _add_comment(claim, actor, role, comment, decision="; ".join(labels)):
-        changed = True
-
     warning = ""
+
+    # Voucher number first, so an approval is never saved without the number being on the PDF
     if voucher_no is not None and role == ROLE_ADMIN:
-        new_no = voucher_no.strip()[:20]
+        new_no = effective_voucher
         old_no = claim.get("voucher_no", "")
         if new_no != old_no:
+            if not new_no and "admin_status" not in changes and claim.get("admin_status") == STATUS_APPROVED:
+                raise PermissionError("The Voucher No. cannot be removed from a claim the Admin has approved. "
+                                      "Recall or reopen the claim first.")
             try:
                 pdf_bytes = service.files().get_media(fileId=claim["file_id"], supportsAllDrives=True).execute()
                 update_pdf_in_drive(service, claim["file_id"], stamp_voucher_number(pdf_bytes, new_no))
@@ -531,7 +539,35 @@ def update_claim(service, folder_id, claim_id, role, actor, changes=None, vouche
                     _log(claim, actor, f"Voucher No. changed from {old_no} to {new_no}")
                 changed = True
             except Exception as e:
+                if changes.get("admin_status") == STATUS_APPROVED:
+                    raise ValueError(f"Not approved: the voucher number could not be written onto the PDF in Drive ({e}).")
                 warning = f"The voucher number could not be written onto the PDF in Drive ({e})."
+
+    now = now_local()
+    today = now.strftime('%d/%m/%Y')
+    labels = []
+    for field, value in changes.items():
+        if field == "paid":
+            claim["paid"] = bool(value)
+            claim["paid_by"] = actor if value else ""
+            claim["paid_on"] = today if value else ""
+            claim["paid_ts"] = now.isoformat() if value else ""
+        elif field == "complete":
+            claim["complete"] = bool(value)
+            claim["complete_by"] = actor if value else ""
+            claim["complete_on"] = today if value else ""
+        else:
+            stage = field.replace("_status", "")
+            claim[field] = value
+            claim[f"{stage}_by"] = actor if value != STATUS_PENDING else ""
+            claim[f"{stage}_on"] = today if value != STATUS_PENDING else ""
+        text = _change_text(field, value)
+        labels.append(text)
+        _log(claim, actor, text)
+        changed = True
+
+    if _add_comment(claim, actor, role, comment, decision="; ".join(labels)):
+        changed = True
 
     if changed:
         save_register(service, folder_id, claims, fid)
@@ -819,9 +855,84 @@ NOT_A_VENDOR = ('tax invoice', 'receipt', 'invoice', 'abn', 'acn', 'ph', 'phone'
                 'time', 'store', 'welcome', 'thank', 'customer', 'copy', 'eftpos', 'card', 'page')
 
 
-def _ocr_image(img):
+def load_receipt_image(data, max_side=2200):
+    """Opens a photo with low memory use: JPEGs are decoded at reduced size, rotated, shrunk."""
+    img = Image.open(io.BytesIO(data))
+    img.draft("RGB", (max_side, max_side))      # big memory saving for JPEG, ignored otherwise
+    img = ImageOps.exif_transpose(img)
+    img.thumbnail((max_side, max_side))
+    return img.convert("RGB")
+
+
+def _prep_for_ocr(img):
     gray = ImageOps.autocontrast(img.convert("L"))
-    return pytesseract.image_to_string(gray, config="--psm 6")
+    if max(gray.size) < 1800:                   # small text needs roughly 300 dpi
+        f = 1800 / max(gray.size)
+        gray = gray.resize((int(gray.width * f), int(gray.height * f)), Image.LANCZOS)
+    arr = cv2.medianBlur(np.array(gray), 3)
+    arr = cv2.adaptiveThreshold(arr, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, 31, 15)
+    return Image.fromarray(arr)
+
+
+def _ocr_image(img):
+    """Tries the plain and the cleaned-up image with two layouts, keeps the result with most amounts found."""
+    best, best_score = "", -1
+    for candidate in (ImageOps.autocontrast(img.convert("L")), _prep_for_ocr(img)):
+        for psm in (4, 6):
+            try:
+                txt = pytesseract.image_to_string(candidate, config=f"--oem 1 --psm {psm}", timeout=25)
+            except pytesseract.TesseractNotFoundError:
+                raise
+            except Exception:
+                continue                        # timed out or failed: try the next option
+            score = len(_amounts_in(txt)) * 10 + min(len(txt), 400) / 40
+            if score > best_score:
+                best, best_score = txt, score
+    return best
+
+
+AI_PROMPT = (
+    "This is a photo of a receipt or tax invoice (Australia). Read it carefully and reply with ONLY a JSON object:\n"
+    '{"vendor": string, "date": "DD/MM/YYYY" or null, "total": number, "gst": number or null, "description": string}\n'
+    "total = the final amount actually paid, including GST. gst = the GST/tax amount printed on the receipt "
+    "(0 if it says GST free, null if not shown). description = 2-5 words, e.g. 'Officeworks stationery'. "
+    "Do not guess: use null for anything you cannot read."
+)
+
+
+def ai_read_receipt(img):
+    """Reads date/total/GST with Claude vision. Returns a dict like parse_receipt_text(), or None to fall back."""
+    key = _secret("anthropic_api_key")
+    if not key:
+        return None
+    try:
+        import anthropic
+        small = img.copy()
+        small.thumbnail((1800, 1800))
+        buf = io.BytesIO()
+        small.save(buf, "JPEG", quality=85)
+        client = anthropic.Anthropic(api_key=key, timeout=45, max_retries=1)
+        msg = client.messages.create(
+            model=_secret("anthropic_model") or "claude-sonnet-5-5", max_tokens=400,
+            messages=[{"role": "user", "content": [
+                {"type": "image", "source": {"type": "base64", "media_type": "image/jpeg",
+                                             "data": base64.b64encode(buf.getvalue()).decode()}},
+                {"type": "text", "text": AI_PROMPT}]}])
+        d = json.loads(re.search(r"\{.*\}", msg.content[0].text, re.S).group(0))
+        total = round(float(d.get("total") or 0), 2)
+        gst = round(float(d.get("gst") or 0), 2)
+        if total <= 0:
+            return None
+        if gst > total:
+            gst = 0.0
+        rdate = d.get("date")
+        ok_date = bool(rdate and re.fullmatch(r"\d{2}/\d{2}/\d{4}", rdate))
+        return {"desc": (d.get("description") or d.get("vendor") or "General Expense Purchases")[:60],
+                "amount": total, "gst": gst,
+                "date": rdate if ok_date else now_local().strftime('%d/%m/%Y'),
+                "date_detected": ok_date}
+    except Exception:
+        return None
 
 
 def _page_images(page):
@@ -883,9 +994,7 @@ def extract_page_texts(data, ext, progress=None, errors=None):
             if progress:
                 progress(idx + 1, limit)
         return texts, total
-    image = Image.open(io.BytesIO(data))
-    image = ImageOps.exif_transpose(image)
-    image.thumbnail((2000, 2000))
+    image = load_receipt_image(data)
     try:
         text = _ocr_image(image)
     except pytesseract.TesseractNotFoundError:
@@ -1063,7 +1172,11 @@ def analyse_upload(name, data, split_pages, progress=None):
             items.append({**parse_receipt_text(text), "exact": exact, "sig": text_signature(text), "text": text})
     else:
         full = "\n".join(texts)
-        items.append({**parse_receipt_text(full), "exact": file_hash, "sig": text_signature(full), "text": full})
+        fields = None
+        if ext != ".pdf":
+            fields = ai_read_receipt(load_receipt_image(data))
+        items.append({**(fields or parse_receipt_text(full)), "exact": file_hash,
+                      "sig": text_signature(full), "text": full})
     return {"pages": total_pages, "read_pages": len(texts), "items": items, "problems": problems}
 
 
@@ -1305,7 +1418,7 @@ def render_claim_rows(service, folder_id, claims_subset, auth, tab_key, newest_f
         _cell(cols[5], f"-${advance:,.2f}" if advance > 0 else "-")
         _cell(cols[6], f"**${c.get('amount_payable', 0):,.2f}**")
         cols[7].markdown(f"**{_md_escape(c['voucher_no'])}**" if c.get("voucher_no") else "-")
-        _cell(cols[8], status_text + (" ⚠️" if flags else ""))
+        _cell(cols[8], status_text + (" ⚠️" if flags else "") + (" ✅ Complete" if c.get("complete") else ""))
         _cell(cols[9], f"💬 {len(comments)}" if comments else "-")
         cols[10].markdown(f"[Open PDF]({c.get('file_link', '')})")
 
@@ -1347,6 +1460,14 @@ def render_claim_rows(service, folder_id, claims_subset, auth, tab_key, newest_f
 
         with ctrl_area:
             if role == ROLE_ADMIN:
+                is_complete = bool(c.get("complete"))
+                # the key includes the saved state, so every copy of this claim (other tabs) shows the new value
+                ticked = st.checkbox(
+                    "Does this claim complete? (tick = Completed, untick = Open Claims)", value=is_complete,
+                    key=f"cplt_{key_base}_{int(is_complete)}")
+                if ticked != is_complete:
+                    _apply({"complete": ticked})
+
                 n = len(actions)
                 row_cols = st.columns([2.0, 1.0] + [1.15] * n + [max(0.2, 3.6 - 1.15 * n), 1.4, 1.1])
                 voucher_input = row_cols[0].text_input(
@@ -1356,7 +1477,10 @@ def render_claim_rows(service, folder_id, claims_subset, auth, tab_key, newest_f
                 if row_cols[1].button("Save No.", key=f"saveno_{key_base}", use_container_width=True):
                     _apply({}, voucher_input)
                 for b_col, (label, field, value) in zip(row_cols[2:2 + n], actions):
-                    if b_col.button(label, key=f"{key_base}_{field}_{value}", use_container_width=True):
+                    needs_voucher = field == "admin_status" and value == STATUS_APPROVED and not voucher_input.strip()
+                    if b_col.button(label, key=f"{key_base}_{field}_{value}", use_container_width=True,
+                                    disabled=needs_voucher,
+                                    help="Enter a Voucher No. first" if needs_voucher else None):
                         _apply({field: value}, voucher_input)
                 if row_cols[-2].button("✏️ Amend PDF", key=f"amend_{key_base}", use_container_width=True):
                     st.session_state["amend_claim_id"] = c["id"]
@@ -1451,7 +1575,10 @@ def _stage_is(*keys):
 # ---------------------------- ADMIN ----------------------------
 def render_claims_dashboard(auth):
     st.markdown("### 📊 Claims Dashboard")
-    top_a, top_b, top_c, _ = st.columns([1, 1, 1, 6])
+    top_s, top_a, top_b, top_c, _ = st.columns([1.2, 1, 1, 1, 5])
+    if top_s.button("📈 Summary", use_container_width=True, type="primary"):
+        st.session_state.admin_view = "summary"
+        st.rerun()
     if top_a.button("⚙️ Settings", use_container_width=True):
         st.session_state.admin_view = "settings"
         st.rerun()
@@ -1474,6 +1601,8 @@ def render_claims_dashboard(auth):
         ("Approved", _stage_is("approved")),
         ("Paid", _stage_is("paid"), {"newest_first": True, "show_history": True}),
         ("Rejected", _stage_is("rejected")),
+        ("Open Claims", lambda c: not c.get("complete") and claim_stage(c)[0] != "rejected"),
+        ("Completed", lambda c: bool(c.get("complete")), {"newest_first": True, "show_history": True}),
     ], "admin")
 
 
@@ -1518,6 +1647,573 @@ def render_president_dashboard(auth):
         ("Approved", _stage_is("approved", "paid")),
         ("Rejected", lambda c: c["president_status"] == STATUS_REJECTED),
     ], "president")
+
+
+# -------------------------------------------------------------------------
+# SUMMARY, ACCOUNT BALANCES AND BAS REPORT (Admin only)
+# Balances live in a small ledger file (account_ledger.json) in the same Drive folder as the claims register.
+# For each account head:  balance = last "Balance set" amount + money added - other payments out
+#                                   - amount paid on claims marked Paid AFTER the balance was set.
+# -------------------------------------------------------------------------
+LEDGER_NAME = "account_ledger.json"
+LEDGER_TYPES = {"set": "Balance set", "add": "Money added", "deduct": "Other payment out"}
+STAGE_LABELS = {
+    "await_nazim": "With Nazim e Ala", "to_process": "With Admin", "await_president": "With President",
+    "approved": "Approved - ready to pay", "paid": "Paid", "hold": "On hold", "rejected": "Rejected",
+}
+
+
+def _find_file_id(service, folder_id, name):
+    q = f"name = '{name}' and '{folder_id}' in parents and trashed = false"
+    res = service.files().list(
+        q=q, fields="files(id)", supportsAllDrives=True, includeItemsFromAllDrives=True
+    ).execute()
+    files = res.get("files", [])
+    return files[0]["id"] if files else None
+
+
+def load_ledger(service, folder_id):
+    """Returns (list_of_entries, ledger_file_id_or_None)."""
+    fid = _find_file_id(service, folder_id, LEDGER_NAME)
+    if not fid:
+        return [], None
+    raw = service.files().get_media(fileId=fid, supportsAllDrives=True).execute()
+    return json.loads(raw.decode("utf-8")), fid
+
+
+def save_ledger(service, folder_id, entries, fid):
+    media = MediaIoBaseUpload(io.BytesIO(json.dumps(entries, indent=2).encode("utf-8")),
+                              mimetype="application/json", resumable=False)
+    if fid:
+        service.files().update(fileId=fid, media_body=media, supportsAllDrives=True).execute()
+    else:
+        service.files().create(body={"name": LEDGER_NAME, "parents": [folder_id]},
+                               media_body=media, fields="id", supportsAllDrives=True).execute()
+
+
+def add_ledger_entry(service, folder_id, kind, account, amount, note, actor):
+    if kind not in LEDGER_TYPES:
+        raise ValueError("Unknown entry type.")
+    if not account:
+        raise ValueError("Choose an account head.")
+    amount = round(float(amount or 0), 2)
+    if kind in ("add", "deduct") and amount <= 0:
+        raise ValueError("The amount must be more than $0.00.")
+    entries, fid = load_ledger(service, folder_id)
+    now = now_local()
+    entries.append({"id": uuid.uuid4().hex[:10], "ts": now.isoformat(), "date": now.strftime('%d/%m/%Y'),
+                    "type": kind, "account": account, "amount": amount,
+                    "note": (note or "").strip()[:200], "by": actor})
+    save_ledger(service, folder_id, entries, fid)
+
+
+def delete_ledger_entry(service, folder_id, entry_id):
+    entries, fid = load_ledger(service, folder_id)
+    save_ledger(service, folder_id, [e for e in entries if e.get("id") != entry_id], fid)
+
+
+def _parse_dmy(text):
+    m = re.match(r"\s*(\d{1,2})[/\-.](\d{1,2})[/\-.](\d{2,4})", str(text or ""))
+    if not m:
+        return None
+    d, mo, y = (int(x) for x in m.groups())
+    if y < 100:
+        y += 2000
+    try:
+        return date(y, mo, d)
+    except ValueError:
+        return None
+
+
+def _iso(ts):
+    try:
+        return datetime.fromisoformat(ts) if ts else None
+    except ValueError:
+        return None
+
+
+def _claim_date(c):
+    d = _parse_dmy(c.get("submitted_on"))
+    if d:
+        return d
+    dt = _iso(c.get("submitted_ts"))
+    return dt.date() if dt else None
+
+
+def _paid_dt(c):
+    dt = _iso(c.get("paid_ts"))
+    if dt:
+        return dt
+    d = _parse_dmy(c.get("paid_on"))
+    return datetime(d.year, d.month, d.day, tzinfo=LOCAL_TZ) if d else None
+
+
+def _fy_label(d):
+    start = d.year if d.month >= 7 else d.year - 1
+    return f"FY{start}-{str(start + 1)[2:]}"
+
+
+def all_heads(claims, entries=()):
+    accts = st.session_state.admin_lists.get("regional_accounts", DEFAULT_CONFIG["regional_accounts"])
+    heads = list(accts.get("National", [])) + list(accts.get("General_Regional", []))
+    for src in (claims, entries):
+        for item in src:
+            if item.get("account") and item["account"] not in heads:
+                heads.append(item["account"])
+    return heads
+
+
+def compute_balances(entries, claims, heads):
+    """{head: {balance, has_base, base_date, start, added, manual_out, claims_paid}}"""
+    out = {}
+    for head in heads:
+        bal = start = added = manual_out = 0.0
+        base_dt, base_date = None, ""
+        for e in sorted((x for x in entries if x.get("account") == head), key=lambda x: x.get("ts", "")):
+            amt = float(e.get("amount") or 0)
+            if e.get("type") == "set":
+                bal = start = amt
+                added = manual_out = 0.0
+                base_dt, base_date = _iso(e.get("ts")), e.get("date", "")
+            elif e.get("type") == "add":
+                bal += amt
+                added += amt
+            elif e.get("type") == "deduct":
+                bal -= amt
+                manual_out += amt
+        claims_paid = 0.0
+        for c in claims:
+            if c.get("account") != head or claim_stage(c)[0] != "paid":
+                continue
+            pdt = _paid_dt(c)
+            if base_dt and (pdt is None or pdt <= base_dt):
+                continue            # that payment was already in the balance that was typed in
+            claims_paid += float(c.get("amount_payable") or 0)
+        out[head] = {"balance": round(bal - claims_paid, 2), "has_base": base_dt is not None,
+                     "base_date": base_date, "start": round(start, 2), "added": round(added, 2),
+                     "manual_out": round(manual_out, 2), "claims_paid": round(claims_paid, 2)}
+    return out
+
+
+def filter_claims(claims, head="All", region="All", fy="All", state="All"):
+    out = []
+    for c in claims:
+        if head != "All" and c.get("account") != head:
+            continue
+        if region != "All" and c.get("region") != region:
+            continue
+        if fy != "All":
+            d = _claim_date(c)
+            if not d or _fy_label(d) != fy:
+                continue
+        if state == "Open" and (c.get("complete") or claim_stage(c)[0] == "rejected"):
+            continue
+        if state == "Completed" and not c.get("complete"):
+            continue
+        out.append(c)
+    return out
+
+
+def _money(x):
+    return f"${x:,.2f}"
+
+
+def _show_df(df, money_cols=()):
+    cfg = {col: st.column_config.NumberColumn(col, format="$%.2f") for col in money_cols if col in df.columns}
+    st.dataframe(df, hide_index=True, use_container_width=True, column_config=cfg)
+
+
+def _group_table(claims, key_fn, label):
+    """One row per key (account head, region ...) with claim counts and money columns. Rejected claims are left out."""
+    rows = {}
+    for c in claims:
+        stage = claim_stage(c)[0]
+        if stage == "rejected":
+            continue
+        r = rows.setdefault(key_fn(c), {"Claims": 0, "Total claimed": 0.0, "GST": 0.0, "Paid out": 0.0})
+        r["Claims"] += 1
+        r["Total claimed"] += float(c.get("total_claim") or 0)
+        r["GST"] += float(c.get("gst") or 0)
+        if stage == "paid":
+            r["Paid out"] += float(c.get("amount_payable") or 0)
+    df = pd.DataFrame([{label: k, **v} for k, v in sorted(rows.items())])
+    return df
+
+
+# ---- BAS ------------------------------------------------------------------
+def _bas_quarters(today, n=8):
+    """The last n BAS quarters (Jul-Sep, Oct-Dec, Jan-Mar, Apr-Jun), newest first."""
+    y, m = today.year, ((today.month - 1) // 3) * 3 + 1
+    out = []
+    for _ in range(n):
+        start = date(y, m, 1)
+        nm, ny = (m + 3, y) if m + 3 <= 12 else (m + 3 - 12, y + 1)
+        end = date(ny, nm, 1) - timedelta(days=1)
+        qnum = {7: 1, 10: 2, 1: 3, 4: 4}[m]
+        label = f"{start.strftime('%b')} - {end.strftime('%b %Y')}  (Q{qnum} {_fy_label(start)})"
+        out.append((label, start, end))
+        m -= 3
+        if m < 1:
+            m, y = m + 12, y - 1
+    return out
+
+
+def build_bas_lines(claims, start, end, basis, include, head="All"):
+    """One line per receipt (or per claim, for older claims saved without receipt lines)."""
+    lines = []
+    for c in claims:
+        stage = claim_stage(c)[0]
+        if stage != "paid" and not (include == "Approved and paid" and stage == "approved"):
+            continue
+        if head != "All" and c.get("account") != head:
+            continue
+        pdt = _paid_dt(c)
+        paid_d = pdt.date() if pdt else None
+        base = {"claimant": c.get("name", ""), "region": c.get("region", ""), "voucher": c.get("voucher_no", ""),
+                "account": c.get("account", ""), "paid_d": paid_d, "status": claim_stage(c)[1]}
+        receipts = c.get("receipts") or []
+        if receipts:
+            for r in receipts:
+                rd, note = _parse_dmy(r.get("date")), ""
+                if rd is None:
+                    rd, note = _claim_date(c), "Receipt date not readable, claim date used"
+                total, gst = float(r.get("amount") or 0), float(r.get("gst") or 0)
+                lines.append({**base, "date": rd, "desc": r.get("desc", ""), "total": total, "gst": gst,
+                              "net": round(total - gst, 2), "note": note})
+        else:
+            total, gst = float(c.get("total_claim") or 0), float(c.get("gst") or 0)
+            lines.append({**base, "date": _claim_date(c), "desc": c.get("event", ""), "total": total, "gst": gst,
+                          "net": round(total - gst, 2), "note": "Older claim: totals only, claim date used"})
+    keep = []
+    for ln in lines:
+        d = ln["date"] if basis == "Receipt date" else ln["paid_d"]
+        if d and start <= d <= end:
+            keep.append(ln)
+    keep.sort(key=lambda x: (x["date"] or date.min, x["claimant"]))
+    return keep
+
+
+def bas_totals(lines):
+    total = round(sum(x["total"] for x in lines), 2)
+    gst = round(sum(x["gst"] for x in lines), 2)
+    return {"total": total, "gst": gst, "net": round(total - gst, 2), "count": len(lines),
+            "no_gst": sum(1 for x in lines if x["gst"] <= 0)}
+
+
+def _fmt_d(d):
+    return d.strftime("%d/%m/%Y") if d else ""
+
+
+def bas_csv_bytes(lines):
+    buf = io.StringIO()
+    w = csv.writer(buf)
+    w.writerow(["Receipt date", "Claimant", "Region", "Voucher No.", "Account head", "Description",
+                "Total (incl GST)", "GST", "Net (excl GST)", "Claim paid on", "Claim status", "Note"])
+    for x in lines:
+        w.writerow([_fmt_d(x["date"]), x["claimant"], x["region"], x["voucher"], x["account"], x["desc"],
+                    f"{x['total']:.2f}", f"{x['gst']:.2f}", f"{x['net']:.2f}", _fmt_d(x["paid_d"]), x["status"], x["note"]])
+    t = bas_totals(lines)
+    w.writerow([])
+    w.writerow(["TOTAL", "", "", "", "", "", f"{t['total']:.2f}", f"{t['gst']:.2f}", f"{t['net']:.2f}"])
+    return buf.getvalue().encode("utf-8-sig")        # utf-8-sig so Excel opens it correctly
+
+
+def build_bas_pdf(lines, period_text, basis_text, head_text):
+    E = lambda v: xml_escape(str(v if v is not None else ""))
+    buf = io.BytesIO()
+    doc = SimpleDocTemplate(buf, pagesize=landscape(A4), leftMargin=28, rightMargin=28, topMargin=28, bottomMargin=28)
+    title = ParagraphStyle("BT", fontName="Helvetica-Bold", fontSize=14, spaceAfter=4)
+    body = ParagraphStyle("BB", fontName="Helvetica", fontSize=9, leading=12)
+    small = ParagraphStyle("BS", fontName="Helvetica", fontSize=7.5, leading=9)
+    small_b = ParagraphStyle("BSB", fontName="Helvetica-Bold", fontSize=7.5, leading=9)
+    right = ParagraphStyle("BR", parent=small, alignment=2)
+    right_b = ParagraphStyle("BRB", parent=small_b, alignment=2)
+
+    t = bas_totals(lines)
+    story = [
+        Paragraph("MAJLIS ANSARULLAH AUSTRALIA - BAS Expense Report", title),
+        Paragraph(f"<b>Period:</b> {E(period_text)} &nbsp;&nbsp; <b>Counted by:</b> {E(basis_text)} &nbsp;&nbsp; "
+                  f"<b>Account head:</b> {E(head_text)}", body),
+        Paragraph(f"<b>Generated:</b> {now_local().strftime('%d/%m/%Y %H:%M')}", body),
+        Spacer(1, 8),
+        Paragraph(f"<b>Total purchases (incl GST):</b> {_money(t['total'])} &nbsp;&nbsp; "
+                  f"<b>GST on purchases (1B):</b> {_money(t['gst'])} &nbsp;&nbsp; "
+                  f"<b>Net (excl GST):</b> {_money(t['net'])} &nbsp;&nbsp; <b>Receipts:</b> {t['count']}", body),
+        Spacer(1, 8),
+    ]
+
+    head = ["Date", "Claimant", "Voucher", "Account head", "Description", "Total", "GST", "Net", "Paid on"]
+    data = [[Paragraph(f"<b>{h}</b>", small_b) for h in head]]
+    for x in lines:
+        data.append([
+            Paragraph(_fmt_d(x["date"]), small), Paragraph(E(x["claimant"]), small), Paragraph(E(x["voucher"]), small),
+            Paragraph(E(x["account"]), small), Paragraph(E(x["desc"]) + (" *" if x["note"] else ""), small),
+            Paragraph(_money(x["total"]), right), Paragraph(_money(x["gst"]), right),
+            Paragraph(_money(x["net"]), right), Paragraph(_fmt_d(x["paid_d"]), small)])
+    data.append([Paragraph("<b>TOTAL</b>", small_b), "", "", "", "", Paragraph(_money(t["total"]), right_b),
+                 Paragraph(_money(t["gst"]), right_b), Paragraph(_money(t["net"]), right_b), ""])
+    table = Table(data, colWidths=[52, 88, 50, 130, 190, 58, 48, 58, 58], repeatRows=1)
+    table.setStyle(TableStyle([
+        ("GRID", (0, 0), (-1, -1), 0.5, colors.grey),
+        ("BACKGROUND", (0, 0), (-1, 0), colors.lightgrey),
+        ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+        ("PADDING", (0, 0), (-1, -1), 3),
+        ("SPAN", (0, -1), (4, -1)),
+    ]))
+    story.append(table)
+    story.append(Spacer(1, 8))
+    notes = ["GST is the amount printed on each receipt as entered on the claim. A GST credit normally needs a valid "
+             "tax invoice, so check the receipts before lodging. Please confirm figures with your accountant."]
+    if any(x["note"] for x in lines):
+        notes.append("* Date or detail taken from the claim, not the receipt (see the CSV Note column).")
+    for n in notes:
+        story.append(Paragraph(E(n), small))
+    doc.build(story)
+    return buf.getvalue()
+
+
+# ---- the page ---------------------------------------------------------------
+def _ledger_form(kind, title, help_text, heads, service, folder_id, actor):
+    with st.form(f"ledger_form_{kind}", clear_on_submit=True):
+        st.markdown(f"**{title}**")
+        st.caption(help_text)
+        head = st.selectbox("Account head", heads, key=f"lf_head_{kind}")
+        amount = st.number_input("Amount ($)", value=0.0, step=10.0, format="%.2f",
+                                 min_value=None if kind == "set" else 0.0, key=f"lf_amt_{kind}")
+        note = st.text_input("Note (optional)", max_chars=200, key=f"lf_note_{kind}")
+        go = st.form_submit_button(title, type="primary")
+    if go:
+        try:
+            add_ledger_entry(service, folder_id, kind, head, amount, note, actor)
+        except Exception as e:
+            st.error(f"Could not save: {e}")
+        else:
+            st.session_state["sum_notice"] = f"{LEDGER_TYPES[kind]}: {_money(amount)} for {head}."
+            st.rerun()
+
+
+def render_summary_page(auth):
+    st.markdown("### 📈 Summary & Tracking")
+    if st.button("⬅ Back to Claims Dashboard"):
+        st.session_state.admin_view = "dashboard"
+        st.rerun()
+
+    notice = st.session_state.pop("sum_notice", None)
+    if notice:
+        st.success(notice)
+
+    data = load_dashboard_data(ROLE_ADMIN)
+    if data is None:
+        return
+    service, folder_id, claims = data
+
+    ledger_ok = True
+    try:
+        entries, _ = load_ledger(service, folder_id)
+    except Exception as e:
+        entries, ledger_ok = [], False
+        st.error(f"Could not read the account ledger from Google Drive: {e}")
+
+    heads = all_heads(claims, entries)
+    regions = st.session_state.admin_lists.get("regions", [])
+    balances = compute_balances(entries, claims, heads)
+
+    tab_over, tab_bal, tab_bas = st.tabs(["📊 Overview", "💰 Account Balances", "🧾 BAS Report"])
+
+    # ------------------------------------------------------------ overview
+    with tab_over:
+        fys = sorted({_fy_label(d) for d in (_claim_date(c) for c in claims) if d}, reverse=True)
+        f1, f2, f3, f4 = st.columns(4)
+        head_f = f1.selectbox("Account head", ["All"] + heads, key="sum_head")
+        region_f = f2.selectbox("Region", ["All"] + regions, key="sum_region")
+        fy_f = f3.selectbox("Financial year (Jul-Jun)", ["All"] + fys, key="sum_fy")
+        state_label = f4.selectbox("Claims", ["All claims", "Open only", "Completed only"], key="sum_state")
+        state_f = {"All claims": "All", "Open only": "Open", "Completed only": "Completed"}[state_label]
+
+        sub = filter_claims(claims, head_f, region_f, fy_f, state_f)
+        live = [c for c in sub if claim_stage(c)[0] != "rejected"]
+        stages = [claim_stage(c)[0] for c in live]
+        paid_out = sum(float(c.get("amount_payable") or 0) for c, s in zip(live, stages) if s == "paid")
+        to_pay = sum(float(c.get("amount_payable") or 0) for c, s in zip(live, stages) if s == "approved")
+        in_pipe = sum(float(c.get("amount_payable") or 0) for c, s in zip(live, stages)
+                      if s not in ("approved", "paid"))
+
+        m1, m2, m3, m4 = st.columns(4)
+        m1.metric("Claims (excl. rejected)", len(live))
+        m2.metric("Total claimed", _money(sum(float(c.get("total_claim") or 0) for c in live)))
+        m3.metric("Total GST", _money(sum(float(c.get("gst") or 0) for c in live)))
+        m4.metric("Paid out", _money(paid_out))
+        m5, m6, m7, m8 = st.columns(4)
+        m5.metric("Approved, still to pay", _money(to_pay))
+        m6.metric("Still in approval", _money(in_pipe))
+        m7.metric("Open claims", sum(1 for c in live if not c.get("complete")))
+        m8.metric("Completed claims", sum(1 for c in live if c.get("complete")))
+
+        if head_f != "All":
+            b = balances.get(head_f, {})
+            st.metric(f"Balance now: {head_f}", _money(b["balance"]) if b.get("has_base") else "Not set yet")
+        if not sub:
+            st.info("No claims match these filters.")
+        else:
+            st.markdown("#### By status")
+            by_status = {}
+            for c in sub:
+                label = STAGE_LABELS.get(claim_stage(c)[0], "Other")
+                r = by_status.setdefault(label, {"Claims": 0, "Total claimed": 0.0, "Amount to pay": 0.0})
+                r["Claims"] += 1
+                r["Total claimed"] += float(c.get("total_claim") or 0)
+                r["Amount to pay"] += float(c.get("amount_payable") or 0)
+            order = [STAGE_LABELS[k] for k in ("await_nazim", "to_process", "await_president", "approved", "paid",
+                                              "hold", "rejected")]
+            _show_df(pd.DataFrame([{"Status": k, **by_status[k]} for k in order if k in by_status]),
+                     ("Total claimed", "Amount to pay"))
+
+            st.markdown("#### By account head")
+            df_head = _group_table(sub, lambda c: c.get("account") or "(none)", "Account head")
+            if not df_head.empty:
+                df_head["Balance now"] = [
+                    balances[h]["balance"] if balances.get(h, {}).get("has_base") else None
+                    for h in df_head["Account head"]]
+                _show_df(df_head, ("Total claimed", "GST", "Paid out", "Balance now"))
+                if len(df_head) > 1:
+                    st.bar_chart(df_head.set_index("Account head")[["Total claimed", "Paid out"]])
+                st.caption("Balance now is the live balance for the head (all dates). "
+                           "Heads with no balance entered show empty.")
+
+            st.markdown("#### By region")
+            df_reg = _group_table(sub, lambda c: c.get("region") or "(none)", "Region")
+            if not df_reg.empty:
+                _show_df(df_reg, ("Total claimed", "GST", "Paid out"))
+
+    # ------------------------------------------------------------ balances
+    with tab_bal:
+        st.caption("Enter what is in an account head today with **Set balance**. After that, the balance updates by "
+                   "itself: **Money added** goes up, **Other payment out** (for example an advance you handed out) "
+                   "goes down, and every claim you mark **Paid** after that moment is taken off "
+                   "(the amount actually paid, after any advance settled).")
+        rows = []
+        for h in heads:
+            b = balances[h]
+            rows.append({"Account head": h,
+                         "Balance now": b["balance"] if b["has_base"] else None,
+                         "Set to": b["start"] if b["has_base"] else None,
+                         "Set on": b["base_date"] or "not set",
+                         "Money added": b["added"], "Other payments out": b["manual_out"],
+                         "Claims paid": b["claims_paid"]})
+        if rows:
+            df_bal = pd.DataFrame(rows)
+            total_now = sum(r["Balance now"] for r in rows if r["Balance now"] is not None)
+            st.metric("Total balance across heads that have a balance set", _money(total_now))
+            _show_df(df_bal, ("Balance now", "Set to", "Money added", "Other payments out", "Claims paid"))
+        else:
+            st.info("No account heads are configured yet. Add them in Settings.")
+
+        if heads and ledger_ok:
+            c1, c2, c3 = st.columns(3)
+            with c1:
+                _ledger_form("set", "Set balance", "Type the real balance of the head right now. "
+                             "This restarts the count from today.", heads, service, folder_id, auth["name"])
+            with c2:
+                _ledger_form("add", "Add money", "Money received into the head (a transfer, a grant, a deposit).",
+                             heads, service, folder_id, auth["name"])
+            with c3:
+                _ledger_form("deduct", "Other payment out", "Money that left the head but is not a claim in this app "
+                             "(for example an advance, or a bank fee).", heads, service, folder_id, auth["name"])
+
+        st.markdown("#### Ledger history")
+        pick = st.selectbox("Show entries for", ["All"] + heads, key="ledger_pick")
+        shown = [e for e in entries if pick == "All" or e.get("account") == pick]
+        shown.sort(key=lambda e: e.get("ts", ""), reverse=True)
+        if not shown:
+            st.info("No ledger entries yet.")
+        else:
+            _show_df(pd.DataFrame([{"Date": e.get("date", ""), "Account head": e.get("account", ""),
+                                    "Type": LEDGER_TYPES.get(e.get("type"), e.get("type")),
+                                    "Amount": float(e.get("amount") or 0), "Note": e.get("note", ""),
+                                    "By": e.get("by", "")} for e in shown]), ("Amount",))
+            if ledger_ok:
+                with st.expander("Delete a wrong entry"):
+                    labels = {f"{e.get('date', '')} | {e.get('account', '')} | "
+                              f"{LEDGER_TYPES.get(e.get('type'), e.get('type'))} | {_money(float(e.get('amount') or 0))}"
+                              f" | {e.get('note', '')}": e["id"] for e in shown}
+                    choice = st.selectbox("Entry", list(labels.keys()), key="ledger_del_pick")
+                    sure = st.checkbox("Yes, delete this entry", key="ledger_del_sure")
+                    if st.button("Delete entry", disabled=not sure):
+                        try:
+                            delete_ledger_entry(service, folder_id, labels[choice])
+                        except Exception as e:
+                            st.error(f"Could not delete: {e}")
+                        else:
+                            st.session_state["sum_notice"] = "Ledger entry deleted."
+                            st.rerun()
+
+    # ------------------------------------------------------------ BAS
+    with tab_bas:
+        st.caption("Lists the GST on every receipt in a period, ready for your BAS (G11 total purchases and 1B GST credits). "
+                   "Only the amounts typed on the claims are used.")
+        today = now_local().date()
+        quarters = _bas_quarters(today)
+        presets = [q[0] for q in quarters] + ["Custom dates"]
+        preset = st.selectbox("Period", presets, key="bas_preset")
+        if preset == "Custom dates":
+            d_from_default, d_to_default = today.replace(day=1), today
+        else:
+            _, d_from_default, d_to_default = next(q for q in quarters if q[0] == preset)
+        b1, b2, b3, b4 = st.columns(4)
+        d_from = b1.date_input("From", value=d_from_default, key=f"bas_from_{preset}", format="DD/MM/YYYY")
+        d_to = b2.date_input("To", value=d_to_default, key=f"bas_to_{preset}", format="DD/MM/YYYY")
+        basis = b3.selectbox("Count receipts by", ["Receipt date", "Date claim was paid"], key="bas_basis")
+        include = b4.selectbox("Include claims", ["Approved and paid", "Paid only"], key="bas_include",
+                               help="'Date claim was paid' always uses paid claims only.")
+        bas_head = st.selectbox("Account head", ["All"] + heads, key="bas_head")
+
+        basis_key = "Receipt date" if basis == "Receipt date" else "Paid date"
+        if d_from > d_to:
+            st.error("The From date is after the To date.")
+        else:
+            lines = build_bas_lines(claims, d_from, d_to, basis_key, include, bas_head)
+            t = bas_totals(lines)
+            k1, k2, k3, k4 = st.columns(4)
+            k1.metric("Total purchases (incl GST)", _money(t["total"]))
+            k2.metric("GST on purchases (1B)", _money(t["gst"]))
+            k3.metric("Net (excl GST)", _money(t["net"]))
+            k4.metric("Receipts / with no GST", f"{t['count']} / {t['no_gst']}")
+
+            if not lines:
+                st.info("No receipts match this period. Check the dates, and that the claims are approved or paid.")
+            else:
+                if any(x["note"] for x in lines):
+                    st.warning("Some lines use the claim date because the receipt date was missing, or the claim is "
+                               "older than receipt-line storage. See the Note column.")
+                df_bas = pd.DataFrame([{
+                    "Receipt date": _fmt_d(x["date"]), "Claimant": x["claimant"], "Voucher No.": x["voucher"],
+                    "Account head": x["account"], "Description": x["desc"], "Total": x["total"], "GST": x["gst"],
+                    "Net": x["net"], "Paid on": _fmt_d(x["paid_d"]), "Note": x["note"]} for x in lines])
+                _show_df(df_bas, ("Total", "GST", "Net"))
+
+                st.markdown("#### GST by account head")
+                by_head = {}
+                for x in lines:
+                    r = by_head.setdefault(x["account"] or "(none)", {"Receipts": 0, "Total": 0.0, "GST": 0.0})
+                    r["Receipts"] += 1
+                    r["Total"] += x["total"]
+                    r["GST"] += x["gst"]
+                _show_df(pd.DataFrame([{"Account head": k, **v} for k, v in sorted(by_head.items())]),
+                         ("Total", "GST"))
+
+                period_text = f"{_fmt_d(d_from)} to {_fmt_d(d_to)}"
+                stamp = f"{d_from:%Y%m%d}_{d_to:%Y%m%d}"
+                try:
+                    pdf_bytes = build_bas_pdf(lines, period_text, basis, bas_head)
+                except Exception as e:
+                    pdf_bytes = None
+                    st.error(f"Could not build the PDF: {e}")
+                dl1, dl2, _ = st.columns([1.4, 1.4, 5])
+                dl1.download_button("📥 Download CSV (Excel)", data=bas_csv_bytes(lines),
+                                    file_name=f"BAS_report_{stamp}.csv", mime="text/csv")
+                if pdf_bytes:
+                    dl2.download_button("📥 Download PDF", data=pdf_bytes,
+                                        file_name=f"BAS_report_{stamp}.pdf", mime="application/pdf")
 
 
 # -------------------------------------------------------------------------
@@ -1681,7 +2377,7 @@ def render_amend_page(auth):
     st.button("➕ Add receipt line", key="am_add_line", on_click=_am_add_row)
 
     extra_files = st.file_uploader("Attach more receipt files (optional, added after the existing pages)",
-                                   type=["png", "jpg", "jpeg", "pdf"], accept_multiple_files=True, key="am_files")
+                                   type=["png", "jpg", "jpeg", "heic", "heif", "pdf"], accept_multiple_files=True, key="am_files")
 
     line_values = [{
         "date": st.session_state.get(f"am_date_{rid}", ""),
@@ -2184,7 +2880,7 @@ def render_claim_form():
             first_line = line_no + 1
             head_l, head_r = st.columns([6, 1.2])
             head_l.markdown(f"#### 📄 Receipt file {sum(1 for r in rows[:i] if meta[r]['kind'] == 'upload')}")
-            uploaded = st.file_uploader("Upload receipt (Image or PDF)", type=["png", "jpg", "jpeg", "pdf"],
+            uploaded = st.file_uploader("Upload receipt (Image or PDF)", type=["png", "jpg", "jpeg", "heic", "heif", "pdf"],
                                         key=_K("file", rid), label_visibility="collapsed")
             if len([r for r in rows if meta[r]["kind"] == "upload"]) > 1:
                 head_r.button("🗑 Remove", key=_K("rm", rid), on_click=_remove_receipt_row, args=(rid,))
@@ -2431,6 +3127,8 @@ if app_mode == "Admin Panel Configuration":
                 render_roles_page()
             elif view == "amend":
                 render_amend_page(auth)
+            elif view == "summary":
+                render_summary_page(auth)
             else:
                 render_claims_dashboard(auth)
         elif auth["role"] == ROLE_NAZIM:
