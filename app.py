@@ -308,9 +308,90 @@ def stamp_voucher_number(pdf_bytes, voucher_no):
     return out.getvalue()
 
 
-def update_pdf_in_drive(service, file_id, pdf_bytes):
+def update_pdf_in_drive(service, file_id, pdf_bytes, new_name=None):
+    """Replaces the PDF in Drive (same file, same link). When new_name is given the file is renamed too."""
     media = MediaIoBaseUpload(io.BytesIO(pdf_bytes), mimetype="application/pdf", resumable=False)
-    service.files().update(fileId=file_id, media_body=media, supportsAllDrives=True).execute()
+    kwargs = {"fileId": file_id, "media_body": media, "supportsAllDrives": True}
+    if new_name:
+        kwargs["body"] = {"name": new_name}
+    service.files().update(**kwargs).execute()
+
+
+def _fn_part(text, limit):
+    t = re.sub(r'[\\/:*?"<>|\r\n\t]+', " ", str(text or ""))
+    t = re.sub(r"\s+", " ", t).strip(" .")
+    return t[:limit].strip()
+
+
+def build_drive_filename(voucher_no, name, event, submitted_on):
+    """Drive file name:  VoucherNo_Claimant name_Description_Date.pdf
+    (the voucher part is left out until the Admin has entered a Voucher No.)"""
+    day = re.sub(r"[^0-9]+", "-", str(submitted_on or "")).strip("-") or now_local().strftime("%d-%m-%Y")
+    parts = [_fn_part(voucher_no, 20), _fn_part(name, 40), _fn_part(event, 60), day]
+    return "_".join(p for p in parts if p) + ".pdf"
+
+
+# ---- members list (auto-fill of the claim form) ---------------------------------------------
+MEMBERS_NAME = "members.csv"
+
+
+def _norm_name(text):
+    return " ".join(str(text or "").lower().split())
+
+
+def load_members(service, folder_id):
+    """Rows of members.csv in the Drive folder (columns: Name, Email, Region, Majlis, optional Account)."""
+    fid = _find_file_id(service, folder_id, MEMBERS_NAME)
+    if not fid:
+        return []
+    raw = service.files().get_media(fileId=fid, supportsAllDrives=True).execute()
+    reader = csv.DictReader(io.StringIO(raw.decode("utf-8-sig", errors="replace")))
+    return [{(k or "").strip().lower(): (v or "").strip() for k, v in row.items()} for row in reader]
+
+
+def members_csv_from_upload(filename, data):
+    """Turns an uploaded .csv or .xlsx into CSV bytes. Must have a Name column."""
+    if filename.lower().endswith((".xlsx", ".xls")):
+        df = pd.read_excel(io.BytesIO(data), dtype=str).fillna("")
+        data = df.to_csv(index=False).encode("utf-8")
+    first_line = data.decode("utf-8-sig", errors="replace").split("\n")[0].lower()
+    headers = [h.strip().strip('"').strip() for h in first_line.split(",")]
+    if "name" not in headers:
+        raise ValueError("The first row must contain column headings, including one called Name.")
+    return data
+
+
+def save_members(service, folder_id, data):
+    media = MediaIoBaseUpload(io.BytesIO(data), mimetype="text/csv", resumable=False)
+    fid = _find_file_id(service, folder_id, MEMBERS_NAME)
+    if fid:
+        service.files().update(fileId=fid, media_body=media, supportsAllDrives=True).execute()
+    else:
+        service.files().create(body={"name": MEMBERS_NAME, "parents": [folder_id]},
+                               media_body=media, fields="id", supportsAllDrives=True).execute()
+
+
+def lookup_person(name, members, claims):
+    """Email, region, majlis and account for a name: from the members list first, then from that person's
+    most recent earlier claim. Bank details are never returned."""
+    key = _norm_name(name)
+    if len(key) < 3:
+        return {}
+    info = {}
+    for m in members:
+        if _norm_name(m.get("name")) == key:
+            info = {"email": m.get("email", ""), "region": m.get("region", ""), "majlis": m.get("majlis", ""),
+                    "account": m.get("account", "") or m.get("account code", "")}
+            break
+    mine = sorted((c for c in claims if _norm_name(c.get("name")) == key),
+                  key=lambda c: c.get("submitted_ts", ""), reverse=True)
+    if mine:
+        c = mine[0]
+        for k, v in (("email", c.get("claimant_email")), ("region", c.get("region")),
+                     ("majlis", c.get("majlis")), ("account", c.get("account"))):
+            if not info.get(k) and v:
+                info[k] = v
+    return {k: v for k, v in info.items() if v}
 
 
 # -------------------------------------------------------------------------
@@ -342,6 +423,8 @@ def normalize_claim(c):
 
 def claim_stage(c):
     """Returns (stage_key, human readable status) for a claim."""
+    if c.get("merged_into"):
+        return "merged", "Merged into a consolidated claim"
     n, a, p = c["nazim_status"], c["admin_status"], c["president_status"]
     nazim = f"Nazim e Ala {c.get('region', '')}".strip()
 
@@ -357,6 +440,8 @@ def claim_stage(c):
     if a == STATUS_HOLD:
         return "hold", "On hold by Admin"
     if a == STATUS_PENDING:
+        if not c.get("complete"):
+            return "to_process", "Open claim (not marked complete yet)"
         if n == STATUS_APPROVED:
             return "to_process", f"Approved by {nazim}"
         return "to_process", "Nazim e Ala skipped by Admin" if c.get("nazim_by") == "Admin" else "Ready for Admin"
@@ -369,6 +454,8 @@ def claim_stage(c):
         return "await_president", "Waiting approval from President"
     if c.get("paid"):
         return "paid", f"Paid on {c.get('paid_on', '')}".strip()
+    if p == STATUS_BYPASSED:
+        return "approved", "President skipped by Admin"
     return "approved", "Approved by President" if p == STATUS_APPROVED else "Approved by Admin"
 
 
@@ -396,15 +483,19 @@ def actions_for(role, c):
     if stage == "await_nazim":
         return [("Skip Nazim", "nazim_status", STATUS_BYPASSED)]
     if stage == "to_process":
+        if not c.get("complete"):       # an open claim cannot be approved until it is ticked as complete
+            return [("Reject", "admin_status", STATUS_REJECTED), ("Hold", "admin_status", STATUS_HOLD)]
         return full("admin_status")
     if stage == "hold":
         if c["nazim_status"] == STATUS_HOLD:
             return [("Skip Nazim", "nazim_status", STATUS_BYPASSED)]
         if c["admin_status"] == STATUS_HOLD:
             return after_hold("admin_status")
-        return []   # on hold with the President: only the President can release it
+        if c["president_status"] == STATUS_HOLD:
+            return [("Skip President", "president_status", STATUS_BYPASSED)]
+        return []
     if stage == "await_president":
-        return [("Recall", "admin_status", STATUS_PENDING)]
+        return [("Skip President", "president_status", STATUS_BYPASSED), ("Recall", "admin_status", STATUS_PENDING)]
     if stage == "approved":
         return [("Mark Paid", "paid", True), ("Reopen", "president_status", STATUS_PENDING)]
     if stage == "paid":
@@ -431,10 +522,11 @@ def _change_text(field, value):
     if field == "paid":
         return "Marked as paid" if value else "Payment mark removed (back to Approved)"
     if field == "complete":
-        return "Marked as complete (moved to Completed)" if value else "Marked as not complete (back in Open Claims)"
+        return "Marked as complete (moved on to approval)" if value else "Marked as not complete (parked in Open Claims)"
     who = {"nazim_status": "Nazim e Ala", "admin_status": "Admin", "president_status": "President"}.get(field, field)
     if value == STATUS_BYPASSED:
-        return "Nazim e Ala stage skipped"
+        return "President stage skipped (approved by Admin without the President)" if field == "president_status" \
+            else "Nazim e Ala stage skipped"
     if value == STATUS_PENDING:
         return f"{who} decision reopened"
     if field == "admin_status" and value == STATUS_APPROVED:
@@ -500,6 +592,14 @@ def update_claim(service, folder_id, claim_id, role, actor, changes=None, vouche
             continue
         if role == ROLE_ADMIN and field == "admin_status" and value == STATUS_APPROVED and not effective_voucher:
             raise PermissionError("Enter a Voucher No. before approving this claim.")
+        if role == ROLE_ADMIN and field == "admin_status" and value == STATUS_APPROVED \
+                and not (claim.get("complete") or changes.get("complete")):
+            raise PermissionError("Tick 'Claim complete' before approving this claim (or merge it with the other open claims).")
+        if role == ROLE_ADMIN and field == "president_status" and value == STATUS_BYPASSED:
+            if not (_stage_done(claim["nazim_status"]) and claim["admin_status"] == STATUS_APPROVED
+                    and claim["president_status"] in (STATUS_PENDING, STATUS_HOLD)):
+                raise PermissionError("The President stage can only be skipped while the claim is waiting for the President. Please refresh.")
+            continue
         if field == "paid":
             if value and claim_stage(claim)[0] != "approved":
                 raise PermissionError("Only approved claims can be marked as paid. Please refresh.")
@@ -529,7 +629,9 @@ def update_claim(service, folder_id, claim_id, role, actor, changes=None, vouche
                                       "Recall or reopen the claim first.")
             try:
                 pdf_bytes = service.files().get_media(fileId=claim["file_id"], supportsAllDrives=True).execute()
-                update_pdf_in_drive(service, claim["file_id"], stamp_voucher_number(pdf_bytes, new_no))
+                new_file_name = build_drive_filename(new_no, claim.get("name"), claim.get("event"), claim.get("submitted_on"))
+                update_pdf_in_drive(service, claim["file_id"], stamp_voucher_number(pdf_bytes, new_no), new_file_name)
+                claim["file_name"] = new_file_name
                 claim["voucher_no"] = new_no
                 if not old_no:
                     _log(claim, actor, f"Voucher No. set to {new_no}")
@@ -593,6 +695,98 @@ def delete_claim(service, folder_id, claim_id, role):
 # -------------------------------------------------------------------------
 # AMEND PDF (Admin): rebuild the voucher page(s) of a submitted claim, keep the receipt pages
 # -------------------------------------------------------------------------
+def merge_claims(service, folder_id, claim_ids, role, actor, event, voucher_no="", keep_first_pages=True):
+    """Admin only. Merges several OPEN claims of one claimant (same event) into one consolidated claim:
+    page 1 = a voucher page listing every receipt line of every claim, followed by each claim's pages.
+    The merged PDF is saved in Drive as VoucherNo_Claimant_Event_Date.pdf and becomes a new claim waiting for the
+    Admin to approve; the original claims are marked as merged and leave the approval flow."""
+    if role != ROLE_ADMIN:
+        raise PermissionError("Only the Admin can merge claims.")
+    event = (event or "").strip()
+    voucher_no = (voucher_no or "").strip()[:20]
+    ids = list(dict.fromkeys(claim_ids))
+    if not event:
+        raise ValueError("Enter the event description for the merged claim.")
+    if len(ids) < 2:
+        raise ValueError("Select at least two claims to merge.")
+
+    claims, fid = load_register(service, folder_id)
+    picked = [c for c in claims if c["id"] in ids]
+    if len(picked) != len(ids):
+        raise ValueError("One of the selected claims was not found. Please refresh and select again.")
+    picked.sort(key=lambda c: c.get("submitted_ts", ""))
+    for c in picked:
+        if claim_stage(c)[0] != "to_process" or c.get("complete"):
+            raise ValueError(f"The claim from {c.get('name', '')} ({c.get('event', '')}) is no longer an open claim. Please refresh.")
+    for field, label in (("name", "claimants"), ("region", "regions"), ("majlis", "majlis"), ("account", "account codes"),
+                         ("bsb", "BSB numbers"), ("acc_num", "account numbers")):
+        if len({_norm_name(c.get(field)) for c in picked}) > 1:
+            raise ValueError(f"These claims have different {label}, so they cannot be merged. Use Amend PDF to make them match first.")
+
+    first = picked[0]
+    lines = []
+    for c in picked:
+        recs = c.get("receipts") or []
+        if recs:
+            lines += [dict(r) for r in recs]
+        else:       # claims saved before receipt lines were stored: one line with the claim totals
+            lines.append({"date": c.get("submitted_on", ""), "desc": c.get("event", ""),
+                          "amount": round(float(c.get("total_claim") or 0), 2), "gst": round(float(c.get("gst") or 0), 2)})
+    total = round(sum(r["amount"] for r in lines), 2)
+    gst_total = round(sum(r["gst"] for r in lines), 2)
+    advance = round(sum(float(c.get("advance") or 0) for c in picked), 2)
+    if advance > total + 0.001:
+        raise ValueError("The advances on these claims add up to more than their total.")
+
+    form = {"name": first.get("name", ""), "region": first.get("region", ""), "majlis": first.get("majlis", ""),
+            "account": first.get("account", ""), "event": event, "bsb": first.get("bsb", ""),
+            "acc_num": first.get("acc_num", ""), "advance": advance}
+    vbuf = io.BytesIO()
+    generate_official_voucher_pdf(vbuf, build_voucher_payload(form, lines), lines)
+    cons_bytes = vbuf.getvalue()
+    if voucher_no:
+        cons_bytes = stamp_voucher_number(cons_bytes, voucher_no)
+    cons_reader = PdfReader(io.BytesIO(cons_bytes))
+
+    writer = PdfWriter()
+    for page in cons_reader.pages:
+        writer.add_page(page)
+    for c in picked:
+        data = service.files().get_media(fileId=c["file_id"], supportsAllDrives=True).execute()
+        reader = PdfReader(io.BytesIO(data))
+        skip = 0 if keep_first_pages else _voucher_page_count(reader, c.get("voucher_pages", 1))
+        for page in reader.pages[skip:]:
+            writer.add_page(page)
+    out = io.BytesIO()
+    writer.write(out)
+
+    now = now_local()
+    drive_name = build_drive_filename(voucher_no, first.get("name"), event, now.strftime("%d/%m/%Y"))
+    new_file_id, new_link = upload_pdf_to_drive(service, folder_id, drive_name, out.getvalue())
+    new_id = uuid.uuid4().hex[:10]
+    record = {
+        "id": new_id, "submitted_on": now.strftime("%d/%m/%Y"), "submitted_ts": now.isoformat(),
+        "name": first.get("name", ""), "claimant_email": first.get("claimant_email", ""), "event": event,
+        "region": first.get("region", ""), "majlis": first.get("majlis", ""), "account": first.get("account", ""),
+        "bsb": first.get("bsb", ""), "acc_num": first.get("acc_num", ""),
+        "total_claim": total, "gst": gst_total, "advance": advance, "amount_payable": round(total - advance, 2),
+        "file_name": drive_name, "file_id": new_file_id, "file_link": new_link, "voucher_no": voucher_no,
+        "voucher_pages": len(cons_reader.pages), "receipts": lines, "flags": [], "comments": [], "paid": False,
+        "complete": True, "merged_from": [c["id"] for c in picked],
+        "nazim_status": STATUS_BYPASSED, "nazim_by": "Merged", "admin_status": STATUS_PENDING,
+        "president_status": STATUS_PENDING, "history": [],
+    }
+    _log(record, actor, f"Consolidated claim created by merging {len(picked)} open claims "
+                        f"({len(lines)} receipt line{'s' if len(lines) != 1 else ''}, ${total:,.2f})")
+    for c in picked:
+        c["merged_into"] = new_id
+        c["complete"] = True
+        _log(c, actor, f"Merged into consolidated claim {voucher_no or new_id}")
+    claims.append(record)
+    save_register(service, folder_id, claims, fid)
+    return record
+
+
 def build_voucher_payload(form, receipts, request_date=None):
     """The dictionary generate_official_voucher_pdf() needs, built from the claim form fields."""
     cfg = st.session_state.admin_lists
@@ -753,7 +947,8 @@ def amend_claim(service, folder_id, claim_id, role, actor, form, rows, extra_fil
 
     if claim.get("voucher_no"):
         new_bytes = stamp_voucher_number(new_bytes, claim["voucher_no"])
-    update_pdf_in_drive(service, claim["file_id"], new_bytes)
+    new_file_name = build_drive_filename(claim.get("voucher_no"), name, event, claim.get("submitted_on"))
+    update_pdf_in_drive(service, claim["file_id"], new_bytes, new_file_name)
 
     # What changed (for the history)
     changed = []
@@ -781,7 +976,7 @@ def amend_claim(service, folder_id, claim_id, role, actor, form, rows, extra_fil
         "account": form["account"], "claimant_email": form.get("claimant_email", ""),
         "bsb": form["bsb"], "acc_num": form["acc_num"], "advance": advance,
         "total_claim": total, "gst": gst_total, "amount_payable": round(total - advance, 2),
-        "receipts": clean, "voucher_pages": len(new_voucher.pages),
+        "receipts": clean, "voucher_pages": len(new_voucher.pages), "file_name": new_file_name,
     })
     _log(claim, actor, "PDF amended by Admin" + (": " + ", ".join(changed) if changed else " (no field changes)"))
     save_register(service, folder_id, claims, fid)
@@ -1125,7 +1320,8 @@ def find_duplicate_receipts(rows, earlier_claims=None, skip_claim_id=None):
     (the strongest match is reported for each line). rows: [{"date","amount","exact","sig","date_detected"}].
     Rejected claims are ignored, since a corrected claim may legitimately contain the same receipts."""
     flags = []
-    earlier = [c for c in (earlier_claims or []) if c.get("id") != skip_claim_id and claim_stage(c)[0] != "rejected"]
+    earlier = [c for c in (earlier_claims or []) if c.get("id") != skip_claim_id and claim_stage(c)[0] != "rejected"
+               and not c.get("merged_into")]
     for j, row in enumerate(rows):
         best_rank, hit = 0, None
         for i in range(j):
@@ -1387,7 +1583,8 @@ def _history_lines(c):
             for e in events]
 
 
-def render_claim_rows(service, folder_id, claims_subset, auth, tab_key, newest_first=False, show_history=False):
+def render_claim_rows(service, folder_id, claims_subset, auth, tab_key, newest_first=False, show_history=False,
+                      merge_select=False):
     """Draws the table for one tab, oldest claim first (newest first when newest_first is set).
     The buttons each role sees come from actions_for(). Everyone can comment; only the Admin gets the
     Voucher No. box, Amend PDF and Delete."""
@@ -1398,13 +1595,24 @@ def render_claim_rows(service, folder_id, claims_subset, auth, tab_key, newest_f
     role = auth["role"]
     actor = auth["name"]
 
+    if merge_select and role == ROLE_ADMIN:
+        chosen = [c["id"] for c in claims_subset if st.session_state.get(f"mrg_{c['id']}")]
+        m_btn, m_note = st.columns([2, 6])
+        if m_btn.button(f"🔗 Merge selected ({len(chosen)})", key=f"merge_go_{tab_key}", type="primary",
+                        disabled=len(chosen) < 2):
+            st.session_state["merge_ids"] = chosen
+            st.session_state["admin_view"] = "merge"
+            st.rerun()
+        m_note.caption("Several claims for one event? Tick 'Select to merge' on each of them (same claimant), "
+                       "then click Merge. Ticking 'Claim complete' instead sends a single claim on for approval.")
+
     header_cols = st.columns(DASH_WIDTHS)
     for col, label in zip(header_cols, DASH_HEADERS):
         col.markdown(f"**{label}**")
     st.divider()
 
     for c in sorted(claims_subset, key=lambda x: x.get("submitted_ts", ""), reverse=newest_first):
-        _, status_text = claim_stage(c)
+        stage_key, status_text = claim_stage(c)
         flags = c.get("flags") or []
         comments = c.get("comments") or []
 
@@ -1418,7 +1626,7 @@ def render_claim_rows(service, folder_id, claims_subset, auth, tab_key, newest_f
         _cell(cols[5], f"-${advance:,.2f}" if advance > 0 else "-")
         _cell(cols[6], f"**${c.get('amount_payable', 0):,.2f}**")
         cols[7].markdown(f"**{_md_escape(c['voucher_no'])}**" if c.get("voucher_no") else "-")
-        _cell(cols[8], status_text + (" ⚠️" if flags else "") + (" ✅ Complete" if c.get("complete") else ""))
+        _cell(cols[8], status_text + (" ⚠️" if flags else "") + (" ✅ Complete" if c.get("complete") and stage_key == "to_process" else ""))
         _cell(cols[9], f"💬 {len(comments)}" if comments else "-")
         cols[10].markdown(f"[Open PDF]({c.get('file_link', '')})")
 
@@ -1461,12 +1669,16 @@ def render_claim_rows(service, folder_id, claims_subset, auth, tab_key, newest_f
         with ctrl_area:
             if role == ROLE_ADMIN:
                 is_complete = bool(c.get("complete"))
-                # the key includes the saved state, so every copy of this claim (other tabs) shows the new value
-                ticked = st.checkbox(
-                    "Does this claim complete? (tick = Completed, untick = Open Claims)", value=is_complete,
-                    key=f"cplt_{key_base}_{int(is_complete)}")
-                if ticked != is_complete:
-                    _apply({"complete": ticked})
+                if stage_key == "to_process" or (stage_key == "hold" and c["admin_status"] == STATUS_HOLD):
+                    # the key includes the saved state, so the box always shows the saved value
+                    ticked = st.checkbox(
+                        "Claim complete (nothing more is coming for this event). Tick to send it on for approval; "
+                        "leave unticked to keep it in Open Claims.", value=is_complete,
+                        key=f"cplt_{key_base}_{int(is_complete)}")
+                    if ticked != is_complete:
+                        _apply({"complete": ticked})
+                if merge_select and stage_key == "to_process" and not is_complete:
+                    st.checkbox("Select to merge", key=f"mrg_{c['id']}")
 
                 n = len(actions)
                 row_cols = st.columns([2.0, 1.0] + [1.15] * n + [max(0.2, 3.6 - 1.15 * n), 1.4, 1.1])
@@ -1572,6 +1784,11 @@ def _stage_is(*keys):
     return lambda c: claim_stage(c)[0] in keys
 
 
+def is_open_claim(c):
+    """Open = with the Admin but not yet ticked as complete (more claims may still come for the same event)."""
+    return claim_stage(c)[0] == "to_process" and not c.get("complete")
+
+
 # ---------------------------- ADMIN ----------------------------
 def render_claims_dashboard(auth):
     st.markdown("### 📊 Claims Dashboard")
@@ -1594,15 +1811,15 @@ def render_claims_dashboard(auth):
     service, folder_id, claims = data
 
     render_tabs(service, folder_id, claims, auth, [
-        ("To Process", _stage_is("to_process")),
+        ("Open Claims", is_open_claim, {"merge_select": True}),
+        ("To Process", lambda c: claim_stage(c)[0] == "to_process" and bool(c.get("complete"))),
         ("Awaiting Nazim", _stage_is("await_nazim")),
         ("On Hold", _stage_is("hold")),
         ("Waiting President", _stage_is("await_president")),
         ("Approved", _stage_is("approved")),
         ("Paid", _stage_is("paid"), {"newest_first": True, "show_history": True}),
         ("Rejected", _stage_is("rejected")),
-        ("Open Claims", lambda c: not c.get("complete") and claim_stage(c)[0] != "rejected"),
-        ("Completed", lambda c: bool(c.get("complete")), {"newest_first": True, "show_history": True}),
+        ("Merged", _stage_is("merged"), {"newest_first": True, "show_history": True}),
     ], "admin")
 
 
@@ -1619,7 +1836,7 @@ def render_nazim_dashboard(auth):
     service, folder_id, claims = data
     mine = [c for c in claims if c.get("region") == region]
 
-    in_progress = lambda c: _stage_done(c["nazim_status"]) and claim_stage(c)[0] not in ("approved", "paid", "rejected")
+    in_progress = lambda c: _stage_done(c["nazim_status"]) and claim_stage(c)[0] not in ("approved", "paid", "rejected", "merged")
     render_tabs(service, folder_id, mine, auth, [
         ("To Review", _stage_is("await_nazim")),
         ("On Hold", lambda c: c["nazim_status"] == STATUS_HOLD),
@@ -1644,7 +1861,7 @@ def render_president_dashboard(auth):
     render_tabs(service, folder_id, visible, auth, [
         ("To Approve", _stage_is("await_president")),
         ("On Hold", lambda c: c["president_status"] == STATUS_HOLD),
-        ("Approved", _stage_is("approved", "paid")),
+        ("Approved", lambda c: claim_stage(c)[0] in ("approved", "paid") and c["president_status"] == STATUS_APPROVED),
         ("Rejected", lambda c: c["president_status"] == STATUS_REJECTED),
     ], "president")
 
@@ -1798,6 +2015,8 @@ def compute_balances(entries, claims, heads):
 def filter_claims(claims, head="All", region="All", fy="All", state="All"):
     out = []
     for c in claims:
+        if claim_stage(c)[0] == "merged":       # counted through the consolidated claim instead
+            continue
         if head != "All" and c.get("account") != head:
             continue
         if region != "All" and c.get("region") != region:
@@ -1806,9 +2025,9 @@ def filter_claims(claims, head="All", region="All", fy="All", state="All"):
             d = _claim_date(c)
             if not d or _fy_label(d) != fy:
                 continue
-        if state == "Open" and (c.get("complete") or claim_stage(c)[0] == "rejected"):
+        if state == "Open" and not is_open_claim(c):
             continue
-        if state == "Completed" and not c.get("complete"):
+        if state == "Completed" and (is_open_claim(c) or claim_stage(c)[0] == "rejected"):
             continue
         out.append(c)
     return out
@@ -2046,8 +2265,8 @@ def render_summary_page(auth):
         m5, m6, m7, m8 = st.columns(4)
         m5.metric("Approved, still to pay", _money(to_pay))
         m6.metric("Still in approval", _money(in_pipe))
-        m7.metric("Open claims", sum(1 for c in live if not c.get("complete")))
-        m8.metric("Completed claims", sum(1 for c in live if c.get("complete")))
+        m7.metric("Open claims", sum(1 for c in live if is_open_claim(c)))
+        m8.metric("Completed claims", sum(1 for c in live if not is_open_claim(c)))
 
         if head_f != "All":
             b = balances.get(head_f, {})
@@ -2214,6 +2433,64 @@ def render_summary_page(auth):
                 if pdf_bytes:
                     dl2.download_button("📥 Download PDF", data=pdf_bytes,
                                         file_name=f"BAS_report_{stamp}.pdf", mime="application/pdf")
+
+
+# -------------------------------------------------------------------------
+# ADMIN: MERGE OPEN CLAIMS
+# -------------------------------------------------------------------------
+def render_merge_page(auth):
+    st.markdown("### 🔗 Merge Open Claims")
+    if st.button("⬅ Back to Claims Dashboard"):
+        st.session_state["admin_view"] = "dashboard"
+        st.rerun()
+
+    data = load_dashboard_data(ROLE_ADMIN)
+    if data is None:
+        return
+    service, folder_id, claims = data
+    ids = st.session_state.get("merge_ids") or []
+    picked = sorted([c for c in claims if c["id"] in ids], key=lambda c: c.get("submitted_ts", ""))
+    if len(picked) < 2:
+        st.error("Select at least two open claims on the Open Claims tab first.")
+        return
+
+    st.caption("One consolidated voucher page is placed first (every receipt line of every claim, one total), "
+               "followed by the pages of each claim. The result is saved to Google Drive as a new claim "
+               "(Voucher No_Claimant_Event_Date.pdf) and the original claims move to the Merged tab.")
+    st.dataframe(pd.DataFrame([{
+        "Claimant": c.get("name", ""), "Date": c.get("submitted_on", ""), "Event": c.get("event", ""),
+        "Receipts": len(c.get("receipts") or []) or 1, "Total claim": float(c.get("total_claim") or 0),
+        "GST": float(c.get("gst") or 0), "Advance": float(c.get("advance") or 0)} for c in picked]),
+        hide_index=True, use_container_width=True,
+        column_config={k: st.column_config.NumberColumn(k, format="$%.2f") for k in ("Total claim", "GST", "Advance")})
+
+    total = sum(float(c.get("total_claim") or 0) for c in picked)
+    adv = sum(float(c.get("advance") or 0) for c in picked)
+    m1, m2, m3 = st.columns(3)
+    m1.metric("Consolidated total claim", _money(total))
+    m2.metric("Advance settled", _money(adv))
+    m3.metric("Amount to pay", _money(total - adv))
+
+    tag = "_".join(c["id"] for c in picked)
+    event = st.text_input("Event description for the merged claim", value=picked[0].get("event", ""), key=f"mg_event_{tag}")
+    voucher = st.text_input("Voucher No. for the merged claim (can also be added later)", max_chars=20, key=f"mg_vno_{tag}")
+    keep = st.checkbox("Keep each claim's own first (voucher) page after the consolidated page", value=True, key=f"mg_keep_{tag}")
+
+    if st.button("🔗 Merge and save to Google Drive", type="primary"):
+        try:
+            with st.spinner("Merging the PDFs and saving to Google Drive..."):
+                record = merge_claims(service, folder_id, [c["id"] for c in picked], auth["role"], auth["name"],
+                                      event, voucher, keep)
+        except Exception as e:
+            st.error(f"Could not merge: {e}")
+        else:
+            for c in picked:
+                st.session_state.pop(f"mrg_{c['id']}", None)
+            st.session_state["merge_ids"] = []
+            st.session_state["admin_view"] = "dashboard"
+            st.session_state["dash_notice"] = (f"Merged {len(picked)} claims into one consolidated claim "
+                                               f"({record['file_name']}). It is now in To Process.")
+            st.rerun()
 
 
 # -------------------------------------------------------------------------
@@ -2562,6 +2839,27 @@ def render_settings_page():
                 st.error(f"Could not open that folder. Check the link, and that it belongs to (or is shared with) the connected Google account. Details: {e}")
 
     st.markdown("---")
+    st.markdown("#### 👤 Members List (auto-fills the claim form)")
+    st.caption("Upload a CSV or Excel file with the headings Name, Email, Region, Majlis (and optionally Account). "
+               "When a claimant types their name, those details are filled in. Bank details are never stored in this list "
+               "and are always typed in by the claimant. The list is saved in the Drive folder as members.csv. "
+               "A name with no match here is looked up in that person's earlier claims.")
+    members_file = st.file_uploader("Members list (.csv or .xlsx)", type=["csv", "xlsx"], key="members_upload")
+    if st.button("Save members list to Drive", disabled=members_file is None):
+        try:
+            m_service = get_drive_service()
+            m_folder = typed_folder_id or get_drive_folder_id()
+            if m_service is None or not m_folder:
+                raise RuntimeError("Google Drive is not set up yet.")
+            csv_data = members_csv_from_upload(members_file.name, members_file.getvalue())
+            save_members(m_service, m_folder, csv_data)
+            st.session_state.pop("members_cache", None)
+            count = len(list(csv.DictReader(io.StringIO(csv_data.decode("utf-8-sig", errors="replace")))))
+            st.success(f"Members list saved ({count} people).")
+        except Exception as e:
+            st.error(f"Could not save the members list: {e}")
+
+    st.markdown("---")
     st.markdown("### 👑 Central Executive Authority Configuration (Global Overrides)")
     q_mal = st.text_input("Approved by Qaid Mal - Target Field Assignment Name", value=st.session_state.admin_lists.get("qaid_mal_name", "Tahir Mahmood Rana"))
     s_maa = st.text_input("Approved by Sadr MAA - Target Field Assignment Name", value=st.session_state.admin_lists.get("sadr_maa_name", "Abdul Jamil Mubbashar"))
@@ -2660,6 +2958,7 @@ def _form_reset(dismiss_submission=False):
     for key in [k for k in st.session_state.keys() if str(k).startswith(f"fm{v}_")]:
         del st.session_state[key]
     st.session_state["form_v"] = v + 1
+    st.session_state.pop("autofill_msg", None)
     st.session_state["row_ctr"] = 1
     st.session_state["rows"] = ["r0"]
     st.session_state["row_meta"] = {"r0": {"kind": "upload"}}
@@ -2786,6 +3085,46 @@ def _refresh_earlier_claims():
     return claims
 
 
+def _members():
+    """The members list from Drive, kept for a couple of minutes so typing stays fast."""
+    cache = st.session_state.get("members_cache")
+    if cache and time.time() - cache["at"] < EARLIER_CACHE_SECONDS:
+        return cache["rows"]
+    rows = []
+    try:
+        service = get_drive_service()
+        folder_id = get_drive_folder_id()
+        if service is not None and folder_id:
+            rows = load_members(service, folder_id)
+    except Exception:
+        rows = []
+    st.session_state["members_cache"] = {"at": time.time(), "rows": rows}
+    return rows
+
+
+def _autofill_from_name():
+    """Runs when the name is changed: fills email, region, majlis and account (never the bank details)."""
+    name = st.session_state.get(_K("name"), "")
+    info = lookup_person(name, _members(), _earlier_claims())
+    if not info:
+        st.session_state.pop("autofill_msg", None)
+        return
+    cfg = st.session_state.admin_lists
+    regions = cfg.get("regions", [])
+    if info.get("email"):
+        st.session_state[_K("email")] = info["email"]
+    region = info.get("region") if info.get("region") in regions else st.session_state.get(_K("region")) or (regions[0] if regions else "")
+    if info.get("region") in regions:
+        st.session_state[_K("region")] = info["region"]
+    if info.get("majlis") in cfg.get("regional_majlis", {}).get(region, []):
+        st.session_state[_K(f"majlis_{region}")] = info["majlis"]
+    accounts = cfg.get("regional_accounts", DEFAULT_CONFIG["regional_accounts"])
+    choices = accounts.get("National", []) if region == "National" else accounts.get("General_Regional", [])
+    if info.get("account") in choices:
+        st.session_state[_K(f"account_{region == 'National'}")] = info["account"]
+    st.session_state["autofill_msg"] = "✅ Your details were filled in from our records. Please check them and enter your bank details."
+
+
 def _value_inputs(rid, label):
     c1, c2, c3, c4 = st.columns([3, 2, 1.5, 1.5])
     desc = c1.text_input(f"Item Description {label}", key=_K("desc", rid))
@@ -2824,7 +3163,10 @@ def render_claim_form():
 
     col1, col2 = st.columns(2)
     with col1:
-        name = st.text_input("Full Name (Payee Name)", key=_K("name"))
+        name = st.text_input("Full Name (Payee Name)", key=_K("name"), on_change=_autofill_from_name,
+                             help="Type your full name and press Enter: your email, region, majlis and account code are filled in if we know you.")
+        if st.session_state.get("autofill_msg"):
+            st.caption(st.session_state["autofill_msg"])
         claimant_email = st.text_input("Email Address", key=_K("email"))
         expense_event_desc = st.text_input("Description of Event (Expense Type)", key=_K("event"))
 
@@ -3039,7 +3381,8 @@ def render_claim_form():
             if service is None or not folder_id:
                 raise RuntimeError("Google Drive storage has not been set up by the administrator yet.")
 
-            file_id, file_link = upload_pdf_to_drive(service, folder_id, output_filename, pdf_bytes)
+            drive_name = build_drive_filename("", name, expense_event_desc, now_local().strftime("%d/%m/%Y"))
+            file_id, file_link = upload_pdf_to_drive(service, folder_id, drive_name, pdf_bytes)
             has_nazim = region_has_nazim_login(region)
             now = now_local()
             record = {
@@ -3058,7 +3401,7 @@ def render_claim_form():
                 "gst": calculated_total_gst,
                 "advance": round(advance_amount, 2),
                 "amount_payable": round(calculated_total_claim - advance_amount, 2),
-                "file_name": output_filename,
+                "file_name": drive_name,
                 "file_id": file_id,
                 "file_link": file_link,
                 "voucher_no": "",
@@ -3127,6 +3470,8 @@ if app_mode == "Admin Panel Configuration":
                 render_roles_page()
             elif view == "amend":
                 render_amend_page(auth)
+            elif view == "merge":
+                render_merge_page(auth)
             elif view == "summary":
                 render_summary_page(auth)
             else:
