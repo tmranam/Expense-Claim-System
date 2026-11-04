@@ -697,6 +697,25 @@ def delete_claim(service, folder_id, claim_id, role):
 # -------------------------------------------------------------------------
 # AMEND PDF (Admin): rebuild the voucher page(s) of a submitted claim, keep the receipt pages
 # -------------------------------------------------------------------------
+def complete_claims(service, folder_id, claim_ids, role, actor):
+    """Admin only. Marks several claims as complete in one go (they leave Open Claims). Returns how many changed."""
+    if role != ROLE_ADMIN:
+        raise PermissionError("Only the Admin can mark claims as complete.")
+    claims, fid = load_register(service, folder_id)
+    wanted = set(claim_ids)
+    n = 0
+    for c in claims:
+        if c["id"] in wanted and not c.get("complete") and claim_stage(c)[0] not in ("rejected", "merged"):
+            c["complete"] = True
+            c["complete_by"] = actor
+            c["complete_on"] = now_local().strftime('%d/%m/%Y')
+            _log(c, actor, _change_text("complete", True))
+            n += 1
+    if n:
+        save_register(service, folder_id, claims, fid)
+    return n
+
+
 def merge_claims(service, folder_id, claim_ids, role, actor, event, voucher_no="", keep_first_pages=True):
     """Admin only. Merges several OPEN claims of one claimant (same event) into one consolidated claim:
     page 1 = a voucher page listing every receipt line of every claim, followed by each claim's pages.
@@ -1599,15 +1618,25 @@ def render_claim_rows(service, folder_id, claims_subset, auth, tab_key, newest_f
 
     if merge_select and role == ROLE_ADMIN:
         chosen = [c["id"] for c in claims_subset if st.session_state.get(f"mrg_{c['id']}")]
-        m_btn, m_note = st.columns([2, 6])
+        m_btn, c_btn, m_note = st.columns([2, 2, 5])
         if m_btn.button(f"🔗 Merge selected ({len(chosen)})", key=f"merge_go_{tab_key}", type="primary",
                         disabled=len(chosen) < 2):
             st.session_state["merge_ids"] = chosen
             st.session_state["admin_view"] = "merge"
             st.rerun()
-        m_note.caption("Several claims for one event? Tick 'Select to merge' on each of them (same claimant), "
-                       "then click Merge (only claims still with the Admin, not yet approved, can be merged). "
-                       "Open claims can still be approved and paid; tick 'Claim complete' when nothing more is coming.")
+        if c_btn.button(f"✅ Complete selected ({len(chosen)})", key=f"complete_go_{tab_key}", disabled=not chosen):
+            try:
+                done = complete_claims(service, folder_id, chosen, role, actor)
+            except Exception as e:
+                st.error(f"Could not complete the claims: {e}")
+            else:
+                for cid in chosen:
+                    st.session_state.pop(f"mrg_{cid}", None)
+                st.session_state["dash_notice"] = f"{done} claim{'s' if done != 1 else ''} marked as complete and removed from Open Claims."
+                st.rerun()
+        m_note.caption("Tick 'Select' on one or more claims, then click Merge (several claims of one claimant, still with the Admin and "
+                       "not yet approved, become one file with a header page) or Complete (all selected claims leave Open Claims). "
+                       "Open claims can still be approved and paid.")
 
     header_cols = st.columns(DASH_WIDTHS)
     for col, label in zip(header_cols, DASH_HEADERS):
@@ -1672,7 +1701,7 @@ def render_claim_rows(service, folder_id, claims_subset, auth, tab_key, newest_f
         with ctrl_area:
             if role == ROLE_ADMIN:
                 is_complete = bool(c.get("complete"))
-                if stage_key not in ("merged", "rejected"):
+                if stage_key not in ("merged", "rejected") and not merge_select:
                     # the key includes the saved state, so the box always shows the saved value
                     ticked = st.checkbox(
                         "Claim complete (nothing more is coming for this event). Untick = stays in Open Claims, "
@@ -1680,8 +1709,8 @@ def render_claim_rows(service, folder_id, claims_subset, auth, tab_key, newest_f
                         key=f"cplt_{key_base}_{int(is_complete)}")
                     if ticked != is_complete:
                         _apply({"complete": ticked})
-                if merge_select and stage_key == "to_process" and not is_complete:
-                    st.checkbox("Select to merge", key=f"mrg_{c['id']}")
+                if merge_select:
+                    st.checkbox("Select (for Merge or Complete)", key=f"mrg_{c['id']}")
 
                 n = len(actions)
                 row_cols = st.columns([2.0, 1.0] + [1.15] * n + [max(0.2, 3.6 - 1.15 * n), 1.4, 1.1])
