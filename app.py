@@ -421,7 +421,7 @@ def normalize_claim(c):
     return c
 
 
-def claim_stage(c):
+def _claim_stage_core(c):
     """Returns (stage_key, human readable status) for a claim."""
     if c.get("merged_into"):
         return "merged", "Merged into a consolidated claim"
@@ -440,8 +440,6 @@ def claim_stage(c):
     if a == STATUS_HOLD:
         return "hold", "On hold by Admin"
     if a == STATUS_PENDING:
-        if not c.get("complete"):
-            return "to_process", "Open claim (not marked complete yet)"
         if n == STATUS_APPROVED:
             return "to_process", f"Approved by {nazim}"
         return "to_process", "Nazim e Ala skipped by Admin" if c.get("nazim_by") == "Admin" else "Ready for Admin"
@@ -457,6 +455,15 @@ def claim_stage(c):
     if p == STATUS_BYPASSED:
         return "approved", "President skipped by Admin"
     return "approved", "Approved by President" if p == STATUS_APPROVED else "Approved by Admin"
+
+
+def claim_stage(c):
+    """(stage_key, status text). A claim the Admin has not ticked 'complete' is an open claim: it keeps moving through
+    approval and payment as usual, and its status text says so, e.g. 'Open claim (Waiting approval from President)'."""
+    key, text = _claim_stage_core(c)
+    if not c.get("complete") and key not in ("rejected", "merged"):
+        text = f"Open claim ({text})"
+    return key, text
 
 
 def actions_for(role, c):
@@ -483,8 +490,6 @@ def actions_for(role, c):
     if stage == "await_nazim":
         return [("Skip Nazim", "nazim_status", STATUS_BYPASSED)]
     if stage == "to_process":
-        if not c.get("complete"):       # an open claim cannot be approved until it is ticked as complete
-            return [("Reject", "admin_status", STATUS_REJECTED), ("Hold", "admin_status", STATUS_HOLD)]
         return full("admin_status")
     if stage == "hold":
         if c["nazim_status"] == STATUS_HOLD:
@@ -522,7 +527,7 @@ def _change_text(field, value):
     if field == "paid":
         return "Marked as paid" if value else "Payment mark removed (back to Approved)"
     if field == "complete":
-        return "Marked as complete (moved on to approval)" if value else "Marked as not complete (parked in Open Claims)"
+        return "Marked as complete (removed from Open Claims)" if value else "Marked as not complete (back in Open Claims)"
     who = {"nazim_status": "Nazim e Ala", "admin_status": "Admin", "president_status": "President"}.get(field, field)
     if value == STATUS_BYPASSED:
         return "President stage skipped (approved by Admin without the President)" if field == "president_status" \
@@ -592,9 +597,6 @@ def update_claim(service, folder_id, claim_id, role, actor, changes=None, vouche
             continue
         if role == ROLE_ADMIN and field == "admin_status" and value == STATUS_APPROVED and not effective_voucher:
             raise PermissionError("Enter a Voucher No. before approving this claim.")
-        if role == ROLE_ADMIN and field == "admin_status" and value == STATUS_APPROVED \
-                and not (claim.get("complete") or changes.get("complete")):
-            raise PermissionError("Tick 'Claim complete' before approving this claim (or merge it with the other open claims).")
         if role == ROLE_ADMIN and field == "president_status" and value == STATUS_BYPASSED:
             if not (_stage_done(claim["nazim_status"]) and claim["admin_status"] == STATUS_APPROVED
                     and claim["president_status"] in (STATUS_PENDING, STATUS_HOLD)):
@@ -1604,7 +1606,8 @@ def render_claim_rows(service, folder_id, claims_subset, auth, tab_key, newest_f
             st.session_state["admin_view"] = "merge"
             st.rerun()
         m_note.caption("Several claims for one event? Tick 'Select to merge' on each of them (same claimant), "
-                       "then click Merge. Ticking 'Claim complete' instead sends a single claim on for approval.")
+                       "then click Merge (only claims still with the Admin, not yet approved, can be merged). "
+                       "Open claims can still be approved and paid; tick 'Claim complete' when nothing more is coming.")
 
     header_cols = st.columns(DASH_WIDTHS)
     for col, label in zip(header_cols, DASH_HEADERS):
@@ -1626,7 +1629,7 @@ def render_claim_rows(service, folder_id, claims_subset, auth, tab_key, newest_f
         _cell(cols[5], f"-${advance:,.2f}" if advance > 0 else "-")
         _cell(cols[6], f"**${c.get('amount_payable', 0):,.2f}**")
         cols[7].markdown(f"**{_md_escape(c['voucher_no'])}**" if c.get("voucher_no") else "-")
-        _cell(cols[8], status_text + (" ⚠️" if flags else "") + (" ✅ Complete" if c.get("complete") and stage_key == "to_process" else ""))
+        _cell(cols[8], status_text + (" ⚠️" if flags else "") + (" ✅ Complete" if c.get("complete") else ""))
         _cell(cols[9], f"💬 {len(comments)}" if comments else "-")
         cols[10].markdown(f"[Open PDF]({c.get('file_link', '')})")
 
@@ -1669,11 +1672,11 @@ def render_claim_rows(service, folder_id, claims_subset, auth, tab_key, newest_f
         with ctrl_area:
             if role == ROLE_ADMIN:
                 is_complete = bool(c.get("complete"))
-                if stage_key == "to_process" or (stage_key == "hold" and c["admin_status"] == STATUS_HOLD):
+                if stage_key not in ("merged", "rejected"):
                     # the key includes the saved state, so the box always shows the saved value
                     ticked = st.checkbox(
-                        "Claim complete (nothing more is coming for this event). Tick to send it on for approval; "
-                        "leave unticked to keep it in Open Claims.", value=is_complete,
+                        "Claim complete (nothing more is coming for this event). Untick = stays in Open Claims, "
+                        "tick = removed from Open Claims. Approval and payment work either way.", value=is_complete,
                         key=f"cplt_{key_base}_{int(is_complete)}")
                     if ticked != is_complete:
                         _apply({"complete": ticked})
@@ -1785,8 +1788,9 @@ def _stage_is(*keys):
 
 
 def is_open_claim(c):
-    """Open = with the Admin but not yet ticked as complete (more claims may still come for the same event)."""
-    return claim_stage(c)[0] == "to_process" and not c.get("complete")
+    """Open = not ticked 'complete' by the Admin (more claims may still come for the same event). An open claim is
+    still approved, sent to the President and paid as normal; it just stays listed here until it is ticked complete."""
+    return not c.get("complete") and claim_stage(c)[0] not in ("rejected", "merged")
 
 
 # ---------------------------- ADMIN ----------------------------
@@ -1812,7 +1816,7 @@ def render_claims_dashboard(auth):
 
     render_tabs(service, folder_id, claims, auth, [
         ("Open Claims", is_open_claim, {"merge_select": True}),
-        ("To Process", lambda c: claim_stage(c)[0] == "to_process" and bool(c.get("complete"))),
+        ("To Process", _stage_is("to_process")),
         ("Awaiting Nazim", _stage_is("await_nazim")),
         ("On Hold", _stage_is("hold")),
         ("Waiting President", _stage_is("await_president")),
