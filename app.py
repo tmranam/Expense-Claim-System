@@ -1604,9 +1604,135 @@ def _history_lines(c):
             for e in events]
 
 
+PERIOD_CHOICES = ["All dates", "Last 7 days", "Last 30 days", "Last 90 days", "This month", "Last month",
+                  "This financial year"]
+SORT_CHOICES = ["Date submitted", "Claimant", "Event", "Total claim", "Amount to pay", "Voucher No.", "Status"]
+
+
+def _in_period(d, period, today):
+    """True when date d falls in the chosen period preset (claims with no date only show under 'All dates')."""
+    if period == "All dates":
+        return True
+    if d is None:
+        return False
+    if period == "Last 7 days":
+        return today - timedelta(days=7) <= d <= today
+    if period == "Last 30 days":
+        return today - timedelta(days=30) <= d <= today
+    if period == "Last 90 days":
+        return today - timedelta(days=90) <= d <= today
+    if period == "This month":
+        return (d.year, d.month) == (today.year, today.month)
+    if period == "Last month":
+        last = today.replace(day=1) - timedelta(days=1)
+        return (d.year, d.month) == (last.year, last.month)
+    return _fy_label(d) == _fy_label(today)
+
+
+def _voucher_sort_key(c):
+    v = str(c.get("voucher_no") or "").strip()
+    parts = re.split(r"(\d+)", v.lower())
+    return [(0, int(p), "") if p.isdigit() else (1, 0, p) for p in parts if p != ""]
+
+
+def filter_sort_claims(claims_subset, key, default_newest=False, show_region=True):
+    """Draws the Search / Sort / Filter controls above a claims list and returns the claims to show, in order.
+    Every list has its own controls (key), so each tab remembers its own choices."""
+    k = lambda n: f"fs_{key}_{n}"
+    stage_text = {c["id"]: claim_stage(c)[1] for c in claims_subset}
+
+    def options(values):
+        return ["All"] + sorted({v for v in values if v}, key=lambda x: str(x).lower())
+
+    opts = {
+        "status": options(stage_text.values()),
+        "who": options(c.get("name") for c in claims_subset),
+        "reg": options(c.get("region") for c in claims_subset),
+        "acct": options(c.get("account") for c in claims_subset),
+    }
+    defaults = {"q": "", "sort": "Date submitted", "dir": "Descending" if default_newest else "Ascending",
+                "status": "All", "who": "All", "reg": "All", "acct": "All", "per": "All dates"}
+    for name, value in defaults.items():
+        st.session_state.setdefault(k(name), value)       # first visit: start from the default order and no filters
+    for name, choices in (("status", opts["status"]), ("who", opts["who"]), ("reg", opts["reg"]),
+                          ("acct", opts["acct"]), ("per", PERIOD_CHOICES), ("sort", SORT_CHOICES),
+                          ("dir", ["Ascending", "Descending"])):
+        if st.session_state.get(k(name), defaults[name]) not in choices:
+            st.session_state[k(name)] = defaults[name]     # a saved choice that no longer exists falls back to All
+
+    def reset():
+        for name, value in defaults.items():
+            st.session_state[k(name)] = value
+
+    extra = ["status", "who", "acct", "per"] + (["reg"] if show_region else [])
+    active = sum(1 for n in extra if st.session_state.get(k(n), defaults[n]) != defaults[n])
+    active_q = bool(str(st.session_state.get(k("q"), "")).strip())
+
+    c1, c2, c3, c4 = st.columns([3, 2, 1.6, 1.2])
+    query = c1.text_input("Search", key=k("q"), placeholder="🔍 Search claimant, event, voucher no. or amount",
+                          label_visibility="collapsed")
+    sort_by = c2.selectbox("Sort by", SORT_CHOICES, key=k("sort"), format_func=lambda x: f"Sort by: {x}",
+                           label_visibility="collapsed")
+    direction = c3.selectbox("Order", ["Ascending", "Descending"], key=k("dir"),
+                             format_func=lambda x: "↑ Ascending (A-Z, oldest, lowest)" if x == "Ascending"
+                             else "↓ Descending (Z-A, newest, highest)", label_visibility="collapsed")
+    c4.button("Clear filters", key=k("clear"), on_click=reset, use_container_width=True,
+              disabled=not (active or active_q))
+
+    with st.expander("Filters" + (f" ({active} active)" if active else ""), expanded=bool(active)):
+        cols = st.columns(5 if show_region else 4)
+        status_f = cols[0].selectbox("Status", opts["status"], key=k("status"))
+        who_f = cols[1].selectbox("Claimant", opts["who"], key=k("who"))
+        acct_f = cols[2].selectbox("Account head", opts["acct"], key=k("acct"))
+        per_f = cols[3].selectbox("Date submitted", PERIOD_CHOICES, key=k("per"))
+        reg_f = cols[4].selectbox("Region", opts["reg"], key=k("reg")) if show_region else "All"
+
+    today = now_local().date()
+    needle = " ".join(str(query or "").lower().split())
+    shown = []
+    for c in claims_subset:
+        if status_f != "All" and stage_text[c["id"]] != status_f:
+            continue
+        if who_f != "All" and c.get("name") != who_f:
+            continue
+        if reg_f != "All" and c.get("region") != reg_f:
+            continue
+        if acct_f != "All" and c.get("account") != acct_f:
+            continue
+        if not _in_period(_claim_date(c), per_f, today):
+            continue
+        if needle:
+            hay = " ".join(str(x).lower() for x in (
+                c.get("name"), c.get("event"), c.get("voucher_no"), c.get("region"), c.get("majlis"),
+                c.get("account"), f"{float(c.get('total_claim') or 0):.2f}",
+                f"{float(c.get('amount_payable') or 0):.2f}"))
+            if needle not in hay:
+                continue
+        shown.append(c)
+
+    rev = direction == "Descending"
+    if sort_by == "Voucher No.":      # claims with no voucher number always stay at the bottom
+        have = sorted([c for c in shown if c.get("voucher_no")], key=_voucher_sort_key, reverse=rev)
+        shown = have + [c for c in shown if not c.get("voucher_no")]
+    else:
+        keyfn = {
+            "Date submitted": lambda c: c.get("submitted_ts", ""),
+            "Claimant": lambda c: (str(c.get("name", "")).lower(), c.get("submitted_ts", "")),
+            "Event": lambda c: (str(c.get("event", "")).lower(), c.get("submitted_ts", "")),
+            "Total claim": lambda c: float(c.get("total_claim") or 0),
+            "Amount to pay": lambda c: float(c.get("amount_payable") or 0),
+            "Status": lambda c: (stage_text[c["id"]].lower(), c.get("submitted_ts", "")),
+        }[sort_by]
+        shown = sorted(shown, key=keyfn, reverse=rev)
+
+    st.caption(f"Showing {len(shown)} of {len(claims_subset)} claims")
+    return shown
+
+
 def render_claim_rows(service, folder_id, claims_subset, auth, tab_key, newest_first=False, show_history=False,
                       merge_select=False):
-    """Draws the table for one tab, oldest claim first (newest first when newest_first is set).
+    """Draws the table for one tab: search, filters and sort order first (oldest first by default, newest first
+    when newest_first is set), then the claims.
     The buttons each role sees come from actions_for(). Everyone can comment; only the Admin gets the
     Voucher No. box, Amend PDF and Delete."""
     if not claims_subset:
@@ -1616,8 +1742,14 @@ def render_claim_rows(service, folder_id, claims_subset, auth, tab_key, newest_f
     role = auth["role"]
     actor = auth["name"]
 
+    shown = filter_sort_claims(claims_subset, tab_key, default_newest=newest_first,
+                               show_region=role != ROLE_NAZIM)
+    if not shown:
+        st.info("No claims match the search and filters. Use Clear filters to see them all.")
+        return
+
     if merge_select and role == ROLE_ADMIN:
-        chosen = [c["id"] for c in claims_subset if st.session_state.get(f"mrg_{c['id']}")]
+        chosen = [c["id"] for c in shown if st.session_state.get(f"mrg_{c['id']}")]
         m_btn, c_btn, m_note = st.columns([2, 2, 5])
         if m_btn.button(f"🔗 Merge selected ({len(chosen)})", key=f"merge_go_{tab_key}", type="primary",
                         disabled=len(chosen) < 2):
@@ -1643,7 +1775,7 @@ def render_claim_rows(service, folder_id, claims_subset, auth, tab_key, newest_f
         col.markdown(f"**{label}**")
     st.divider()
 
-    for c in sorted(claims_subset, key=lambda x: x.get("submitted_ts", ""), reverse=newest_first):
+    for c in shown:
         stage_key, status_text = claim_stage(c)
         flags = c.get("flags") or []
         comments = c.get("comments") or []
@@ -2282,7 +2414,22 @@ def render_summary_page(auth):
         state_label = f4.selectbox("Claims", ["All claims", "Open only", "Completed only"], key="sum_state")
         state_f = {"All claims": "All", "Open only": "Open", "Completed only": "Completed"}[state_label]
 
+        g1, g2, g3 = st.columns(3)
+        who_opts = ["All"] + sorted({c.get("name") for c in claims if c.get("name")}, key=str.lower)
+        stage_opts = ["All"] + [STAGE_LABELS[k] for k in ("await_nazim", "to_process", "await_president", "approved",
+                                                          "paid", "hold", "rejected")]
+        who_f = g1.selectbox("Claimant", who_opts, key="sum_who")
+        stage_f = g2.selectbox("Status", stage_opts, key="sum_stage")
+        text_f = g3.text_input("Search", key="sum_text", placeholder="🔍 Event or voucher no.")
+
         sub = filter_claims(claims, head_f, region_f, fy_f, state_f)
+        if who_f != "All":
+            sub = [c for c in sub if c.get("name") == who_f]
+        if stage_f != "All":
+            sub = [c for c in sub if STAGE_LABELS.get(claim_stage(c)[0]) == stage_f]
+        if text_f.strip():
+            t = text_f.strip().lower()
+            sub = [c for c in sub if t in str(c.get("event", "")).lower() or t in str(c.get("voucher_no", "")).lower()]
         live = [c for c in sub if claim_stage(c)[0] != "rejected"]
         stages = [claim_stage(c)[0] for c in live]
         paid_out = sum(float(c.get("amount_payable") or 0) for c, s in zip(live, stages) if s == "paid")
@@ -2373,9 +2520,20 @@ def render_summary_page(auth):
                              "(for example an advance, or a bank fee).", heads, service, folder_id, auth["name"])
 
         st.markdown("#### Ledger history")
-        pick = st.selectbox("Show entries for", ["All"] + heads, key="ledger_pick")
-        shown = [e for e in entries if pick == "All" or e.get("account") == pick]
-        shown.sort(key=lambda e: e.get("ts", ""), reverse=True)
+        lf1, lf2, lf3, lf4 = st.columns([2, 2, 2, 2])
+        pick = lf1.selectbox("Show entries for", ["All"] + heads, key="ledger_pick")
+        type_pick = lf2.selectbox("Type", ["All"] + list(LEDGER_TYPES.values()), key="ledger_type")
+        l_sort = lf3.selectbox("Sort by", ["Date entered", "Amount", "Account head", "Type"], key="ledger_sort")
+        l_dir = lf4.selectbox("Order", ["Descending", "Ascending"], key="ledger_dir")
+        l_text = st.text_input("Search notes", key="ledger_text", placeholder="🔍 Search the note or who entered it")
+        shown = [e for e in entries if (pick == "All" or e.get("account") == pick)
+                 and (type_pick == "All" or LEDGER_TYPES.get(e.get("type"), e.get("type")) == type_pick)
+                 and (not l_text.strip() or l_text.strip().lower() in
+                      f"{e.get('note', '')} {e.get('by', '')}".lower())]
+        l_key = {"Date entered": lambda e: e.get("ts", ""), "Amount": lambda e: float(e.get("amount") or 0),
+                 "Account head": lambda e: (str(e.get("account", "")).lower(), e.get("ts", "")),
+                 "Type": lambda e: (str(LEDGER_TYPES.get(e.get("type"), e.get("type"))), e.get("ts", ""))}[l_sort]
+        shown.sort(key=l_key, reverse=l_dir == "Descending")
         if not shown:
             st.info("No ledger entries yet.")
         else:
@@ -2424,6 +2582,16 @@ def render_summary_page(auth):
             st.error("The From date is after the To date.")
         else:
             lines = build_bas_lines(claims, d_from, d_to, basis_key, include, bas_head)
+            s1, s2, s3 = st.columns([2, 2, 3])
+            bas_sort = s1.selectbox("Sort by", ["Receipt date", "Claimant", "Voucher No.", "Account head", "Total", "GST"],
+                                    key="bas_sort")
+            bas_dir = s2.selectbox("Order", ["Ascending", "Descending"], key="bas_dir")
+            bas_text = s3.text_input("Search the table", key="bas_text", placeholder="🔍 Claimant, description or voucher no.")
+            bas_key = {"Receipt date": lambda x: str(x["date"] or ""), "Claimant": lambda x: str(x["claimant"]).lower(),
+                       "Voucher No.": lambda x: _voucher_sort_key({"voucher_no": x["voucher"]}),
+                       "Account head": lambda x: str(x["account"]).lower(), "Total": lambda x: x["total"],
+                       "GST": lambda x: x["gst"]}[bas_sort]
+            lines = sorted(lines, key=bas_key, reverse=bas_dir == "Descending")
             t = bas_totals(lines)
             k1, k2, k3, k4 = st.columns(4)
             k1.metric("Total purchases (incl GST)", _money(t["total"]))
@@ -2437,10 +2605,15 @@ def render_summary_page(auth):
                 if any(x["note"] for x in lines):
                     st.warning("Some lines use the claim date because the receipt date was missing, or the claim is "
                                "older than receipt-line storage. See the Note column.")
+                table_lines = [x for x in lines if not bas_text.strip() or bas_text.strip().lower() in
+                               f"{x['claimant']} {x['desc']} {x['voucher']}".lower()]
                 df_bas = pd.DataFrame([{
                     "Receipt date": _fmt_d(x["date"]), "Claimant": x["claimant"], "Voucher No.": x["voucher"],
                     "Account head": x["account"], "Description": x["desc"], "Total": x["total"], "GST": x["gst"],
-                    "Net": x["net"], "Paid on": _fmt_d(x["paid_d"]), "Note": x["note"]} for x in lines])
+                    "Net": x["net"], "Paid on": _fmt_d(x["paid_d"]), "Note": x["note"]} for x in table_lines])
+                if bas_text.strip():
+                    st.caption(f"Showing {len(table_lines)} of {len(lines)} receipts. The totals above and the downloads "
+                               "always cover the whole period; only the order follows the sort choice.")
                 _show_df(df_bas, ("Total", "GST", "Net"))
 
                 st.markdown("#### GST by account head")
