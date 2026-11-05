@@ -564,12 +564,16 @@ def _add_comment(claim, actor, role, text, decision=""):
     return True
 
 
-def update_claim(service, folder_id, claim_id, role, actor, changes=None, voucher_no=None, region=None, comment=None):
+def update_claim(service, folder_id, claim_id, role, actor, changes=None, voucher_no=None, region=None, comment=None,
+                 fy=None):
     """Applies a status change, a voucher number and/or a comment to one claim, after checking the role is allowed.
     changes = {"nazim_status": "Approved"} etc. Every change is written to the claim's history, and a comment
     typed together with a decision is saved with that decision.
     Returns a warning message ('' if all fine)."""
     changes = changes or {}
+    fy = None if fy is None or role != ROLE_ADMIN else str(fy).strip()
+    if fy is not None and not re.fullmatch(r"20\d{2}", fy):
+        raise ValueError("Choose a valid year (for example 2026).")
     claims, fid = load_register(service, folder_id)
     claim = next((c for c in claims if c["id"] == claim_id), None)
     if claim is None:
@@ -650,6 +654,11 @@ def update_claim(service, folder_id, claim_id, role, actor, changes=None, vouche
     now = now_local()
     today = now.strftime('%d/%m/%Y')
     labels = []
+    if fy is not None and str(claim.get("fy") or "") != fy:
+        old_fy = str(claim.get("fy") or "")
+        claim["fy"] = fy
+        _log(claim, actor, f"Year set to {fy}" if not old_fy else f"Year changed from {old_fy} to {fy}")
+        changed = True
     for field, value in changes.items():
         if field == "paid":
             claim["paid"] = bool(value)
@@ -1605,7 +1614,7 @@ def _history_lines(c):
 
 
 PERIOD_CHOICES = ["All dates", "Last 7 days", "Last 30 days", "Last 90 days", "This month", "Last month",
-                  "This financial year"]
+                  "This year"]
 SORT_CHOICES = ["Date submitted", "Claimant", "Event", "Total claim", "Amount to pay", "Voucher No.", "Status"]
 
 
@@ -1649,13 +1658,14 @@ def filter_sort_claims(claims_subset, key, default_newest=False, show_region=Tru
         "who": options(c.get("name") for c in claims_subset),
         "reg": options(c.get("region") for c in claims_subset),
         "acct": options(c.get("account") for c in claims_subset),
+        "year": options(_claim_year(c) for c in claims_subset),
     }
     defaults = {"q": "", "sort": "Date submitted", "dir": "Descending" if default_newest else "Ascending",
-                "status": "All", "who": "All", "reg": "All", "acct": "All", "per": "All dates"}
+                "status": "All", "who": "All", "reg": "All", "acct": "All", "per": "All dates", "year": "All"}
     for name, value in defaults.items():
         st.session_state.setdefault(k(name), value)       # first visit: start from the default order and no filters
     for name, choices in (("status", opts["status"]), ("who", opts["who"]), ("reg", opts["reg"]),
-                          ("acct", opts["acct"]), ("per", PERIOD_CHOICES), ("sort", SORT_CHOICES),
+                          ("acct", opts["acct"]), ("year", opts["year"]), ("per", PERIOD_CHOICES), ("sort", SORT_CHOICES),
                           ("dir", ["Ascending", "Descending"])):
         if st.session_state.get(k(name), defaults[name]) not in choices:
             st.session_state[k(name)] = defaults[name]     # a saved choice that no longer exists falls back to All
@@ -1664,7 +1674,7 @@ def filter_sort_claims(claims_subset, key, default_newest=False, show_region=Tru
         for name, value in defaults.items():
             st.session_state[k(name)] = value
 
-    extra = ["status", "who", "acct", "per"] + (["reg"] if show_region else [])
+    extra = ["status", "who", "acct", "year", "per"] + (["reg"] if show_region else [])
     active = sum(1 for n in extra if st.session_state.get(k(n), defaults[n]) != defaults[n])
     active_q = bool(str(st.session_state.get(k("q"), "")).strip())
 
@@ -1680,12 +1690,13 @@ def filter_sort_claims(claims_subset, key, default_newest=False, show_region=Tru
               disabled=not (active or active_q))
 
     with st.expander("Filters" + (f" ({active} active)" if active else ""), expanded=bool(active)):
-        cols = st.columns(5 if show_region else 4)
+        cols = st.columns(6 if show_region else 5)
         status_f = cols[0].selectbox("Status", opts["status"], key=k("status"))
         who_f = cols[1].selectbox("Claimant", opts["who"], key=k("who"))
         acct_f = cols[2].selectbox("Account head", opts["acct"], key=k("acct"))
-        per_f = cols[3].selectbox("Date submitted", PERIOD_CHOICES, key=k("per"))
-        reg_f = cols[4].selectbox("Region", opts["reg"], key=k("reg")) if show_region else "All"
+        year_f = cols[3].selectbox("Year (Jan-Dec)", opts["year"], key=k("year"))
+        per_f = cols[4].selectbox("Date submitted", PERIOD_CHOICES, key=k("per"))
+        reg_f = cols[5].selectbox("Region", opts["reg"], key=k("reg")) if show_region else "All"
 
     today = now_local().date()
     needle = " ".join(str(query or "").lower().split())
@@ -1698,6 +1709,8 @@ def filter_sort_claims(claims_subset, key, default_newest=False, show_region=Tru
         if reg_f != "All" and c.get("region") != reg_f:
             continue
         if acct_f != "All" and c.get("account") != acct_f:
+            continue
+        if year_f != "All" and _claim_year(c) != year_f:
             continue
         if not _in_period(_claim_date(c), per_f, today):
             continue
@@ -1782,7 +1795,7 @@ def render_claim_rows(service, folder_id, claims_subset, auth, tab_key, newest_f
 
         cols = st.columns(DASH_WIDTHS)
         cols[0].markdown(f"**{_md_escape(c.get('name', ''))}**  \n:gray[{_md_escape(c.get('region', ''))}]")
-        _cell(cols[1], c.get("submitted_on", ""))
+        _cell(cols[1], c.get("submitted_on", "") + (f"  \n:gray[Year {c['fy']}]" if c.get("fy") else ""))
         cols[2].markdown(_md_escape(c.get("event", "")))
         _cell(cols[3], f"${c.get('total_claim', 0):,.2f}")
         _cell(cols[4], f"${c.get('gst', 0):,.2f}")
@@ -1811,10 +1824,10 @@ def render_claim_rows(service, folder_id, claims_subset, auth, tab_key, newest_f
                 placeholder="Add a comment (optional). It is saved with your decision and the Nazim e Ala, Admin and President can all read it.")
             add_comment_clicked = cc2.button("💬 Add comment", key=f"addcmt_{key_base}", use_container_width=True)
 
-        def _apply(changes, voucher=None, c=c, key_base=key_base, ver=ver, comment=comment_text):
+        def _apply(changes, voucher=None, c=c, key_base=key_base, ver=ver, comment=comment_text, fy=None):
             try:
                 warning = update_claim(service, folder_id, c["id"], role, actor, changes=changes,
-                                       voucher_no=voucher, region=auth.get("region"), comment=comment)
+                                       voucher_no=voucher, region=auth.get("region"), comment=comment, fy=fy)
             except Exception as e:
                 st.error(f"Could not update claim: {e}")
                 return
@@ -1845,19 +1858,32 @@ def render_claim_rows(service, folder_id, claims_subset, auth, tab_key, newest_f
                     st.checkbox("Select (for Merge or Complete)", key=f"mrg_{c['id']}")
 
                 n = len(actions)
-                row_cols = st.columns([2.0, 1.0] + [1.15] * n + [max(0.2, 3.6 - 1.15 * n), 1.4, 1.1])
+                row_cols = st.columns([2.0, 1.0, 1.0] + [1.15] * n + [max(0.2, 2.6 - 1.15 * n), 1.4, 1.1])
                 voucher_input = row_cols[0].text_input(
                     "Voucher No.", value=c.get("voucher_no", ""), max_chars=20,
                     key=f"vno_{key_base}", placeholder="Enter Voucher No.", label_visibility="collapsed"
                 )
+                # The year the claim counts in (our year is 1 Jan - 31 Dec). Current year unless already set.
+                this_year = now_local().year
+                saved_fy = str(c.get("fy") or "")
+                year_opts = sorted({str(this_year + 1), str(this_year), str(this_year - 1), saved_fy,
+                                    _claim_year(c)} - {""}, reverse=True)
+                fy_pick = row_cols[2].selectbox(
+                    "Year", year_opts, index=year_opts.index(saved_fy or str(this_year)),
+                    key=f"fy_{key_base}_{saved_fy or 'new'}", label_visibility="collapsed",
+                    format_func=lambda y: f"Year {y}",
+                    help="The year (1 Jan - 31 Dec) this claim counts in. It is saved when you approve the claim, "
+                         "or when you click Save No. on an approved claim.")
                 if row_cols[1].button("Save No.", key=f"saveno_{key_base}", use_container_width=True):
-                    _apply({}, voucher_input)
-                for b_col, (label, field, value) in zip(row_cols[2:2 + n], actions):
+                    keep_year = fy_pick if (saved_fy or c["admin_status"] == STATUS_APPROVED) else None
+                    _apply({}, voucher_input, fy=keep_year)
+                for b_col, (label, field, value) in zip(row_cols[3:3 + n], actions):
                     needs_voucher = field == "admin_status" and value == STATUS_APPROVED and not voucher_input.strip()
                     if b_col.button(label, key=f"{key_base}_{field}_{value}", use_container_width=True,
                                     disabled=needs_voucher,
                                     help="Enter a Voucher No. first" if needs_voucher else None):
-                        _apply({field: value}, voucher_input)
+                        _apply({field: value}, voucher_input,
+                               fy=fy_pick if (field == "admin_status" and value == STATUS_APPROVED) else None)
                 if row_cols[-2].button("✏️ Amend PDF", key=f"amend_{key_base}", use_container_width=True):
                     st.session_state["amend_claim_id"] = c["id"]
                     st.session_state["amend_init"] = None
@@ -2131,8 +2157,17 @@ def _paid_dt(c):
 
 
 def _fy_label(d):
-    start = d.year if d.month >= 7 else d.year - 1
-    return f"FY{start}-{str(start + 1)[2:]}"
+    """Our financial year is the calendar year (1 January - 31 December), labelled by that year, e.g. '2026'."""
+    return str(d.year)
+
+
+def _claim_year(c):
+    """The year a claim counts in: the year the Admin chose when approving it, otherwise the year it was submitted."""
+    fy = str(c.get("fy") or "").strip()
+    if fy:
+        return fy
+    d = _claim_date(c)
+    return str(d.year) if d else ""
 
 
 def all_heads(claims, entries=()):
@@ -2187,8 +2222,7 @@ def filter_claims(claims, head="All", region="All", fy="All", state="All"):
         if region != "All" and c.get("region") != region:
             continue
         if fy != "All":
-            d = _claim_date(c)
-            if not d or _fy_label(d) != fy:
+            if _claim_year(c) != fy:
                 continue
         if state == "Open" and not is_open_claim(c):
             continue
@@ -2226,15 +2260,15 @@ def _group_table(claims, key_fn, label):
 
 # ---- BAS ------------------------------------------------------------------
 def _bas_quarters(today, n=8):
-    """The last n BAS quarters (Jul-Sep, Oct-Dec, Jan-Mar, Apr-Jun), newest first."""
+    """The last n quarters of our calendar year (Jan-Mar = Q1, Apr-Jun, Jul-Sep, Oct-Dec = Q4), newest first."""
     y, m = today.year, ((today.month - 1) // 3) * 3 + 1
     out = []
     for _ in range(n):
         start = date(y, m, 1)
         nm, ny = (m + 3, y) if m + 3 <= 12 else (m + 3 - 12, y + 1)
         end = date(ny, nm, 1) - timedelta(days=1)
-        qnum = {7: 1, 10: 2, 1: 3, 4: 4}[m]
-        label = f"{start.strftime('%b')} - {end.strftime('%b %Y')}  (Q{qnum} {_fy_label(start)})"
+        qnum = (m - 1) // 3 + 1
+        label = f"{start.strftime('%b')} - {end.strftime('%b %Y')}  (Q{qnum} {start.year})"
         out.append((label, start, end))
         m -= 3
         if m < 1:
@@ -2406,11 +2440,11 @@ def render_summary_page(auth):
 
     # ------------------------------------------------------------ overview
     with tab_over:
-        fys = sorted({_fy_label(d) for d in (_claim_date(c) for c in claims) if d}, reverse=True)
+        fys = sorted({y for y in (_claim_year(c) for c in claims) if y} | {str(now_local().year)}, reverse=True)
         f1, f2, f3, f4 = st.columns(4)
         head_f = f1.selectbox("Account head", ["All"] + heads, key="sum_head")
         region_f = f2.selectbox("Region", ["All"] + regions, key="sum_region")
-        fy_f = f3.selectbox("Financial year (Jul-Jun)", ["All"] + fys, key="sum_fy")
+        fy_f = f3.selectbox("Year (Jan-Dec)", ["All"] + fys, key="sum_fy")
         state_label = f4.selectbox("Claims", ["All claims", "Open only", "Completed only"], key="sum_state")
         state_f = {"All claims": "All", "Open only": "Open", "Completed only": "Completed"}[state_label]
 
