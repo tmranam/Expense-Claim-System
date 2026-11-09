@@ -413,7 +413,9 @@ def normalize_claim(c):
     c.setdefault("admin_status", STATUS_PENDING)
     c.setdefault("president_status", STATUS_PENDING)
     c.setdefault("paid", False)
-    c.setdefault("complete", False)  # Admin ticks this when nothing more is needed on the claim
+    c.setdefault("complete", True)   # ticked by default; the Admin unticks it to keep a claim open under a Main Claim Number
+    c.setdefault("main_no", "")      # Main Claim Number of the open claim group this claim belongs to (e.g. 2026-136)
+    c.setdefault("main_event", "")
     c.setdefault("history", [])
     c.setdefault("comments", [])
     c.setdefault("receipts", [])     # receipt lines + fingerprints (claims saved from now on)
@@ -565,7 +567,7 @@ def _add_comment(claim, actor, role, text, decision=""):
 
 
 def update_claim(service, folder_id, claim_id, role, actor, changes=None, voucher_no=None, region=None, comment=None,
-                 fy=None):
+                 fy=None, main=None):
     """Applies a status change, a voucher number and/or a comment to one claim, after checking the role is allowed.
     changes = {"nazim_status": "Approved"} etc. Every change is written to the claim's history, and a comment
     typed together with a decision is saved with that decision.
@@ -581,6 +583,22 @@ def update_claim(service, folder_id, claim_id, role, actor, changes=None, vouche
 
     if not can_view_claim(role, claim, region):
         raise PermissionError("You are not allowed to change this claim.")
+
+    # Main Claim Number + Event for an open claim (Admin only). An existing open main claim with the same number is reused.
+    m_no = m_ev = ""
+    if main is not None:
+        if role != ROLE_ADMIN:
+            raise PermissionError("Only the Admin can set a Main Claim Number.")
+        m_no = " ".join(str(main.get("no") or "").split())[:30]
+        m_ev = " ".join(str(main.get("event") or "").split())[:100]
+        if not m_no or not m_ev:
+            raise ValueError("Enter both the Main Claim Number and the Event.")
+        for other in claims:
+            if (other["id"] != claim_id and not other.get("complete") and not other.get("merged_into")
+                    and (other.get("main_no") or "").strip().lower() == m_no.lower()):
+                m_no = other["main_no"].strip()
+                m_ev = (other.get("main_event") or m_ev).strip()
+                break
 
     allowed_fields = {
         ROLE_NAZIM: {"nazim_status"},
@@ -598,6 +616,8 @@ def update_claim(service, folder_id, claim_id, role, actor, changes=None, vouche
         if field not in allowed_fields:
             raise PermissionError("You are not allowed to make that change.")
         if field == "complete":
+            if not value and not (m_no or (claim.get("main_no") or "").strip()):
+                raise ValueError("Enter a Main Claim Number and Event to keep this claim open.")
             continue
         if role == ROLE_ADMIN and field == "admin_status" and value == STATUS_APPROVED and not effective_voucher:
             raise PermissionError("Enter a Voucher No. before approving this claim.")
@@ -678,6 +698,14 @@ def update_claim(service, folder_id, claim_id, role, actor, changes=None, vouche
         labels.append(text)
         _log(claim, actor, text)
         changed = True
+
+    if main is not None:
+        if claim.get("complete"):
+            raise ValueError("Untick 'complete' before giving the claim a Main Claim Number.")
+        if claim.get("main_no") != m_no or claim.get("main_event") != m_ev:
+            claim["main_no"], claim["main_event"] = m_no, m_ev
+            _log(claim, actor, f"Part of open main claim {m_no} ({m_ev})")
+            changed = True
 
     if _add_comment(claim, actor, role, comment, decision="; ".join(labels)):
         changed = True
@@ -1716,7 +1744,8 @@ def filter_sort_claims(claims_subset, key, default_newest=False, show_region=Tru
             continue
         if needle:
             hay = " ".join(str(x).lower() for x in (
-                c.get("name"), c.get("event"), c.get("voucher_no"), c.get("region"), c.get("majlis"),
+                c.get("name"), c.get("event"), c.get("voucher_no"), c.get("main_no"), c.get("main_event"),
+                c.get("region"), c.get("majlis"),
                 c.get("account"), f"{float(c.get('total_claim') or 0):.2f}",
                 f"{float(c.get('amount_payable') or 0):.2f}"))
             if needle not in hay:
@@ -1796,7 +1825,9 @@ def render_claim_rows(service, folder_id, claims_subset, auth, tab_key, newest_f
         cols = st.columns(DASH_WIDTHS)
         cols[0].markdown(f"**{_md_escape(c.get('name', ''))}**  \n:gray[{_md_escape(c.get('region', ''))}]")
         _cell(cols[1], c.get("submitted_on", "") + (f"  \n:gray[Year {c['fy']}]" if c.get("fy") else ""))
-        cols[2].markdown(_md_escape(c.get("event", "")))
+        main_line = (f"  \n:gray[Main claim {_md_escape(c['main_no'])}]"
+                     if (c.get("main_no") or "").strip() and not c.get("complete") else "")
+        cols[2].markdown(_md_escape(c.get("event", "")) + main_line)
         _cell(cols[3], f"${c.get('total_claim', 0):,.2f}")
         _cell(cols[4], f"${c.get('gst', 0):,.2f}")
         advance = c.get("advance", 0)
@@ -1846,16 +1877,27 @@ def render_claim_rows(service, folder_id, claims_subset, auth, tab_key, newest_f
         with ctrl_area:
             if role == ROLE_ADMIN:
                 is_complete = bool(c.get("complete"))
+                cplt_key = f"cplt_{key_base}_{int(is_complete)}"     # includes the saved state, so the box shows what is saved
                 if stage_key not in ("merged", "rejected") and not merge_select:
-                    # the key includes the saved state, so the box always shows the saved value
-                    ticked = st.checkbox(
-                        "Claim complete (nothing more is coming for this event). Untick = stays in Open Claims, "
-                        "tick = removed from Open Claims. Approval and payment work either way.", value=is_complete,
-                        key=f"cplt_{key_base}_{int(is_complete)}")
-                    if ticked != is_complete:
-                        _apply({"complete": ticked})
+                    st.checkbox(
+                        "Claim complete. Untick to keep it open for more receipts or claims for the same event "
+                        "(you will be asked for a Main Claim Number and the Event). Approval and payment work either way.",
+                        value=is_complete, key=cplt_key, on_change=_on_complete_toggle, args=(cplt_key, c["id"]))
+                    toggled = st.session_state.get("cplt_event")
+                    if toggled and toggled[0] == c["id"]:
+                        st.session_state.pop("cplt_event", None)
+                        if toggled[1]:
+                            _apply({"complete": True})
+                        else:
+                            main_claim_dialog(c["id"], c.get("main_no") or "", c.get("main_event") or c.get("event") or "")
                 if merge_select:
                     st.checkbox("Select (for Merge or Complete)", key=f"mrg_{c['id']}")
+                if not is_complete and stage_key not in ("merged", "rejected"):
+                    mc1, mc2, _ = st.columns([1.8, 4, 3])
+                    if mc1.button("📌 Main Claim No.", key=f"mc_{key_base}"):
+                        main_claim_dialog(c["id"], c.get("main_no") or "", c.get("main_event") or c.get("event") or "")
+                    mc2.caption(f"Main claim: {c['main_no']} - {c.get('main_event', '')}" if (c.get("main_no") or "").strip()
+                                else "No Main Claim Number yet")
 
                 n = len(actions)
                 row_cols = st.columns([2.0, 1.0, 1.0] + [1.15] * n + [max(0.2, 2.6 - 1.15 * n), 1.4, 1.1])
@@ -3995,6 +4037,7 @@ def render_claim_form():
                 "flags": flags,
                 "comments": [],
                 "paid": False,
+                "complete": True,
                 # Approval workflow: Nazim e Ala -> Admin -> President.
                 # Regions with no Nazim e Ala login go straight to the Admin.
                 "nazim_status": STATUS_PENDING if has_nazim else STATUS_BYPASSED,
