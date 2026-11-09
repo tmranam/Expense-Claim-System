@@ -2940,20 +2940,18 @@ def render_amend_page(auth):
 
 
 # -------------------------------------------------------------------------
-# STAFF LOGIN
-# -------------------------------------------------------------------------
-# -------------------------------------------------------------------------
-# ADMIN: UPLOAD A PREPARED CLAIM
-# The Admin uploads the claim files (PDFs / photos). A summary (voucher) page is built and placed first, the details are
-# read from the files into editable fields, and the claim can be saved either as a normal claim waiting for the Admin,
-# or as already PAID (all approval stages bypassed). The PDF is saved to Drive and named like every other claim.
+# ADMIN: UPLOAD AN ALREADY PROCESSED CLAIM
+# For claims finished before this system existed. The uploaded PDF is already complete (summary page + receipts), so it is
+# saved to Drive EXACTLY as uploaded: no new summary page, no changes inside the file. Only the Drive file name follows the
+# usual VoucherNo_Claimant_Event_Date.pdf pattern. The details are read from the PDF's own summary page into fields
+# (for the register, dashboard, balances and BAS) and the claim can be saved as Paid, bypassing every approval stage.
 # -------------------------------------------------------------------------
 def _natural_key(name):
     return [int(p) if p.isdigit() else p.lower() for p in re.split(r"(\d+)", str(name))]
 
 
 def _is_voucher_pdf(data):
-    """True when page 1 of the PDF is already one of our Expense Payment Voucher summary pages."""
+    """True when page 1 of the PDF is one of our Expense Payment Voucher summary pages."""
     try:
         text = PdfReader(io.BytesIO(data)).pages[0].extract_text() or ""
     except Exception:
@@ -2961,20 +2959,18 @@ def _is_voucher_pdf(data):
     return "Payee Name" in text and "Expense Payment Voucher" in text
 
 
-def save_prepared_claim(service, folder_id, role, actor, form, rows, segments, claim_date, voucher_no,
+def save_existing_claim(service, folder_id, role, actor, form, rows, pdf_bytes, claim_date, voucher_no,
                         paid, paid_date, flags=None):
-    """Admin only. Builds the summary page, puts the uploaded pages after it, stamps the voucher number, saves the PDF to
-    Drive and adds the claim to the register. paid=True saves it as Paid with the Nazim e Ala and President stages bypassed."""
+    """Admin only. Saves an already complete claim PDF to Drive unchanged (only the file name is set) and adds the claim to the
+    register. paid=True saves it as Paid with the Nazim e Ala, Admin and President stages bypassed."""
     if role != ROLE_ADMIN:
-        raise PermissionError("Only the Admin can upload a prepared claim.")
+        raise PermissionError("Only the Admin can upload a processed claim.")
     name = (form.get("name") or "").strip()
     event = (form.get("event") or "").strip()
     if not name or not event:
         raise ValueError("Name and event description are required.")
     if not rows:
         raise ValueError("At least one receipt line is needed.")
-    if not segments:
-        raise ValueError("Upload at least one file.")
 
     clean = []
     for r in rows:
@@ -2994,32 +2990,12 @@ def save_prepared_claim(service, folder_id, role, actor, form, rows, segments, c
     if advance > total + 0.001:
         raise ValueError("The advance cannot be more than the total claim.")
     voucher_no = (voucher_no or "").strip()[:20]
-    form = dict(form, name=name, event=event, advance=advance)
     submitted_on = claim_date.strftime("%d/%m/%Y")
 
-    # summary page first, then every uploaded file in order
-    vbuf = io.BytesIO()
-    generate_official_voucher_pdf(vbuf, build_voucher_payload(form, clean, request_date=submitted_on), clean)
-    voucher_reader = PdfReader(io.BytesIO(vbuf.getvalue()))
-    writer = PdfWriter()
-    for page in voucher_reader.pages:
-        writer.add_page(page)
-    for k, seg in enumerate(segments):
-        if seg["ext"] == ".pdf":
-            pages = PdfReader(io.BytesIO(seg["data"])).pages[int(seg.get("skip", 0)):]
-        else:
-            pages = PdfReader(_image_to_pdf_buffer(io.BytesIO(seg["data"]), f"Receipt file {k + 1}")).pages
-        for page in pages:
-            writer.add_page(page)
-    out = io.BytesIO()
-    writer.write(out)
-    pdf_bytes = out.getvalue()
-    if voucher_no:
-        pdf_bytes = stamp_voucher_number(pdf_bytes, voucher_no)
-
+    voucher_pages = _voucher_page_count(PdfReader(io.BytesIO(pdf_bytes)))
     now = now_local()
     drive_name = build_drive_filename(voucher_no, name, event, submitted_on)
-    file_id, file_link = upload_pdf_to_drive(service, folder_id, drive_name, pdf_bytes)
+    file_id, file_link = upload_pdf_to_drive(service, folder_id, drive_name, pdf_bytes)   # the PDF itself is not changed
     today = now.strftime("%d/%m/%Y")
     record = {
         "id": uuid.uuid4().hex[:10], "submitted_on": submitted_on, "submitted_ts": now.isoformat(),
@@ -3028,13 +3004,13 @@ def save_prepared_claim(service, folder_id, role, actor, form, rows, segments, c
         "bsb": form["bsb"], "acc_num": form["acc_num"],
         "total_claim": total, "gst": gst_total, "advance": advance, "amount_payable": round(total - advance, 2),
         "file_name": drive_name, "file_id": file_id, "file_link": file_link, "voucher_no": voucher_no,
-        "voucher_pages": len(voucher_reader.pages), "receipts": clean, "flags": flags or [], "comments": [],
+        "voucher_pages": voucher_pages, "receipts": clean, "flags": flags or [], "comments": [],
         "paid": False, "complete": False, "uploaded_by": actor,
         "nazim_status": STATUS_BYPASSED, "nazim_by": "Upload", "nazim_on": today,
         "admin_status": STATUS_PENDING, "president_status": STATUS_PENDING, "history": [],
     }
-    _log(record, actor, f"Prepared claim uploaded by Admin ({len(clean)} receipt line{'s' if len(clean) != 1 else ''}, "
-                        f"${total:,.2f}); summary page added")
+    _log(record, actor, f"Existing processed claim uploaded by Admin ({len(clean)} receipt line{'s' if len(clean) != 1 else ''}, "
+                        f"${total:,.2f}); PDF saved unchanged")
     if paid:
         paid_str = paid_date.strftime("%d/%m/%Y")
         record.update({
@@ -3060,7 +3036,6 @@ def _up_set_row(rid, line=None):
     st.session_state[f"up_desc_{rid}"] = str(line.get("desc", ""))
     st.session_state[f"up_amt_{rid}"] = float(line.get("amount") or 0.0)
     st.session_state[f"up_gst_{rid}"] = float(line.get("gst") or 0.0)
-    st.session_state[f"up_fp_{rid}"] = {k: line[k] for k in ("exact", "sig", "date_detected") if k in line}
 
 
 def _up_add_row():
@@ -3073,7 +3048,7 @@ def _up_add_row():
 
 def _up_remove_row(rid):
     st.session_state["up_rows"].remove(rid)
-    for prefix in ("up_date_", "up_desc_", "up_amt_", "up_gst_", "up_fp_"):
+    for prefix in ("up_date_", "up_desc_", "up_amt_", "up_gst_"):
         st.session_state.pop(f"{prefix}{rid}", None)
 
 
@@ -3095,34 +3070,23 @@ def _up_autofill():
         st.session_state[f"up_account_{region == 'National'}"] = info["account"]
 
 
-def _up_read(files):
-    """Reads the uploaded files (already in name order) and fills the editor. A PDF that already starts with one of our
-    summary pages has its fields read back from that page and the old summary is replaced by a fresh one."""
-    segments, lines, info, problems = [], [], {}, []
-    bar = st.progress(0.0, text="Reading files ...")
-    for n, (fname, data) in enumerate(files):
-        ext = os.path.splitext(fname)[1].lower()
-        bar.progress(n / max(1, len(files)), text=f"Reading {fname} ...")
-        if ext == ".pdf" and _is_voucher_pdf(data):
-            parsed = parse_voucher_fields(data) or {}
-            skip = _voucher_page_count(PdfReader(io.BytesIO(data)))
-            segments.append({"name": fname, "ext": ext, "data": data, "skip": skip})
-            if not info:
-                info = {k: v for k, v in parsed.items() if k != "rows"}
-            lines += [dict(r) for r in parsed.get("rows", [])]
-        else:
-            analysis = analyse_upload(fname, data, True)
-            problems += [f"{fname}: {p}" for p in analysis.get("problems", [])]
-            segments.append({"name": fname, "ext": ext, "data": data, "skip": 0})
-            lines += [{k: v for k, v in it.items() if k != "text"} for it in analysis["items"]]
-    bar.empty()
-
+def _up_read(fname, data):
+    """Reads the claim's own summary page (page 1) into the fields. The PDF itself is never changed."""
     _up_reset()
+    has_summary = _is_voucher_pdf(data)
+    info = (parse_voucher_fields(data) or {}) if has_summary else {}
+    claim_date = None
+    try:
+        reader = PdfReader(io.BytesIO(data))
+        st.session_state["up_pages"] = len(reader.pages)
+        m = re.search(r"Date:\s*(\d{1,2}/\d{1,2}/\d{4})", reader.pages[0].extract_text() or "")
+        claim_date = _parse_dmy(m.group(1)) if m else None
+    except Exception:
+        st.session_state["up_pages"] = 0
+
     regions = st.session_state.admin_lists.get("regions", [])
     region = info.get("region") or (regions[0] if regions else "")
-    st.session_state["up_segments"] = segments
-    st.session_state["up_problems"] = problems
-    st.session_state["up_recovered"] = bool(info)
+    st.session_state["up_has_summary"] = has_summary
     st.session_state["up_name"] = info.get("name", "")
     st.session_state["up_email"] = ""
     st.session_state["up_event"] = info.get("event", "")
@@ -3136,10 +3100,13 @@ def _up_read(files):
     advance = float(info.get("advance") or 0.0)
     st.session_state["up_adv_mode"] = "Yes" if advance > 0 else "No"
     st.session_state["up_advance"] = advance
-    m = re.match(r"\s*(\d{1,8})(?!\d)", files[0][0]) if files else None
+    m = re.match(r"\s*(\d{1,8})(?!\d)", fname)
     st.session_state["up_vno"] = m.group(1) if m else ""
+    st.session_state["up_claim_date"] = claim_date or now_local().date()
+    st.session_state["up_paid_date"] = claim_date or now_local().date()
+    st.session_state["up_paid_mode"] = "Yes"
     rows = []
-    for n, line in enumerate(lines):
+    for n, line in enumerate(info.get("rows", [])):
         rid = f"u{n}"
         rows.append(rid)
         _up_set_row(rid, line)
@@ -3153,9 +3120,10 @@ def _up_read(files):
 
 
 def render_upload_claim_page(auth):
-    st.markdown("### 📤 Upload Prepared Claim")
+    st.markdown("### 📤 Upload Processed Claim")
     if st.button("⬅ Back to Claims Dashboard"):
         _up_reset()
+        st.session_state["upq_i"] = 0
         st.session_state["admin_view"] = "dashboard"
         st.rerun()
 
@@ -3168,30 +3136,49 @@ def render_upload_claim_page(auth):
         return
     service, folder_id, claims = data
 
-    st.caption("Upload the files of a claim that was already prepared (PDFs or photos). A new summary page is built and "
-               "placed first; the receipts follow in file-name order. Details are read from the files, or from an existing "
-               "summary page if the PDF already has one, and can be corrected below. "
-               "The PDF is saved to Google Drive and renamed VoucherNo_Claimant_Event_Date.pdf like every other claim.")
+    st.caption("For claims that were completed before this system. Upload the finished claim PDF (summary page and receipts "
+               "already inside). It is saved to Google Drive exactly as it is, with nothing added or changed in the file; only "
+               "the Drive name becomes VoucherNo_Claimant_Event_Date.pdf. The details are read from its summary page so the "
+               "claim appears in the dashboard, balances and BAS report. You can upload several files; they are handled "
+               "one at a time in name order (1, 2, 3 ...).")
     upl_v = st.session_state.get("upl_v", 0)
-    uploaded = st.file_uploader("Claim files (several files are joined in name order: 1, 2, 3 ...)",
-                                type=["png", "jpg", "jpeg", "heic", "heif", "pdf"], accept_multiple_files=True,
+    uploaded = st.file_uploader("Completed claim PDF(s)", type=["pdf"], accept_multiple_files=True,
                                 key=f"upl_files_{upl_v}")
     if not uploaded:
         _up_reset()
+        st.session_state.pop("upq_sig", None)
         return
 
     files = [(f.name, f.getvalue()) for f in sorted(uploaded, key=lambda f: _natural_key(f.name))]
-    sig = [(n, len(d)) for n, d in files]
-    if st.session_state.get("up_sig") != sig:
-        _up_read(files)
-        st.session_state["up_sig"] = sig
+    queue_sig = [(n, len(d)) for n, d in files]
+    if st.session_state.get("upq_sig") != queue_sig:
+        st.session_state["upq_sig"] = queue_sig
+        st.session_state["upq_i"] = 0
+        _up_reset()
+    i = st.session_state.get("upq_i", 0)
+    if i >= len(files):
+        st.success(f"All {len(files)} file(s) have been dealt with.")
+        if st.button("Upload more claims"):
+            st.session_state["upl_v"] = upl_v + 1
+            st.session_state.pop("upq_sig", None)
+            st.rerun()
+        return
 
-    st.markdown("**Order of the files in the PDF:** " + "  →  ".join(_md_escape(n) for n, _ in files))
-    for problem in st.session_state.get("up_problems", []):
-        st.warning(f"⚠️ {problem}. Please type that receipt's details in by hand.")
-    if st.session_state.get("up_recovered"):
-        st.info("An existing summary page was found and read. Please check each field, especially the email address, "
-                "which is not on the PDF. A fresh summary page replaces the old one.")
+    fname, pdf_bytes = files[i]
+    st.markdown(f"#### Claim {i + 1} of {len(files)}: {_md_escape(fname)}")
+    file_sig = (i, fname, len(pdf_bytes))
+    if st.session_state.get("up_sig") != file_sig:
+        with st.spinner("Reading the claim ..."):
+            _up_read(fname, pdf_bytes)
+        st.session_state["up_sig"] = file_sig
+
+    if st.session_state.get("up_has_summary"):
+        st.info(f"The summary page was found and read ({st.session_state.get('up_pages', 0)} pages in the file). "
+                "Please check the fields below. The PDF is saved unchanged, so corrections here change the dashboard "
+                "record only, not the PDF. The email address is not on the PDF, so please add it if you want it recorded.")
+    else:
+        st.warning("No summary page was found on page 1 of this file, so nothing could be read. You can type the details "
+                   "in below. The PDF is still saved unchanged.")
 
     regions = st.session_state.admin_lists.get("regions", [])
     majlis_map = st.session_state.admin_lists.get("regional_majlis", {})
@@ -3214,16 +3201,15 @@ def render_upload_claim_page(auth):
     with col2:
         bsb = st.text_input("Bank BSB Code (e.g., 000-000)", max_chars=7, key="up_bsb")
         acc_num = st.text_input("Account Number", key="up_accnum")
-        voucher_no = st.text_input("Voucher No. (optional, written onto the summary page and the file name)",
-                                   max_chars=20, key="up_vno")
-        claim_date = st.date_input("Claim date", value=now_local().date(), key="up_claim_date", format="DD/MM/YYYY")
-        adv_mode = st.radio("Is an advance being settled in this claim?", ["No", "Yes"], horizontal=True, key="up_adv_mode")
+        voucher_no = st.text_input("Voucher No. (used in the Drive file name and the dashboard)", max_chars=20, key="up_vno")
+        claim_date = st.date_input("Claim date", key="up_claim_date", format="DD/MM/YYYY")
+        adv_mode = st.radio("Was an advance settled in this claim?", ["No", "Yes"], horizontal=True, key="up_adv_mode")
         advance = 0.0
         if adv_mode == "Yes":
-            advance = st.number_input("Advance Amount Being Settled ($)", min_value=0.0, format="%.2f", key="up_advance")
+            advance = st.number_input("Advance Amount Settled ($)", min_value=0.0, format="%.2f", key="up_advance")
 
     st.markdown("---")
-    st.markdown("#### 🧾 Receipt lines (shown on the summary page)")
+    st.markdown("#### 🧾 Receipt lines (read from the summary page; used for totals, GST and BAS only)")
     rows = st.session_state["up_rows"]
     for n, rid in enumerate(list(rows), start=1):
         r1, r2, r3, r4, r5 = st.columns([1.6, 3.4, 1.5, 1.5, 1.2])
@@ -3240,14 +3226,13 @@ def render_upload_claim_page(auth):
         "date": st.session_state.get(f"up_date_{rid}", ""), "desc": st.session_state.get(f"up_desc_{rid}", ""),
         "amount": float(st.session_state.get(f"up_amt_{rid}", 0.0) or 0.0),
         "gst": float(st.session_state.get(f"up_gst_{rid}", 0.0) or 0.0),
-        **(st.session_state.get(f"up_fp_{rid}") or {}),
     } for rid in rows]
     total = round(sum(r["amount"] for r in line_values), 2)
     gst_total = round(sum(r["gst"] for r in line_values), 2)
     m1, m2, m3 = st.columns(3)
     m1.metric("Total Claim", f"${total:,.2f}")
     m2.metric("Total GST", f"${gst_total:,.2f}")
-    m3.metric("Amount to be paid (after advance)", f"${total - advance:,.2f}")
+    m3.metric("Amount paid (after advance)", f"${total - advance:,.2f}")
 
     problems = []
     if not name.strip():
@@ -3255,53 +3240,45 @@ def render_upload_claim_page(auth):
     if not event.strip():
         problems.append("Event description is required.")
     if total <= 0:
-        problems.append("Enter the receipt amounts: the total claim is $0.00.")
+        problems.append("The total claim is $0.00. Enter the receipt amounts from the summary page.")
     if advance > total + 0.001:
         problems.append(f"The advance (${advance:.2f}) is more than the total claim (${total:.2f}).")
     for p in problems:
         st.error(p)
 
-    flags = find_duplicate_receipts(line_values, claims)
-    dup_ok = True
-    if flags:
-        st.markdown("#### ⚠️ Possible duplicate receipts")
-        for fl in flags:
-            st.warning(describe_flag(fl, ROLE_ADMIN))
-        dup_ok = st.checkbox("I have checked, these are genuine separate expenses", key="up_dupok")
-
     st.markdown("---")
     st.markdown("#### 💳 Payment")
-    paid_mode = st.radio("Was this claim already paid?", ["No", "Yes"], horizontal=True, key="up_paid_mode",
-                         format_func=lambda x: "No - save it as a new claim for the Admin to process"
-                         if x == "No" else "Yes - already paid")
+    paid_mode = st.radio("Was this claim paid?", ["Yes", "No"], horizontal=True, key="up_paid_mode",
+                         format_func=lambda x: "Yes - already paid" if x == "Yes"
+                         else "No - save it as a new claim for the Admin to process")
     paid = paid_mode == "Yes"
     paid_date = now_local().date()
     if paid:
-        paid_date = st.date_input("Date paid", value=now_local().date(), key="up_paid_date", format="DD/MM/YYYY")
+        paid_date = st.date_input("Date paid", key="up_paid_date", format="DD/MM/YYYY")
         st.info("It will be saved straight into the Paid tab. The Nazim e Ala, Admin and President approval stages are "
-                "bypassed and the claim is marked complete. The PDF is saved to Google Drive like every other claim.")
-        if not voucher_no.strip():
-            st.caption("No Voucher No. entered. You can add one later with Save No. on the claim.")
+                "bypassed and the claim is marked complete.")
 
-    blocked = bool(problems) or (bool(flags) and not dup_ok)
-    if st.button("✅ Save as PAID claim" if paid else "💾 Save claim", type="primary", disabled=blocked):
+    save_col, skip_col, _ = st.columns([2, 1.4, 5])
+    if save_col.button("✅ Save as PAID claim" if paid else "💾 Save claim", type="primary", disabled=bool(problems)):
         form = {"name": name, "claimant_email": email, "event": event, "region": region, "majlis": majlis,
                 "account": account, "bsb": bsb, "acc_num": acc_num, "advance": advance}
         try:
-            with st.spinner("Building the PDF and saving it to Google Drive..."):
-                record = save_prepared_claim(service, folder_id, auth["role"], auth["name"], form, line_values,
-                                             st.session_state["up_segments"], claim_date, voucher_no, paid,
-                                             paid_date, flags)
+            with st.spinner("Saving to Google Drive..."):
+                record = save_existing_claim(service, folder_id, auth["role"], auth["name"], form, line_values,
+                                             pdf_bytes, claim_date, voucher_no, paid, paid_date, [])
         except Exception as e:
             st.error(f"Could not save the claim: {e}")
         else:
             st.session_state.pop("earlier_cache", None)
             _up_reset()
-            st.session_state["upl_v"] = upl_v + 1
-            st.session_state["upl_notice"] = (
-                f"Saved {record['file_name']} " + ("as a PAID claim." if paid else "in To Process.") +
-                " You can upload the next claim below.")
+            st.session_state["upq_i"] = i + 1
+            st.session_state["upl_notice"] = (f"Saved {record['file_name']} " +
+                                              ("as a PAID claim." if paid else "in To Process."))
             st.rerun()
+    if skip_col.button("Skip this file"):
+        _up_reset()
+        st.session_state["upq_i"] = i + 1
+        st.rerun()
 
 
 # -------------------------------------------------------------------------
