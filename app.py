@@ -2004,35 +2004,19 @@ def load_dashboard_data(role):
 
 def render_tabs(service, folder_id, claims, auth, tab_specs, role_key):
     """tab_specs = [(label, predicate)] or [(label, predicate, options)].
-    Each tab shows the claims its predicate accepts; options are passed on to render_claim_rows."""
+    Each tab shows the claims its predicate accepts. In every tab (for every role) the claims of one main claim are shown as
+    one expandable line; an option 'wrapper' replaces the default drawing (used by the Admin's Open Claims tab)."""
     specs = [(s[0], s[1], s[2] if len(s) > 2 else {}) for s in tab_specs]
     subsets = [[c for c in claims if pred(c)] for _, pred, _ in specs]
-    all_open = open_groups(claims)
-
-    def split(sub, opts):
-        """With 'collapse', claims of an open main claim become one line per main claim; the rest stay as they are."""
-        if not opts.get("collapse"):
-            return {}, sub
-        groups = open_groups(sub)
-        ids = {c["id"] for items in groups.values() for c in items}
-        return groups, [c for c in sub if c["id"] not in ids]
-
-    splits = [split(sub, opts) for (_, _, opts), sub in zip(specs, subsets)]
-    tabs = st.tabs([f"{label} ({len(sub) if opts.get('wrapper') else len(groups) + len(loose)})"
-                    for (label, _, opts), sub, (groups, loose) in zip(specs, subsets, splits)])
-    for tab, (label, _, opts), sub, (groups, loose) in zip(tabs, specs, subsets, splits):
+    tabs = st.tabs([f"{label} ({len(sub)})" for (label, _, _), sub in zip(specs, subsets)])
+    for tab, (label, _, opts), sub in zip(tabs, specs, subsets):
         with tab:
             key = f"{role_key}_{label}"
-            row_opts = {k: v for k, v in opts.items() if k not in ("collapse", "wrapper")}
             if opts.get("wrapper"):
                 opts["wrapper"](service, folder_id, sub, auth, key)
-            elif groups:
-                render_group_lines(groups, all_open, key)
-                if loose:
-                    st.markdown("##### Other claims")
-                    render_claim_rows(service, folder_id, loose, auth, key, **row_opts)
             else:
-                render_claim_rows(service, folder_id, loose, auth, key, **row_opts)
+                row_opts = {k: v for k, v in opts.items() if k not in ("collapse", "wrapper")}
+                render_grouped_rows(service, folder_id, sub, auth, key, **row_opts)
 
 
 def _stage_is(*keys):
@@ -2371,42 +2355,57 @@ def render_open_tab(service, folder_id, sub, auth, tab_key):
         render_claim_rows(service, folder_id, loose, auth, f"{tab_key}_none", merge_select=True)
 
 
-def render_paid_tab(service, folder_id, sub, auth, tab_key):
-    """Paid tab: paid claims that belong to a main claim (still open, or already processed into one combined file)
-    are one expandable line per main claim. All other paid claims are listed as usual."""
-    if not sub:
-        st.info("No claims in this tab.")
-        return
+def _main_group_key(c):
+    """Key of the main claim a claim is shown under: open claims with a Main Claim Number, and claims already processed into a
+    combined main claim file. Rejected and merged claims are never grouped."""
+    no = _main_no(c)
+    if not no or claim_stage(c)[0] in ("rejected", "merged"):
+        return None
+    if not c.get("complete") or c.get("main_file_id"):
+        return f"{no.lower()}|{c.get('main_file_id') or ''}"
+    return None
+
+
+def render_grouped_rows(service, folder_id, sub, auth, tab_key, **row_opts):
+    """Claims of one main claim as one expandable line (collapsed) with its totals; all other claims as usual."""
     groups = {}
     for c in sub:
-        no = _main_no(c)
-        if no and (not c.get("complete") or c.get("main_file_id")):
-            groups.setdefault(f"{no.lower()}|{c.get('main_file_id') or ''}", []).append(c)
+        k = _main_group_key(c)
+        if k:
+            groups.setdefault(k, []).append(c)
+    if not groups:
+        render_claim_rows(service, folder_id, sub, auth, tab_key, **row_opts)
+        return
     ids = {c["id"] for items in groups.values() for c in items}
     loose = [c for c in sub if c["id"] not in ids]
 
-    newest = lambda kv: max((c.get("paid_ts") or c.get("submitted_ts") or "") for c in kv[1])
-    for gkey, items in sorted(groups.items(), key=newest, reverse=True):
+    if row_opts.get("newest_first"):
+        order = sorted(groups.items(), key=lambda kv: max((c.get("paid_ts") or c.get("submitted_ts") or "") for c in kv[1]),
+                       reverse=True)
+    else:
+        order = sorted(groups.items(), key=lambda kv: _natural_key(_group_title(kv[1])[0]))
+    for gkey, items in order:
         items = sorted(items, key=lambda c: c.get("submitted_ts", ""))
         no, ev = _group_title(items)
         t = _group_totals(items)
-        label = (f"🗂 {_md_escape(no)} - {_md_escape(ev)}  ·  {t['claims']} paid claim{'s' if t['claims'] != 1 else ''}  ·  "
-                 f"Total {_money(t['total'])}  ·  GST {_money(t['gst'])}  ·  Paid {_money(t['paid'])}").replace("$", "\\$")
+        label = (f"🗂 {_md_escape(no)} - {_md_escape(ev)}  ·  {t['claims']} claim{'s' if t['claims'] != 1 else ''}  ·  "
+                 f"Total {_money(t['total'])}  ·  GST {_money(t['gst'])}  ·  Paid {_money(t['paid'])}"
+                 + (f"  ·  Pending {_money(t['pending'])}" if t["pending"] > 0.004 else "")).replace("$", "\\$")
         with st.expander(label, expanded=False):
-            m1, m2, m3, m4 = st.columns(4)
+            m1, m2, m3, m4, m5 = st.columns(5)
             m1.metric("Claims", t["claims"])
             m2.metric("Total claims", _money(t["total"]))
             m3.metric("Total GST", _money(t["gst"]))
             m4.metric("Total paid", _money(t["paid"]))
+            m5.metric("Total pending", _money(t["pending"]))
             main_link = next((c.get("main_file_link") for c in items if c.get("main_file_link")), "")
             if main_link:
                 st.markdown(f"[Open the combined main claim PDF]({main_link})")
             st.divider()
-            render_claim_rows(service, folder_id, items, auth, f"{tab_key}_{gkey}", newest_first=True, show_history=True)
+            render_claim_rows(service, folder_id, items, auth, f"{tab_key}_{gkey}", **row_opts)
     if loose:
-        if groups:
-            st.markdown("##### Other paid claims")
-        render_claim_rows(service, folder_id, loose, auth, f"{tab_key}_other", newest_first=True, show_history=True)
+        st.markdown("##### Other claims")
+        render_claim_rows(service, folder_id, loose, auth, f"{tab_key}_other", **row_opts)
 
 
 def render_group_page(auth):
@@ -2459,7 +2458,7 @@ def render_claims_dashboard(auth):
         ("On Hold", _stage_is("hold"), {"collapse": True}),
         ("Waiting President", _stage_is("await_president"), {"collapse": True}),
         ("Approved", _stage_is("approved"), {"collapse": True}),
-        ("Paid", _stage_is("paid"), {"wrapper": render_paid_tab}),
+        ("Paid", _stage_is("paid"), {"newest_first": True, "show_history": True}),
         ("Rejected", _stage_is("rejected")),
         ("Merged", _stage_is("merged"), {"newest_first": True, "show_history": True}),
     ], "admin")
