@@ -1836,7 +1836,8 @@ def render_claim_rows(service, folder_id, claims_subset, auth, tab_key, newest_f
         cols[7].markdown(f"**{_md_escape(c['voucher_no'])}**" if c.get("voucher_no") else "-")
         _cell(cols[8], status_text + (" ⚠️" if flags else "") + (" ✅ Complete" if c.get("complete") else ""))
         _cell(cols[9], f"💬 {len(comments)}" if comments else "-")
-        cols[10].markdown(f"[Open PDF]({c.get('file_link', '')})")
+        cols[10].markdown(f"[Open PDF]({c.get('file_link', '')})" +
+                          (f"  \n[Main file]({c['main_file_link']})" if c.get("main_file_link") else ""))
 
         if flags:
             st.warning("⚠️ **Possible duplicate receipt(s):**  \n" +
@@ -2158,24 +2159,216 @@ def render_group_lines(groups, all_open, tab_key):
         st.divider()
 
 
+def _group_totals(items):
+    """Money summary of one open main claim. Paid and pending are the amounts payable (after advances)."""
+    payable = sum(float(c.get("amount_payable") or 0) for c in items)
+    paid = sum(float(c.get("amount_payable") or 0) for c in items if claim_stage(c)[0] == "paid")
+    return {"claims": len(items), "total": sum(float(c.get("total_claim") or 0) for c in items),
+            "gst": sum(float(c.get("gst") or 0) for c in items), "paid": paid, "pending": round(payable - paid, 2)}
+
+
+def _unique_drive_name(service, folder_id, base):
+    """base.pdf, or base (2).pdf, base (3).pdf ... when that name is already used in the Drive folder."""
+    name, n = f"{base}.pdf", 1
+    while True:
+        safe = name.replace("\\", "\\\\").replace("'", "\\'")
+        res = service.files().list(
+            q=f"name = '{safe}' and '{folder_id}' in parents and trashed = false",
+            fields="files(id)", supportsAllDrives=True, includeItemsFromAllDrives=True).execute()
+        if not res.get("files"):
+            return name
+        n += 1
+        name = f"{base} ({n}).pdf"
+
+
+def build_main_claim_summary_pdf(main_no, main_event, items):
+    """Header page for a main claim: the main claim's information, then one entry per sub claim."""
+    E = lambda v: xml_escape(str(v if v is not None else ""))
+    uniq = lambda vals: ", ".join(dict.fromkeys(str(v).strip() for v in vals if v and str(v).strip()))
+    buf = io.BytesIO()
+    doc = SimpleDocTemplate(buf, pagesize=A4, leftMargin=36, rightMargin=36, topMargin=36, bottomMargin=36)
+    top = ParagraphStyle("MCtop", fontName="Helvetica-Oblique", fontSize=9, alignment=1, spaceAfter=4)
+    title = ParagraphStyle("MCt", fontName="Helvetica-Bold", fontSize=14, alignment=1, spaceAfter=2)
+    sub = ParagraphStyle("MCs", fontName="Helvetica-Bold", fontSize=12, alignment=1, spaceAfter=2)
+    cell = ParagraphStyle("MCc", fontName="Helvetica", fontSize=9, leading=11)
+    cell_b = ParagraphStyle("MCb", fontName="Helvetica-Bold", fontSize=9, leading=11)
+    sm = ParagraphStyle("MCsm", fontName="Helvetica", fontSize=8, leading=10)
+    sm_b = ParagraphStyle("MCsmb", fontName="Helvetica-Bold", fontSize=8, leading=10)
+    sm_r = ParagraphStyle("MCsmr", parent=sm, alignment=2)
+    sm_rb = ParagraphStyle("MCsmrb", parent=sm_b, alignment=2)
+
+    t = _group_totals(items)
+    advance = sum(float(c.get("advance") or 0) for c in items)
+    payable = sum(float(c.get("amount_payable") or 0) for c in items)
+    story = [
+        Paragraph("In the name of Allah, the gracious, the merciful", top),
+        Paragraph("MAJLIS ANSARULLAH AUSTRALIA", title),
+        Paragraph("Department of Mal", ParagraphStyle("MCd", fontName="Helvetica", fontSize=11, alignment=1, spaceAfter=2)),
+        Paragraph("Consolidated Claim Summary", sub),
+        Spacer(1, 10),
+    ]
+    info = [
+        ("Main Claim No:", main_no),
+        ("Event:", main_event),
+        ("Claimants:", uniq(c.get("name") for c in items)),
+        ("Region:", uniq(c.get("region") for c in items)),
+        ("Majlis / Office:", uniq(c.get("majlis") for c in items)),
+        ("Account:", uniq(c.get("account") for c in items)),
+        ("Number of claims:", str(len(items))),
+        ("Prepared on:", now_local().strftime("%d/%m/%Y")),
+    ]
+    t_info = Table([[Paragraph(f"<b>{E(k)}</b>", cell), Paragraph(E(v), cell)] for k, v in info], colWidths=[130, 393])
+    t_info.setStyle(TableStyle([("GRID", (0, 0), (-1, -1), 1, colors.black), ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+                                ("PADDING", (0, 0), (-1, -1), 5)]))
+    story += [t_info, Spacer(1, 12)]
+
+    money = [
+        [Paragraph("<b>Total Claim:</b>", cell), Paragraph(f"<b>{_money(t['total'])}</b>", cell_b),
+         Paragraph("<b>Total GST:</b>", cell), Paragraph(_money(t["gst"]), cell)],
+        [Paragraph("<b>Advances Settled:</b>", cell), Paragraph(_money(advance), cell),
+         Paragraph("<b>Amount Payable:</b>", cell), Paragraph(f"<b>{_money(payable)}</b>", cell_b)],
+    ]
+    t_money = Table(money, colWidths=[110, 151, 110, 152])
+    t_money.setStyle(TableStyle([("GRID", (0, 0), (-1, -1), 1, colors.black), ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+                                 ("PADDING", (0, 0), (-1, -1), 5)]))
+    story += [t_money, Spacer(1, 12)]
+
+    head = ["#", "Date", "Claimant", "Description", "Total amount", "GST", "Advance", "Payable"]
+    rows = [[Paragraph(f"<b>{h}</b>", sm_b) for h in head]]
+    for n, c in enumerate(items, start=1):
+        desc = str(c.get("event", ""))
+        if c.get("voucher_no"):
+            desc += f" (Voucher {c['voucher_no']})"
+        adv = float(c.get("advance") or 0)
+        rows.append([Paragraph(str(n), sm), Paragraph(E(c.get("submitted_on", "")), sm), Paragraph(E(c.get("name", "")), sm),
+                     Paragraph(E(desc), sm), Paragraph(_money(float(c.get("total_claim") or 0)), sm_r),
+                     Paragraph(_money(float(c.get("gst") or 0)), sm_r),
+                     Paragraph(f"-{_money(adv)}" if adv > 0 else "", sm_r),
+                     Paragraph(_money(float(c.get("amount_payable") or 0)), sm_r)])
+    rows.append([Paragraph("<b>Total</b>", sm_b), "", "", "", Paragraph(_money(t["total"]), sm_rb),
+                 Paragraph(_money(t["gst"]), sm_rb), Paragraph(f"-{_money(advance)}" if advance > 0 else "", sm_rb),
+                 Paragraph(_money(payable), sm_rb)])
+    t_rows = Table(rows, colWidths=[22, 60, 86, 127, 58, 42, 50, 78], repeatRows=1)
+    t_rows.setStyle(TableStyle([("GRID", (0, 0), (-1, -1), 1, colors.black), ("BACKGROUND", (0, 0), (-1, 0), colors.lightgrey),
+                                ("VALIGN", (0, 0), (-1, -1), "MIDDLE"), ("PADDING", (0, 0), (-1, -1), 4),
+                                ("SPAN", (0, -1), (3, -1))]))
+    story += [t_rows, Spacer(1, 10),
+              Paragraph("Each line above is one claim. The pages that follow are those claims in the same order, "
+                        "each with its own voucher page and receipts.", sm)]
+    doc.build(story)
+    return buf.getvalue()
+
+
+def process_main_claim(service, folder_id, main_no, role, actor):
+    """Admin only. Combines every open claim of a main claim into ONE PDF (header page first, then each claim's pages),
+    saves it to Drive named after the main claim, and marks those claims complete. The individual claim PDFs, their
+    approvals and their payments are left as they are. Returns (file name, link, number of claims)."""
+    if role != ROLE_ADMIN:
+        raise PermissionError("Only the Admin can process a main claim.")
+    claims, fid = load_register(service, folder_id)
+    items = sorted((c for c in claims if is_open_claim(c) and _main_no(c).lower() == str(main_no).strip().lower()),
+                   key=lambda c: c.get("submitted_ts", ""))
+    if not items:
+        raise ValueError("This main claim has no open claims. Please refresh.")
+    no, ev = _group_title(items)
+
+    writer = PdfWriter()
+    for page in PdfReader(io.BytesIO(build_main_claim_summary_pdf(no, ev, items))).pages:
+        writer.add_page(page)
+    for c in items:
+        try:
+            data = service.files().get_media(fileId=c["file_id"], supportsAllDrives=True).execute()
+            for page in PdfReader(io.BytesIO(data)).pages:
+                writer.add_page(page)
+        except Exception as e:
+            raise ValueError(f"Could not read the PDF of the claim from {c.get('name', '')} ({c.get('event', '')}): {e}")
+    out = io.BytesIO()
+    writer.write(out)
+
+    base = "_".join(p for p in (_fn_part(no, 30), _fn_part(ev, 60)) if p) or "Main_claim"
+    name = _unique_drive_name(service, folder_id, base)
+    file_id, link = upload_pdf_to_drive(service, folder_id, name, out.getvalue())
+
+    today = now_local().strftime("%d/%m/%Y")
+    for c in items:
+        c["complete"] = True
+        c["complete_by"], c["complete_on"] = actor, today
+        c["main_file_id"], c["main_file_link"], c["main_file_name"] = file_id, link, name
+        _log(c, actor, f"Main claim {no} processed as complete: combined file {name} saved to Drive "
+                       f"({len(items)} claims); claim marked complete")
+    save_register(service, folder_id, claims, fid)
+    return name, link, len(items)
+
+
+def render_process_button(service, folder_id, items, auth, key):
+    no, ev = _group_title(items)
+    if st.button("✅ Process as complete", key=f"proc_{key}", type="primary"):
+        st.session_state[f"confirm_proc_{key}"] = True
+    if st.session_state.get(f"confirm_proc_{key}"):
+        st.warning(f"Combine all {len(items)} claims of {no} into one PDF in Google Drive, with a main claim header page, "
+                   "and mark them complete (they leave Open Claims)? The individual claims keep their own PDFs, approvals "
+                   "and payments.")
+        y, n_, _ = st.columns([1.4, 1, 6])
+        if y.button("Yes, process", key=f"procyes_{key}", type="primary"):
+            try:
+                with st.spinner("Combining the files and saving to Google Drive..."):
+                    name, link, count = process_main_claim(service, folder_id, no, auth["role"], auth["name"])
+            except Exception as e:
+                st.error(f"Could not process the main claim: {e}")
+            else:
+                st.session_state.pop(f"confirm_proc_{key}", None)
+                st.session_state["dash_notice"] = f"Main claim {no} processed: {count} claims combined into [{name}]({link})."
+                st.session_state["admin_view"] = "dashboard"
+                st.rerun()
+        if n_.button("Cancel", key=f"procno_{key}"):
+            st.session_state.pop(f"confirm_proc_{key}", None)
+            st.rerun()
+
+
+def render_group_body(service, folder_id, items, auth, key):
+    """Totals, the Process as complete button and the full claim rows of one open main claim."""
+    t = _group_totals(items)
+    m1, m2, m3, m4, m5 = st.columns(5)
+    m1.metric("Claims", t["claims"])
+    m2.metric("Total claims", _money(t["total"]))
+    m3.metric("Total GST", _money(t["gst"]))
+    m4.metric("Total paid", _money(t["paid"]))
+    m5.metric("Total pending", _money(t["pending"]))
+    render_process_button(service, folder_id, items, auth, key)
+    st.divider()
+    render_claim_rows(service, folder_id, items, auth, key, merge_select=True)
+
+
 def render_open_tab(service, folder_id, sub, auth, tab_key):
-    """Open Claims tab: a dropdown of every open main claim, then the full claim rows of the chosen one."""
+    """Open Claims tab: one expandable line per open main claim showing its totals; expand it to see its claims."""
     if not sub:
         st.info("No open claims. Untick 'Claim complete' on a claim to keep it open under a Main Claim Number.")
         return
-    labels = {}
-    for items in open_groups(sub).values():
-        no, ev = _group_title(items)
-        labels[f"{no} - {ev}"] = items
+    groups = open_groups(sub)
     loose = [c for c in sub if not _main_no(c)]
-    ALL, NONE = "All open claims", "No Main Claim Number yet"
-    options = [ALL] + sorted(labels, key=_natural_key) + ([NONE] if loose else [])
+    names = {}
+    for gkey, items in groups.items():
+        no, ev = _group_title(items)
+        names[f"{no} - {ev}"] = gkey
+    ALL = "All open main claims"
+    options = [ALL] + sorted(names, key=_natural_key)
     pick_key = "open_pick"
     if st.session_state.get(pick_key) not in options:
         st.session_state[pick_key] = ALL
     pick = st.selectbox("Open main claim", options, key=pick_key)
-    shown = sub if pick == ALL else (loose if pick == NONE else labels[pick])
-    render_claim_rows(service, folder_id, shown, auth, tab_key, merge_select=True)
+
+    chosen = groups if pick == ALL else {names[pick]: groups[names[pick]]}
+    for gkey, items in sorted(chosen.items(), key=lambda kv: _natural_key(_group_title(kv[1])[0])):
+        no, ev = _group_title(items)
+        t = _group_totals(items)
+        label = (f"🗂 {_md_escape(no)} - {_md_escape(ev)}  ·  {t['claims']} claim{'s' if t['claims'] != 1 else ''}  ·  "
+                 f"Total {_money(t['total'])}  ·  GST {_money(t['gst'])}  ·  Paid {_money(t['paid'])}  ·  "
+                 f"Pending {_money(t['pending'])}").replace("$", "\\$")
+        with st.expander(label, expanded=pick != ALL):
+            render_group_body(service, folder_id, items, auth, f"{tab_key}_{gkey}")
+    if pick == ALL and loose:
+        st.markdown("##### Open claims with no Main Claim Number yet")
+        render_claim_rows(service, folder_id, loose, auth, f"{tab_key}_none", merge_select=True)
 
 
 def render_group_page(auth):
@@ -2194,32 +2387,7 @@ def render_group_page(auth):
         return
     no, ev = _group_title(items)
     st.markdown(f"#### {_md_escape(no)} - {_md_escape(ev)}")
-    m1, m2, m3, m4 = st.columns(4)
-    m1.metric("Claims", len(items))
-    m2.metric("Total claimed", _money(sum(float(c.get("total_claim") or 0) for c in items)))
-    m3.metric("GST", _money(sum(float(c.get("gst") or 0) for c in items)))
-    m4.metric("Amount to pay", _money(sum(float(c.get("amount_payable") or 0) for c in items)))
-
-    if st.button("✅ Close this main claim (mark all its claims complete)"):
-        st.session_state["confirm_close_group"] = no
-    if st.session_state.get("confirm_close_group") == no:
-        st.warning(f"Mark all {len(items)} claims of {no} as complete? They leave Open Claims. Approval and payment are not affected.")
-        y, n_, _ = st.columns([1.3, 1, 6])
-        if y.button("Yes, close it", type="primary"):
-            try:
-                done = complete_claims(service, folder_id, [c["id"] for c in items], auth["role"], auth["name"])
-            except Exception as e:
-                st.error(f"Could not close the main claim: {e}")
-            else:
-                st.session_state.pop("confirm_close_group", None)
-                st.session_state["dash_notice"] = f"Main claim {no} closed ({done} claims marked complete)."
-                st.session_state["admin_view"] = "dashboard"
-                st.rerun()
-        if n_.button("Cancel"):
-            st.session_state.pop("confirm_close_group", None)
-            st.rerun()
-    st.divider()
-    render_claim_rows(service, folder_id, items, auth, "group", merge_select=True)
+    render_group_body(service, folder_id, items, auth, "group")
 
 
 # ---------------------------- ADMIN ----------------------------
