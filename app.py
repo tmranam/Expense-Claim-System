@@ -2006,10 +2006,32 @@ def render_tabs(service, folder_id, claims, auth, tab_specs, role_key):
     Each tab shows the claims its predicate accepts; options are passed on to render_claim_rows."""
     specs = [(s[0], s[1], s[2] if len(s) > 2 else {}) for s in tab_specs]
     subsets = [[c for c in claims if pred(c)] for _, pred, _ in specs]
-    tabs = st.tabs([f"{label} ({len(sub)})" for (label, _, _), sub in zip(specs, subsets)])
-    for tab, (label, _, opts), sub in zip(tabs, specs, subsets):
+    all_open = open_groups(claims)
+
+    def split(sub, opts):
+        """With 'collapse', claims of an open main claim become one line per main claim; the rest stay as they are."""
+        if not opts.get("collapse"):
+            return {}, sub
+        groups = open_groups(sub)
+        ids = {c["id"] for items in groups.values() for c in items}
+        return groups, [c for c in sub if c["id"] not in ids]
+
+    splits = [split(sub, opts) for (_, _, opts), sub in zip(specs, subsets)]
+    tabs = st.tabs([f"{label} ({len(sub) if opts.get('wrapper') else len(groups) + len(loose)})"
+                    for (label, _, opts), sub, (groups, loose) in zip(specs, subsets, splits)])
+    for tab, (label, _, opts), sub, (groups, loose) in zip(tabs, specs, subsets, splits):
         with tab:
-            render_claim_rows(service, folder_id, sub, auth, f"{role_key}_{label}", **opts)
+            key = f"{role_key}_{label}"
+            row_opts = {k: v for k, v in opts.items() if k not in ("collapse", "wrapper")}
+            if opts.get("wrapper"):
+                opts["wrapper"](service, folder_id, sub, auth, key)
+            elif groups:
+                render_group_lines(groups, all_open, key)
+                if loose:
+                    st.markdown("##### Other claims")
+                    render_claim_rows(service, folder_id, loose, auth, key, **row_opts)
+            else:
+                render_claim_rows(service, folder_id, loose, auth, key, **row_opts)
 
 
 def _stage_is(*keys):
@@ -2020,6 +2042,184 @@ def is_open_claim(c):
     """Open = not ticked 'complete' by the Admin (more claims may still come for the same event). An open claim is
     still approved, sent to the President and paid as normal; it just stays listed here until it is ticked complete."""
     return not c.get("complete") and claim_stage(c)[0] not in ("rejected", "merged")
+
+
+# ------------------ OPEN MAIN CLAIMS (claims kept open for the same event) ------------------
+# An open claim has a Main Claim Number (e.g. 2026-136) and an Event (e.g. Shura Travel). Claims sharing the number form one
+# open main claim. In the approval tabs they show as ONE line; the Open Claims tab has a dropdown of all open main claims.
+def _main_no(c):
+    return (c.get("main_no") or "").strip()
+
+
+def open_groups(claims):
+    """{lower-case main claim number: [open claims]} for every open claim that has a Main Claim Number."""
+    groups = {}
+    for c in claims:
+        if is_open_claim(c) and _main_no(c):
+            groups.setdefault(_main_no(c).lower(), []).append(c)
+    return groups
+
+
+def _group_title(items):
+    items = sorted(items, key=lambda c: c.get("submitted_ts", ""))
+    no = _main_no(items[0])
+    ev = next((c.get("main_event") for c in items if c.get("main_event")), "") or items[0].get("event", "")
+    return no, ev
+
+
+def _on_complete_toggle(widget_key, claim_id):
+    """Checkbox callback. Unticking never changes the box by itself: it stays ticked until a Main Claim Number is saved."""
+    val = bool(st.session_state.get(widget_key))
+    st.session_state["cplt_event"] = (claim_id, val)
+    if not val:
+        st.session_state[widget_key] = True
+
+
+def _main_claim_form(claim_id, default_no, default_event):
+    auth = st.session_state.get("auth") or {}
+    try:
+        service = get_drive_service()
+        folder_id = get_drive_folder_id()
+        claims, _ = load_register(service, folder_id)
+    except Exception as e:
+        st.error(f"Could not read the claims from Google Drive: {e}")
+        return
+    this = next((c for c in claims if c["id"] == claim_id), None)
+    if this is None:
+        st.error("That claim was not found. Please refresh the page.")
+        return
+    labels = {}
+    for items in open_groups([c for c in claims if c["id"] != claim_id]).values():
+        no, ev = _group_title(items)
+        labels[f"{no} - {ev}"] = (no, ev)
+    NEW = "➕ New main claim"
+    pick = st.selectbox("Open main claim", [NEW] + sorted(labels), key=f"mc_pick_{claim_id}")
+    if pick == NEW:
+        no = st.text_input("Enter Main Claim Number (for example 2026-136)", value=default_no, max_chars=30,
+                           key=f"mc_no_{claim_id}")
+        ev = st.text_input("Event (for example Shura Travel)", value=default_event, max_chars=100,
+                           key=f"mc_ev_{claim_id}")
+    else:
+        no, ev = labels[pick]
+        st.caption(f"This claim will be added to main claim {no} ({ev}).")
+    if st.button("Save and keep this claim open", type="primary", key=f"mc_save_{claim_id}"):
+        changes = {"complete": False} if this.get("complete") else {}
+        try:
+            update_claim(service, folder_id, claim_id, ROLE_ADMIN, auth.get("name", "Admin"), changes=changes,
+                         main={"no": no, "event": ev})
+        except Exception as e:
+            st.error(f"Could not save: {e}")
+            return
+        st.session_state["dash_notice"] = f"The claim is kept open under main claim {no.strip()}."
+        st.rerun()
+
+
+_DIALOG = next((getattr(st, n) for n in ("dialog", "experimental_dialog") if hasattr(st, n)), None)
+if _DIALOG:
+    main_claim_dialog = _DIALOG("Keep this claim open")(_main_claim_form)
+else:                                       # very old Streamlit: show the same form on the page instead of a pop-up
+    def main_claim_dialog(*args):
+        with st.container(border=True):
+            _main_claim_form(*args)
+
+
+GROUP_HEADERS = ["Date", "Event", "Total Claim", "GST", "Claim Number", "Advance Adj.", "Status", "File"]
+GROUP_WIDTHS = [0.9, 2.2, 1.0, 0.8, 1.3, 1.0, 0.8, 1.0]
+
+
+def render_group_lines(groups, all_open, tab_key):
+    """One line per open main claim (the claims of that main claim that are in this tab, added up), with a grey line below."""
+    st.markdown("##### Open main claims")
+    for col, label in zip(st.columns(GROUP_WIDTHS), GROUP_HEADERS):
+        col.markdown(f"**{label}**")
+    st.divider()
+    for gkey, items in groups.items():
+        items = sorted(items, key=lambda c: c.get("submitted_ts", ""))
+        no, ev = _group_title(items)
+        latest = items[-1]
+        advance = sum(float(c.get("advance") or 0) for c in items)
+        cols = st.columns(GROUP_WIDTHS)
+        _cell(cols[0], latest.get("submitted_on", ""))
+        cols[1].markdown(_md_escape(ev))
+        _cell(cols[2], f"${sum(float(c.get('total_claim') or 0) for c in items):,.2f}")
+        _cell(cols[3], f"${sum(float(c.get('gst') or 0) for c in items):,.2f}")
+        cols[4].markdown(f"**{_md_escape(no)}**")
+        _cell(cols[5], f"-${advance:,.2f}" if advance > 0 else "-")
+        cols[6].markdown("Open")
+        cols[7].markdown(f"[Open PDF]({latest.get('file_link', '')})")
+        total_n = len(all_open.get(gkey, items))
+        g1, g2, _ = st.columns([3.4, 1.8, 3.8])
+        g1.markdown(f":gray[There are multiple claims for this event ({total_n} in total, {len(items)} in this tab).]"
+                    if total_n > 1 else ":gray[This is an open claim. More claims for this event can still be added.]")
+        if g2.button("Click here to view those", key=f"grp_{tab_key}_{gkey}"):
+            st.session_state["group_no"] = no
+            st.session_state["admin_view"] = "group"
+            st.rerun()
+        st.divider()
+
+
+def render_open_tab(service, folder_id, sub, auth, tab_key):
+    """Open Claims tab: a dropdown of every open main claim, then the full claim rows of the chosen one."""
+    if not sub:
+        st.info("No open claims. Untick 'Claim complete' on a claim to keep it open under a Main Claim Number.")
+        return
+    labels = {}
+    for items in open_groups(sub).values():
+        no, ev = _group_title(items)
+        labels[f"{no} - {ev}"] = items
+    loose = [c for c in sub if not _main_no(c)]
+    ALL, NONE = "All open claims", "No Main Claim Number yet"
+    options = [ALL] + sorted(labels, key=_natural_key) + ([NONE] if loose else [])
+    pick_key = "open_pick"
+    if st.session_state.get(pick_key) not in options:
+        st.session_state[pick_key] = ALL
+    pick = st.selectbox("Open main claim", options, key=pick_key)
+    shown = sub if pick == ALL else (loose if pick == NONE else labels[pick])
+    render_claim_rows(service, folder_id, shown, auth, tab_key, merge_select=True)
+
+
+def render_group_page(auth):
+    st.markdown("### 🗂 Open Main Claim")
+    if st.button("⬅ Back to Claims Dashboard"):
+        st.session_state["admin_view"] = "dashboard"
+        st.rerun()
+    data = load_dashboard_data(ROLE_ADMIN)
+    if data is None:
+        return
+    service, folder_id, claims = data
+    gno = st.session_state.get("group_no", "")
+    items = sorted(open_groups(claims).get(gno.lower(), []), key=lambda c: c.get("submitted_ts", ""))
+    if not items:
+        st.info("This main claim has no open claims any more.")
+        return
+    no, ev = _group_title(items)
+    st.markdown(f"#### {_md_escape(no)} - {_md_escape(ev)}")
+    m1, m2, m3, m4 = st.columns(4)
+    m1.metric("Claims", len(items))
+    m2.metric("Total claimed", _money(sum(float(c.get("total_claim") or 0) for c in items)))
+    m3.metric("GST", _money(sum(float(c.get("gst") or 0) for c in items)))
+    m4.metric("Amount to pay", _money(sum(float(c.get("amount_payable") or 0) for c in items)))
+
+    if st.button("✅ Close this main claim (mark all its claims complete)"):
+        st.session_state["confirm_close_group"] = no
+    if st.session_state.get("confirm_close_group") == no:
+        st.warning(f"Mark all {len(items)} claims of {no} as complete? They leave Open Claims. Approval and payment are not affected.")
+        y, n_, _ = st.columns([1.3, 1, 6])
+        if y.button("Yes, close it", type="primary"):
+            try:
+                done = complete_claims(service, folder_id, [c["id"] for c in items], auth["role"], auth["name"])
+            except Exception as e:
+                st.error(f"Could not close the main claim: {e}")
+            else:
+                st.session_state.pop("confirm_close_group", None)
+                st.session_state["dash_notice"] = f"Main claim {no} closed ({done} claims marked complete)."
+                st.session_state["admin_view"] = "dashboard"
+                st.rerun()
+        if n_.button("Cancel"):
+            st.session_state.pop("confirm_close_group", None)
+            st.rerun()
+    st.divider()
+    render_claim_rows(service, folder_id, items, auth, "group", merge_select=True)
 
 
 # ---------------------------- ADMIN ----------------------------
@@ -2047,12 +2247,12 @@ def render_claims_dashboard(auth):
     service, folder_id, claims = data
 
     render_tabs(service, folder_id, claims, auth, [
-        ("Open Claims", is_open_claim, {"merge_select": True}),
-        ("To Process", _stage_is("to_process")),
-        ("Awaiting Nazim", _stage_is("await_nazim")),
-        ("On Hold", _stage_is("hold")),
-        ("Waiting President", _stage_is("await_president")),
-        ("Approved", _stage_is("approved")),
+        ("Open Claims", is_open_claim, {"wrapper": render_open_tab}),
+        ("To Process", _stage_is("to_process"), {"collapse": True}),
+        ("Awaiting Nazim", _stage_is("await_nazim"), {"collapse": True}),
+        ("On Hold", _stage_is("hold"), {"collapse": True}),
+        ("Waiting President", _stage_is("await_president"), {"collapse": True}),
+        ("Approved", _stage_is("approved"), {"collapse": True}),
         ("Paid", _stage_is("paid"), {"newest_first": True, "show_history": True}),
         ("Rejected", _stage_is("rejected")),
         ("Merged", _stage_is("merged"), {"newest_first": True, "show_history": True}),
@@ -4102,6 +4302,8 @@ if app_mode == "Admin Panel Configuration":
                 render_merge_page(auth)
             elif view == "upload":
                 render_upload_claim_page(auth)
+            elif view == "group":
+                render_group_page(auth)
             elif view == "summary":
                 render_summary_page(auth)
             else:
