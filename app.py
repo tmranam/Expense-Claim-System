@@ -2371,6 +2371,44 @@ def render_open_tab(service, folder_id, sub, auth, tab_key):
         render_claim_rows(service, folder_id, loose, auth, f"{tab_key}_none", merge_select=True)
 
 
+def render_paid_tab(service, folder_id, sub, auth, tab_key):
+    """Paid tab: paid claims that belong to a main claim (still open, or already processed into one combined file)
+    are one expandable line per main claim. All other paid claims are listed as usual."""
+    if not sub:
+        st.info("No claims in this tab.")
+        return
+    groups = {}
+    for c in sub:
+        no = _main_no(c)
+        if no and (not c.get("complete") or c.get("main_file_id")):
+            groups.setdefault(f"{no.lower()}|{c.get('main_file_id') or ''}", []).append(c)
+    ids = {c["id"] for items in groups.values() for c in items}
+    loose = [c for c in sub if c["id"] not in ids]
+
+    newest = lambda kv: max((c.get("paid_ts") or c.get("submitted_ts") or "") for c in kv[1])
+    for gkey, items in sorted(groups.items(), key=newest, reverse=True):
+        items = sorted(items, key=lambda c: c.get("submitted_ts", ""))
+        no, ev = _group_title(items)
+        t = _group_totals(items)
+        label = (f"🗂 {_md_escape(no)} - {_md_escape(ev)}  ·  {t['claims']} paid claim{'s' if t['claims'] != 1 else ''}  ·  "
+                 f"Total {_money(t['total'])}  ·  GST {_money(t['gst'])}  ·  Paid {_money(t['paid'])}").replace("$", "\\$")
+        with st.expander(label, expanded=False):
+            m1, m2, m3, m4 = st.columns(4)
+            m1.metric("Claims", t["claims"])
+            m2.metric("Total claims", _money(t["total"]))
+            m3.metric("Total GST", _money(t["gst"]))
+            m4.metric("Total paid", _money(t["paid"]))
+            main_link = next((c.get("main_file_link") for c in items if c.get("main_file_link")), "")
+            if main_link:
+                st.markdown(f"[Open the combined main claim PDF]({main_link})")
+            st.divider()
+            render_claim_rows(service, folder_id, items, auth, f"{tab_key}_{gkey}", newest_first=True, show_history=True)
+    if loose:
+        if groups:
+            st.markdown("##### Other paid claims")
+        render_claim_rows(service, folder_id, loose, auth, f"{tab_key}_other", newest_first=True, show_history=True)
+
+
 def render_group_page(auth):
     st.markdown("### 🗂 Open Main Claim")
     if st.button("⬅ Back to Claims Dashboard"):
@@ -2421,7 +2459,7 @@ def render_claims_dashboard(auth):
         ("On Hold", _stage_is("hold"), {"collapse": True}),
         ("Waiting President", _stage_is("await_president"), {"collapse": True}),
         ("Approved", _stage_is("approved"), {"collapse": True}),
-        ("Paid", _stage_is("paid"), {"newest_first": True, "show_history": True}),
+        ("Paid", _stage_is("paid"), {"wrapper": render_paid_tab}),
         ("Rejected", _stage_is("rejected")),
         ("Merged", _stage_is("merged"), {"newest_first": True, "show_history": True}),
     ], "admin")
