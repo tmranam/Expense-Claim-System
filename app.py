@@ -204,6 +204,196 @@ def get_drive_service():
     return build("drive", "v3", credentials=creds, cache_discovery=False)
 
 
+# -------------------------------------------------------------------------
+# TRACKING SHEET (a Google Sheet in the admin's Drive, e.g. "2026 Expense Tracking Sheet")
+# When a Voucher No. is given to a claim, one row is added to the chosen sheet. Columns are matched by the headings in row 1
+# (Date, Voucher No, Paying To, Head, Sub Head, Details, Amount, GST, Majlis, Status, Advance ...), so the sheet's column
+# order can change. Headings the app has nothing for (Sub Head, Remarks, BAS Claimed ...) are left empty for you to fill in.
+# Uses the Google Sheets API: it must be enabled in the same Google Cloud project as the Drive credentials.
+# -------------------------------------------------------------------------
+SHEETS_MIME = "application/vnd.google-apps.spreadsheet"
+_HEAD_ALIASES = {
+    "voucher": "voucher no", "voucher number": "voucher no", "voucher no.": "voucher no", "vno": "voucher no",
+    "payee": "paying to", "paid to": "paying to", "name": "paying to", "claimant": "paying to",
+    "account": "head", "account head": "head", "description": "details", "event": "details",
+    "total": "amount", "total claim": "amount",
+}
+
+
+def _google_creds():
+    oauth = _secret("google_oauth")
+    if oauth:
+        return OAuthCredentials(token=None, refresh_token=oauth["refresh_token"], token_uri="https://oauth2.googleapis.com/token",
+                                client_id=oauth["client_id"], client_secret=oauth["client_secret"], scopes=DRIVE_SCOPES)
+    info = _secret("gcp_service_account")
+    if not info:
+        return None
+    return service_account.Credentials.from_service_account_info(dict(info), scopes=DRIVE_SCOPES)
+
+
+def get_sheets_service():
+    creds = _google_creds()
+    return build("sheets", "v4", credentials=creds, cache_discovery=False) if creds else None
+
+
+def _norm_head(h):
+    h = " ".join(re.sub(r"[^a-z0-9. ]+", " ", str(h or "").lower()).split())
+    return _HEAD_ALIASES.get(h, h)
+
+
+def _col_letter(i):
+    """0 -> A, 25 -> Z, 26 -> AA"""
+    out, i = "", i + 1
+    while i:
+        i, r = divmod(i - 1, 26)
+        out = chr(65 + r) + out
+    return out
+
+
+def _sheet_text(v):
+    """Text for a sheet cell; a leading = + - @ is made plain text so it can never be run as a formula."""
+    v = str(v or "")
+    return "'" + v if v[:1] in ("=", "+", "-", "@") else v
+
+
+def _voucher_cell(v):
+    """Digits only (133) are written as a number like the rest of the sheet; anything else (139-03) is kept exactly as text."""
+    v = str(v or "").strip()
+    return v if v.isdigit() else "'" + v
+
+
+def _tracking_values(claim):
+    """What the app can fill in, by (normalised) heading."""
+    d = _claim_date(claim)
+    adv = round(float(claim.get("advance") or 0), 2)
+    details = str(claim.get("event") or "")
+    if is_advance(claim):
+        details = f"Advance - {details}"
+    return {
+        "date": f"{d.day}-{d.strftime('%b')}-{d.strftime('%y')}" if d else str(claim.get("submitted_on", "")),
+        "voucher no": _voucher_cell(claim.get("voucher_no")),
+        "paying to": _sheet_text(claim.get("name")),
+        "head": _sheet_text(claim.get("account")),
+        "details": _sheet_text(details),
+        "amount": round(float(claim.get("total_claim") or 0), 2),
+        "gst": round(float(claim.get("gst") or 0), 2),
+        "majlis": _sheet_text(claim.get("majlis")),
+        "status": "Complete" if claim.get("complete") else "Open",
+        "advance": adv if adv > 0 else "",
+    }
+
+
+def _tracking_sheets():
+    """(list of {id, name}, error text). The admin's Google Sheets (those with 'track' in the name, if any), cached for 5 minutes."""
+    cached = st.session_state.get("trk_sheets")
+    if cached and time.time() - cached["at"] < 300:
+        return cached["rows"], cached["err"]
+    rows, err = [], ""
+    try:
+        service = get_drive_service()
+        if service is None:
+            err = "Google Drive is not connected."
+        else:
+            res = service.files().list(q=f"mimeType = '{SHEETS_MIME}' and trashed = false", fields="files(id, name)",
+                                       pageSize=200, orderBy="name desc", supportsAllDrives=True,
+                                       includeItemsFromAllDrives=True).execute()
+            found = res.get("files", [])
+            rows = [f for f in found if "track" in f.get("name", "").lower()] or found
+    except Exception as e:
+        err = str(e)
+    st.session_state["trk_sheets"] = {"at": time.time(), "rows": rows, "err": err}
+    return rows, err
+
+
+def tracking_controls(key, year=None, box=None, claim=None, stack=False):
+    """'Enter in Tracking Sheet' tick box (ticked by default) and the sheet drop-down (the sheet with the year in its name is
+    pre-selected). Returns {"id", "name"} when ticked, else None."""
+    year = str(year or now_local().year)
+    sheets, err = _tracking_sheets()
+    with (box if box is not None else st.container()):
+        t1, t2, t3 = (st, st, st) if stack else st.columns([2.1, 4.2, 3])     # stack=True: one under the other (narrow spots)
+        on = t1.checkbox("Enter in Tracking Sheet", value=True, key=f"trk_{key}",
+                         help="When ticked, saving a Voucher No. adds one row for this claim to the selected Google Sheet.")
+        if not sheets:
+            t2.caption("No Google Sheets found in Drive." + (f" ({err})" if err else ""))
+            return None
+        names = {f["id"]: f["name"] for f in sheets}
+        ids = list(names)
+        default = next((i for i, f in enumerate(sheets) if year in f["name"]), 0)
+        pick = t2.selectbox("Tracking sheet", ids, index=default, format_func=lambda i: names[i],
+                            key=f"trksh_{key}_{year}", label_visibility="collapsed", disabled=not on)
+        tr = (claim or {}).get("tracking")
+        if tr:
+            t3.caption(f"✅ Entered in {tr.get('sheet_name', 'the sheet')} (row {tr.get('row', '?')})")
+    return {"id": pick, "name": names[pick]} if on else None
+
+
+def apply_tracking(claim, tracking, actor):
+    """Adds the claim to the tracking sheet (or, if it was already entered there and only the Voucher No. changed, corrects the
+    voucher cell of that row). Records where in claim['tracking'] and in its history. Never raises: the result is left in
+    st.session_state['dash_tracking_msg'] as ('ok' | 'warn', text) for the next page to show."""
+    voucher = (claim.get("voucher_no") or "").strip()
+    if not tracking or not voucher:
+        return
+    prev = claim.get("tracking") or {}
+    if prev.get("sheet_id") == tracking["id"] and str(prev.get("voucher", "")).strip() == voucher:
+        return                                                       # already entered with this voucher number
+    try:
+        sheets = get_sheets_service()
+        if sheets is None:
+            raise RuntimeError("Google credentials are missing from the app secrets.")
+        sid = tracking["id"]
+        api = sheets.spreadsheets()
+        quote = lambda t: "'" + t.replace("'", "''") + "'"
+        meta = api.get(spreadsheetId=sid, fields="sheets.properties.title").execute()
+        tabs = [x["properties"]["title"] for x in meta.get("sheets", [])]
+        if not tabs:
+            raise ValueError("that spreadsheet has no tabs")
+        firsts = api.values().batchGet(spreadsheetId=sid, ranges=[f"{quote(t)}!1:1" for t in tabs]).execute().get("valueRanges", [])
+        tab, header = None, []
+        for t, vr in zip(tabs, firsts):
+            row1 = (vr.get("values") or [[]])[0]
+            if any(_norm_head(h) == "voucher no" for h in row1):
+                tab, header = t, row1
+                break
+        if tab is None:
+            raise ValueError("no tab in that spreadsheet has a 'Voucher No' heading in row 1")
+        vcol = next(i for i, h in enumerate(header) if _norm_head(h) == "voucher no")
+        vletter = _col_letter(vcol)
+        today = now_local().strftime("%d/%m/%Y")
+
+        if prev.get("sheet_id") == sid and prev.get("row"):          # same sheet, new voucher number: correct that row
+            cell = f"{quote(tab)}!{vletter}{int(prev['row'])}"
+            cur = api.values().get(spreadsheetId=sid, range=cell).execute().get("values") or [[""]]
+            if str((cur[0] or [""])[0]).strip() == str(prev.get("voucher", "")).strip():
+                api.values().update(spreadsheetId=sid, range=cell, valueInputOption="USER_ENTERED",
+                                    body={"values": [[_voucher_cell(voucher)]]}).execute()
+                claim["tracking"] = dict(prev, voucher=voucher, on=today, by=actor)
+                _log(claim, actor, f"Voucher No. corrected to {voucher} in tracking sheet {tracking['name']} (row {prev['row']})")
+                st.session_state["dash_tracking_msg"] = ("ok", f"Voucher No. updated in {tracking['name']} (row {prev['row']}).")
+                return
+            # the row was moved or edited by hand: add a fresh row below instead
+
+        ends = api.values().batchGet(spreadsheetId=sid, ranges=[f"{quote(tab)}!A:A", f"{quote(tab)}!{vletter}:{vletter}"]
+                                     ).execute().get("valueRanges", [])
+        last = max([len(v.get("values") or []) for v in ends] + [1])   # last used row (at least the heading row)
+        vals = _tracking_values(claim)
+        row_values = [vals.get(_norm_head(h), "") for h in header]
+        last_col = _col_letter(max(len(header) - 1, 0))
+        resp = api.values().append(spreadsheetId=sid, range=f"{quote(tab)}!A{last}:{last_col}{last}",
+                                   valueInputOption="USER_ENTERED", insertDataOption="INSERT_ROWS",
+                                   body={"values": [row_values]}).execute()
+        m = re.search(r"!\$?[A-Z]+(\d+)", str((resp.get("updates") or {}).get("updatedRange", "")))
+        row = int(m.group(1)) if m else last + 1
+        claim["tracking"] = {"sheet_id": sid, "sheet_name": tracking["name"], "tab": tab, "row": row, "voucher": voucher,
+                             "on": today, "by": actor}
+        _log(claim, actor, f"Entered in tracking sheet {tracking['name']} (row {row})")
+        st.session_state["dash_tracking_msg"] = ("ok", f"Voucher {voucher} entered in {tracking['name']} (row {row}).")
+    except Exception as e:
+        st.session_state["dash_tracking_msg"] = (
+            "warn", f"The voucher was saved, but it could not be entered in the tracking sheet {tracking.get('name', '')}: {e}")
+
+
 def upload_pdf_to_drive(service, folder_id, filename, pdf_bytes):
     media = MediaIoBaseUpload(io.BytesIO(pdf_bytes), mimetype="application/pdf", resumable=False)
     meta = {"name": filename, "parents": [folder_id]}
@@ -569,7 +759,7 @@ def _add_comment(claim, actor, role, text, decision=""):
 
 
 def update_claim(service, folder_id, claim_id, role, actor, changes=None, voucher_no=None, region=None, comment=None,
-                 fy=None, main=None):
+                 fy=None, main=None, tracking=None, track_explicit=False):
     """Applies a status change, a voucher number and/or a comment to one claim, after checking the role is allowed.
     changes = {"nazim_status": "Approved"} etc. Every change is written to the claim's history, and a comment
     typed together with a decision is saved with that decision.
@@ -648,6 +838,7 @@ def update_claim(service, folder_id, claim_id, role, actor, changes=None, vouche
 
     changed = False
     warning = ""
+    voucher_changed = False
 
     # Voucher number first, so an approval is never saved without the number being on the PDF
     if voucher_no is not None and role == ROLE_ADMIN:
@@ -670,10 +861,18 @@ def update_claim(service, folder_id, claim_id, role, actor, changes=None, vouche
                 else:
                     _log(claim, actor, f"Voucher No. changed from {old_no} to {new_no}")
                 changed = True
+                voucher_changed = True
             except Exception as e:
                 if changes.get("admin_status") == STATUS_APPROVED:
                     raise ValueError(f"Not approved: the voucher number could not be written onto the PDF in Drive ({e}).")
                 warning = f"The voucher number could not be written onto the PDF in Drive ({e})."
+
+    # Tracking sheet: when a voucher number is given or changed (or Save No. is clicked) and the box is ticked
+    if tracking and role == ROLE_ADMIN and (voucher_changed or track_explicit) and (claim.get("voucher_no") or "").strip():
+        before = copy.deepcopy(claim.get("tracking"))
+        apply_tracking(claim, tracking, actor)
+        if claim.get("tracking") != before:
+            changed = True
 
     now = now_local()
     today = now.strftime('%d/%m/%Y')
@@ -895,7 +1094,7 @@ def complete_claims(service, folder_id, claim_ids, role, actor):
     return n
 
 
-def merge_claims(service, folder_id, claim_ids, role, actor, event, voucher_no="", keep_first_pages=True):
+def merge_claims(service, folder_id, claim_ids, role, actor, event, voucher_no="", keep_first_pages=True, tracking=None):
     """Admin only. Merges several OPEN claims of one claimant (same event) into one consolidated claim:
     page 1 = a voucher page listing every receipt line of every claim, followed by each claim's pages.
     The merged PDF is saved in Drive as VoucherNo_Claimant_Event_Date.pdf and becomes a new claim waiting for the
@@ -993,6 +1192,8 @@ def merge_claims(service, folder_id, claim_ids, role, actor, event, voucher_no="
             rest.append({"claim_id": new_id, "amount": round(moved, 2), "by": actor, "on": now.strftime("%d/%m/%Y")})
             a["allocations"] = rest
             _log(a, actor, f"${moved:,.2f} now used in consolidated claim {voucher_no or new_id}")
+    if tracking and voucher_no:
+        apply_tracking(record, tracking, actor)
     claims.append(record)
     save_register(service, folder_id, claims, fid)
     return record
@@ -2112,10 +2313,12 @@ def render_claim_rows(service, folder_id, claims_subset, auth, tab_key, newest_f
                 placeholder="Add a comment (optional). It is saved with your decision and the Nazim e Ala, Admin and President can all read it.")
             add_comment_clicked = cc2.button("💬 Add comment", key=f"addcmt_{key_base}", use_container_width=True)
 
-        def _apply(changes, voucher=None, c=c, key_base=key_base, ver=ver, comment=comment_text, fy=None):
+        def _apply(changes, voucher=None, c=c, key_base=key_base, ver=ver, comment=comment_text, fy=None,
+                   tracking=None, track_explicit=False):
             try:
                 warning = update_claim(service, folder_id, c["id"], role, actor, changes=changes,
-                                       voucher_no=voucher, region=auth.get("region"), comment=comment, fy=fy)
+                                       voucher_no=voucher, region=auth.get("region"), comment=comment, fy=fy,
+                                       tracking=tracking, track_explicit=track_explicit)
             except Exception as e:
                 st.error(f"Could not update claim: {e}")
                 return
@@ -2158,6 +2361,7 @@ def render_claim_rows(service, folder_id, claims_subset, auth, tab_key, newest_f
 
                 n = len(actions)
                 row_cols = st.columns([2.0, 1.0, 1.0] + [1.15] * n + [max(0.2, 2.6 - 1.15 * n), 1.4, 1.1])
+                trk_box = st.container()          # the tracking-sheet controls sit directly under this row
                 voucher_input = row_cols[0].text_input(
                     "Voucher No.", value=c.get("voucher_no", ""), max_chars=20,
                     key=f"vno_{key_base}", placeholder="Enter Voucher No.", label_visibility="collapsed"
@@ -2173,16 +2377,18 @@ def render_claim_rows(service, folder_id, claims_subset, auth, tab_key, newest_f
                     format_func=lambda y: f"Year {y}",
                     help="The year (1 Jan - 31 Dec) this claim counts in. It is saved when you approve the claim, "
                          "or when you click Save No. on an approved claim.")
+                tracking = tracking_controls(f"{key_base}", year=fy_pick, box=trk_box, claim=c)
                 if row_cols[1].button("Save No.", key=f"saveno_{key_base}", use_container_width=True):
                     keep_year = fy_pick if (saved_fy or c["admin_status"] == STATUS_APPROVED) else None
-                    _apply({}, voucher_input, fy=keep_year)
+                    _apply({}, voucher_input, fy=keep_year, tracking=tracking, track_explicit=True)
                 for b_col, (label, field, value) in zip(row_cols[3:3 + n], actions):
                     needs_voucher = field == "admin_status" and value == STATUS_APPROVED and not voucher_input.strip()
                     if b_col.button(label, key=f"{key_base}_{field}_{value}", use_container_width=True,
                                     disabled=needs_voucher,
                                     help="Enter a Voucher No. first" if needs_voucher else None):
                         _apply({field: value}, voucher_input,
-                               fy=fy_pick if (field == "admin_status" and value == STATUS_APPROVED) else None)
+                               fy=fy_pick if (field == "admin_status" and value == STATUS_APPROVED) else None,
+                               tracking=tracking)
                 if not adv_row and row_cols[-2].button("✏️ Amend PDF", key=f"amend_{key_base}", use_container_width=True):
                     st.session_state["amend_claim_id"] = c["id"]
                     st.session_state["amend_init"] = None
@@ -2240,6 +2446,9 @@ def load_dashboard_data(role):
     pending_warning = st.session_state.pop("dash_warning", None)
     if pending_warning:
         st.warning(f"Saved, but: {pending_warning} Use the Open PDF link to check the file in Drive.")
+    trk = st.session_state.pop("dash_tracking_msg", None)
+    if trk:
+        (st.success if trk[0] == "ok" else st.warning)(str(trk[1]).replace("$", "\\$"))
 
     try:
         service = get_drive_service()
@@ -2732,6 +2941,7 @@ def render_claims_dashboard(auth):
         st.session_state.admin_view = "roles"
         st.rerun()
     if top_c.button("🔄 Refresh", use_container_width=True):
+        st.session_state.pop("trk_sheets", None)
         st.rerun()
     if top_u.button("📤 Upload Claim", use_container_width=True):
         st.session_state.admin_view = "upload"
@@ -3476,13 +3686,14 @@ def render_merge_page(auth):
     tag = "_".join(c["id"] for c in picked)
     event = st.text_input("Event description for the merged claim", value=picked[0].get("event", ""), key=f"mg_event_{tag}")
     voucher = st.text_input("Voucher No. for the merged claim (can also be added later)", max_chars=20, key=f"mg_vno_{tag}")
+    merge_tracking = tracking_controls(f"mg_{tag}", claim=None) if voucher.strip() else None
     keep = st.checkbox("Keep each claim's own first (voucher) page after the consolidated page", value=True, key=f"mg_keep_{tag}")
 
     if st.button("🔗 Merge and save to Google Drive", type="primary"):
         try:
             with st.spinner("Merging the PDFs and saving to Google Drive..."):
                 record = merge_claims(service, folder_id, [c["id"] for c in picked], auth["role"], auth["name"],
-                                      event, voucher, keep)
+                                      event, voucher, keep, tracking=merge_tracking)
         except Exception as e:
             st.error(f"Could not merge: {e}")
         else:
@@ -3719,7 +3930,7 @@ def _is_voucher_pdf(data):
 
 
 def save_existing_claim(service, folder_id, role, actor, form, rows, pdf_bytes, claim_date, voucher_no,
-                        paid, paid_date, flags=None):
+                        paid, paid_date, flags=None, tracking=None):
     """Admin only. Saves an already complete claim PDF to Drive unchanged (only the file name is set) and adds the claim to the
     register. paid=True saves it as Paid with the Nazim e Ala, Admin and President stages bypassed."""
     if role != ROLE_ADMIN:
@@ -3780,6 +3991,8 @@ def save_existing_claim(service, folder_id, role, actor, form, rows, pdf_bytes, 
             "complete": True, "complete_by": actor, "complete_on": today,
         })
         _log(record, actor, f"Saved as already paid on {paid_str}: Nazim e Ala, Admin and President approval stages bypassed")
+    if tracking and voucher_no:
+        apply_tracking(record, tracking, actor)
     add_claim_to_register(service, folder_id, record)
     return record
 
@@ -3961,6 +4174,7 @@ def render_upload_claim_page(auth):
         bsb = st.text_input("Bank BSB Code (e.g., 000-000)", max_chars=7, key="up_bsb")
         acc_num = st.text_input("Account Number", key="up_accnum")
         voucher_no = st.text_input("Voucher No. (used in the Drive file name and the dashboard)", max_chars=20, key="up_vno")
+        up_tracking = tracking_controls("up_trk", claim=None, stack=True) if voucher_no.strip() else None
         claim_date = st.date_input("Claim date", key="up_claim_date", format="DD/MM/YYYY")
         adv_mode = st.radio("Was an advance settled in this claim?", ["No", "Yes"], horizontal=True, key="up_adv_mode")
         advance = 0.0
@@ -4024,7 +4238,7 @@ def render_upload_claim_page(auth):
         try:
             with st.spinner("Saving to Google Drive..."):
                 record = save_existing_claim(service, folder_id, auth["role"], auth["name"], form, line_values,
-                                             pdf_bytes, claim_date, voucher_no, paid, paid_date, [])
+                                             pdf_bytes, claim_date, voucher_no, paid, paid_date, [], tracking=up_tracking)
         except Exception as e:
             st.error(f"Could not save the claim: {e}")
         else:
