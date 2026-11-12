@@ -2756,7 +2756,7 @@ def render_claims_dashboard(auth):
     # advance requests live in their own tab, so every other tab shows claims only
     claims_only = lambda pred: (lambda c: not is_advance(c) and pred(c))
     render_tabs(service, folder_id, claims, auth,
-                [(label, claims_only(pred), opts) for label, pred, opts in claim_tabs]
+                [(t[0], claims_only(t[1]), t[2] if len(t) > 2 else {}) for t in claim_tabs]
                 + [("💵 Advances", is_advance, {"wrapper": render_advances_tab})], "admin")
 
 
