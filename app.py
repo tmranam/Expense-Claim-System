@@ -416,6 +416,8 @@ def normalize_claim(c):
     c.setdefault("complete", True)   # ticked by default; the Admin unticks it to keep a claim open under a Main Claim Number
     c.setdefault("main_no", "")      # Main Claim Number of the open claim group this claim belongs to (e.g. 2026-136)
     c.setdefault("main_event", "")
+    c.setdefault("kind", "claim")    # "advance" = a request for an advance (money before an event), shown in the Advances tab
+    c.setdefault("allocations", [])  # advances only: [{claim_id, amount, by, on}] where the advance was used in a claim
     c.setdefault("history", [])
     c.setdefault("comments", [])
     c.setdefault("receipts", [])     # receipt lines + fingerprints (claims saved from now on)
@@ -615,6 +617,8 @@ def update_claim(service, folder_id, claim_id, role, actor, changes=None, vouche
     for field, value in changes.items():
         if field not in allowed_fields:
             raise PermissionError("You are not allowed to make that change.")
+        if is_advance(claim) and value == STATUS_REJECTED and (claim.get("allocations") or []):
+            raise PermissionError("This advance has already been used in a claim. Remove those allocations first (Advances tab).")
         if field == "complete":
             if not value and not (m_no or (claim.get("main_no") or "").strip()):
                 raise ValueError("Enter a Main Claim Number and Event to keep this claim open.")
@@ -710,9 +714,142 @@ def update_claim(service, folder_id, claim_id, role, actor, changes=None, vouche
     if _add_comment(claim, actor, role, comment, decision="; ".join(labels)):
         changed = True
 
+    if not is_advance(claim) and claim_stage(claim)[0] == "rejected" and _release_allocations(
+            claims, claim["id"], actor, "the claim was rejected"):
+        changed = True
+
     if changed:
         save_register(service, folder_id, claims, fid)
     return warning
+
+
+# -------------------------------------------------------------------------
+# ADVANCES
+# A request for an advance is saved in the same register as the claims (kind = "advance") and follows the same approvals.
+# Its amount is in total_claim. When a claim says it settles an advance, the Admin links one or more advances to that claim
+# and enters how much of each is used. The advance keeps that list (allocations), so it can show how much is outstanding.
+# -------------------------------------------------------------------------
+def is_advance(c):
+    return (c or {}).get("kind") == "advance"
+
+
+def advance_used(a):
+    return round(sum(float(x.get("amount") or 0) for x in (a.get("allocations") or [])), 2)
+
+
+def advance_left(a):
+    return round(float(a.get("total_claim") or 0) - advance_used(a), 2)
+
+
+def advance_exhausted(a):
+    return advance_left(a) <= 0.004
+
+
+def _all_claims():
+    """Every record of the register as loaded by the page being drawn (set in load_dashboard_data)."""
+    return st.session_state.get("_all_claims") or []
+
+
+def allocated_to_claim(claims, claim_id):
+    """How much advance has been linked to this claim, in total."""
+    return round(sum(float(x.get("amount") or 0) for a in claims if is_advance(a)
+                     for x in (a.get("allocations") or []) if x.get("claim_id") == claim_id), 2)
+
+
+def claim_label(c):
+    no = (c.get("voucher_no") or "").strip()
+    who = f"{c.get('name', '')}, {c.get('event', '')}"
+    return f"{no} ({who})" if no else f"{who} (no voucher no. yet)"
+
+
+def eligible_advances(claims, claimant_name, include_others=False):
+    """Advances that can still be used: fully approved (Nazim e Ala, Admin and President) with money outstanding.
+    By default only the claimant's own advances."""
+    out = []
+    for a in claims:
+        if not is_advance(a) or a.get("merged_into"):
+            continue
+        if claim_stage(a)[0] not in ("approved", "paid") or advance_exhausted(a):
+            continue
+        if not include_others and _norm_name(a.get("name")) != _norm_name(claimant_name):
+            continue
+        out.append(a)
+    return sorted(out, key=lambda a: a.get("submitted_ts", ""))
+
+
+def allocate_advance(service, folder_id, claim_id, advance_id, amount, role, actor):
+    """Admin only. Uses `amount` of an advance in a claim. Returns what is still outstanding on that advance."""
+    if role != ROLE_ADMIN:
+        raise PermissionError("Only the Admin can allocate advances.")
+    amount = round(float(amount or 0), 2)
+    if amount <= 0:
+        raise ValueError("Enter how much of the advance is used in this claim (more than $0).")
+    claims, fid = load_register(service, folder_id)
+    claim = next((c for c in claims if c["id"] == claim_id and not is_advance(c)), None)
+    adv = next((c for c in claims if c["id"] == advance_id and is_advance(c)), None)
+    if claim is None or adv is None:
+        raise ValueError("The claim or the advance was not found. Please refresh the page.")
+    if claim_stage(claim)[0] in ("rejected", "merged"):
+        raise ValueError("An advance cannot be allocated to a rejected or merged claim.")
+    if claim_stage(adv)[0] not in ("approved", "paid"):
+        raise ValueError("This advance is not fully approved yet.")
+    left = advance_left(adv)
+    if amount > left + 0.004:
+        raise ValueError(f"Only ${left:,.2f} of this advance is still outstanding.")
+    declared = round(float(claim.get("advance") or 0), 2)
+    already = allocated_to_claim(claims, claim_id)
+    if already + amount > declared + 0.004:
+        raise ValueError(f"This claim settles ${declared:,.2f} of advance and ${already:,.2f} is already allocated, so at most "
+                         f"${max(0.0, declared - already):,.2f} more can be allocated. To use more, change the advance amount "
+                         "on the claim first (Amend PDF).")
+    today = now_local().strftime("%d/%m/%Y")
+    allocs = adv.setdefault("allocations", [])
+    same = next((x for x in allocs if x.get("claim_id") == claim_id), None)
+    if same:
+        same["amount"] = round(float(same.get("amount") or 0) + amount, 2)
+        same["on"], same["by"] = today, actor
+    else:
+        allocs.append({"claim_id": claim_id, "amount": amount, "by": actor, "on": today})
+    _log(adv, actor, f"${amount:,.2f} used in claim {claim_label(claim)}; ${advance_left(adv):,.2f} still outstanding")
+    _log(claim, actor, f"${amount:,.2f} of advance {adv.get('voucher_no') or adv.get('event', '')} allocated to this claim")
+    save_register(service, folder_id, claims, fid)
+    return advance_left(adv)
+
+
+def _release_allocations(claims, claim_id, actor, why):
+    """Takes every advance allocation of one claim off the advances (the money becomes outstanding again)."""
+    n = 0
+    for a in claims:
+        if not is_advance(a):
+            continue
+        keep = [x for x in (a.get("allocations") or []) if x.get("claim_id") != claim_id]
+        if len(keep) != len(a.get("allocations") or []):
+            freed = advance_used(a) - round(sum(float(x.get("amount") or 0) for x in keep), 2)
+            a["allocations"] = keep
+            _log(a, actor, f"${freed:,.2f} given back to this advance ({why}); ${advance_left(a):,.2f} outstanding")
+            n += 1
+    return n
+
+
+def remove_allocation(service, folder_id, advance_id, claim_id, role, actor):
+    """Admin only. Takes the amount an advance had been allocated to one claim back to outstanding."""
+    if role != ROLE_ADMIN:
+        raise PermissionError("Only the Admin can change advance allocations.")
+    claims, fid = load_register(service, folder_id)
+    adv = next((c for c in claims if c["id"] == advance_id and is_advance(c)), None)
+    claim = next((c for c in claims if c["id"] == claim_id), None)
+    if adv is None:
+        raise ValueError("That advance was not found. Please refresh the page.")
+    entry = next((x for x in (adv.get("allocations") or []) if x.get("claim_id") == claim_id), None)
+    if entry is None:
+        raise ValueError("That allocation no longer exists. Please refresh the page.")
+    amount = float(entry.get("amount") or 0)
+    adv["allocations"] = [x for x in adv["allocations"] if x.get("claim_id") != claim_id]
+    label = claim_label(claim) if claim else "a deleted claim"
+    _log(adv, actor, f"${amount:,.2f} taken off claim {label}; ${advance_left(adv):,.2f} outstanding")
+    if claim:
+        _log(claim, actor, f"${amount:,.2f} of advance {adv.get('voucher_no') or adv.get('event', '')} removed from this claim")
+    save_register(service, folder_id, claims, fid)
 
 
 def delete_claim(service, folder_id, claim_id, role):
@@ -723,12 +860,17 @@ def delete_claim(service, folder_id, claim_id, role):
     claim = next((c for c in claims if c["id"] == claim_id), None)
     if claim is None:
         raise ValueError("That claim was not found. Please refresh the page.")
+    if is_advance(claim) and (claim.get("allocations") or []):
+        raise ValueError("This advance has been used in one or more claims. Remove those allocations first "
+                         "(Advances tab), then delete it.")
     try:
         service.files().update(fileId=claim["file_id"], body={"trashed": True}, supportsAllDrives=True).execute()
     except HttpError as e:
         if getattr(e.resp, "status", None) != 404:      # 404 = the file is already gone, carry on
             raise
-    save_register(service, folder_id, [c for c in claims if c["id"] != claim_id], fid)
+    remaining = [c for c in claims if c["id"] != claim_id]
+    _release_allocations(remaining, claim_id, "Admin", "the claim was deleted")
+    save_register(service, folder_id, remaining, fid)
 
 
 # -------------------------------------------------------------------------
@@ -840,6 +982,17 @@ def merge_claims(service, folder_id, claim_ids, role, actor, event, voucher_no="
         c["merged_into"] = new_id
         c["complete"] = True
         _log(c, actor, f"Merged into consolidated claim {voucher_no or new_id}")
+    for a in claims:                  # advances used in those claims are now used in the consolidated claim
+        if is_advance(a) and any(x.get("claim_id") in ids for x in (a.get("allocations") or [])):
+            moved, rest = 0.0, []
+            for x in a["allocations"]:
+                if x.get("claim_id") in ids:
+                    moved += float(x.get("amount") or 0)
+                else:
+                    rest.append(x)
+            rest.append({"claim_id": new_id, "amount": round(moved, 2), "by": actor, "on": now.strftime("%d/%m/%Y")})
+            a["allocations"] = rest
+            _log(a, actor, f"${moved:,.2f} now used in consolidated claim {voucher_no or new_id}")
     claims.append(record)
     save_register(service, folder_id, claims, fid)
     return record
@@ -977,6 +1130,12 @@ def amend_claim(service, folder_id, claim_id, role, actor, form, rows, extra_fil
     claim = next((c for c in claims if c["id"] == claim_id), None)
     if claim is None:
         raise ValueError("That claim was not found. Please refresh the page.")
+    if is_advance(claim):
+        raise ValueError("An advance request cannot be amended. Delete it and ask for a new request.")
+    got = allocated_to_claim(claims, claim_id)
+    if advance < got - 0.004:
+        raise ValueError(f"${got:,.2f} of advance is already allocated to this claim. Remove those allocations "
+                         "(Advances tab or the claim's advance panel) before lowering the advance.")
 
     old_bytes = service.files().get_media(fileId=claim["file_id"], supportsAllDrives=True).execute()
     old_reader = PdfReader(io.BytesIO(old_bytes))
@@ -1454,14 +1613,14 @@ def generate_official_voucher_pdf(filename, data, receipts):
     story.append(Paragraph("In the name of Allah, the gracious, the merciful", top_line_style))
     story.append(Paragraph("MAJLIS ANSARULLAH AUSTRALIA", header_title_style))
     story.append(Paragraph("Department of Mal", dept_style))
-    story.append(Paragraph("Expense Payment Voucher", header_subtitle_style))
+    story.append(Paragraph("Advance Payment Voucher" if data.get("is_advance") else "Expense Payment Voucher", header_subtitle_style))
     story.append(Spacer(1, 10))
 
     header_data = [
         [Paragraph("<b>Payee Name:</b>", cell_style), Paragraph(E(data['name']), cell_style), Paragraph("<b>Voucher No:</b>", cell_style), Paragraph("", cell_style)],
         [Paragraph("<b>Expense Type:</b>", cell_style), Paragraph(E(data['expense_type']), cell_style), Paragraph("<b>BSB:</b>", cell_style), Paragraph(E(data['bsb']), cell_style)],
         [Paragraph("<b>Account:</b>", cell_style), Paragraph(E(data['account']), cell_style), Paragraph("<b>Account No:</b>", cell_style), Paragraph(E(data['acc_num']), cell_style)],
-        [Paragraph("<b>Region:</b>", cell_style), Paragraph(E(data['region']), cell_style), Paragraph("<b>Total Claim:</b>", cell_bold_style), Paragraph(f"<b>$ {data['total_amount']:.2f}</b>", cell_bold_style)],
+        [Paragraph("<b>Region:</b>", cell_style), Paragraph(E(data['region']), cell_style), Paragraph("<b>Advance Requested:</b>" if data.get("is_advance") else "<b>Total Claim:</b>", cell_bold_style), Paragraph(f"<b>$ {data['total_amount']:.2f}</b>", cell_bold_style)],
         [Paragraph("<b>Majlis:</b>", cell_style), Paragraph(E(data['majlis']), cell_style), Paragraph("<b>Advance Issued:</b>", cell_style), Paragraph(f"$ {data['advance']:.2f}" if data['advance'] > 0 else "", cell_red_bold_style)]
     ]
 
@@ -1620,6 +1779,8 @@ def stitch_files_to_pdf(voucher_pdf_path, uploaded_files_list, labels=None, skip
 # -------------------------------------------------------------------------
 DASH_HEADERS = ["Claimant", "Date", "Event", "Total Claim", "GST", "Advance Adj.", "Amount To Pay",
                 "Voucher No.", "Status", "💬", "File"]
+ADV_HEADERS = ["Claimant", "Date", "Advance for", "Advance Amount", "Utilised", "Outstanding", "Amount To Pay",
+               "Voucher No.", "Status", "💬", "File"]
 DASH_WIDTHS = [1.5, 0.9, 1.4, 0.9, 0.7, 0.9, 1.0, 1.0, 1.8, 0.5, 0.8]
 
 
@@ -1771,14 +1932,99 @@ def filter_sort_claims(claims_subset, key, default_newest=False, show_region=Tru
     return shown
 
 
+def _m(x):
+    """Money for st.markdown (the dollar sign is escaped so it is not read as maths)."""
+    return _money(x).replace("$", "\\$")
+
+
+def render_advance_usage(service, folder_id, a, key_base, role, actor):
+    """Under an advance (Advances tab): how much is used in which claim, and how much is outstanding."""
+    by_id = {c["id"]: c for c in _all_claims()}
+    allocs = a.get("allocations") or []
+    used, left = advance_used(a), advance_left(a)
+    if not allocs:
+        st.caption(f"Not used in any claim yet. Outstanding {_money(left)}.".replace("$", "\\$"))
+        return
+    st.markdown(f"**Used in {len(allocs)} claim{'s' if len(allocs) != 1 else ''}:** {_m(used)}  ·  **Outstanding:** {_m(left)}"
+                + ("  ·  ✅ **Exhausted**" if advance_exhausted(a) else ""))
+    for n, x in enumerate(allocs):
+        cl = by_id.get(x.get("claim_id")) or {}
+        r1, r2 = st.columns([8, 1.4])
+        no = (cl.get("voucher_no") or "").strip()
+        r1.markdown(f"Claim **{_md_escape(no) if no else '(no voucher no. yet)'}** · {_md_escape(cl.get('name', ''))} · "
+                    f"{_md_escape(cl.get('event', ''))} — **{_m(float(x.get('amount') or 0))}**"
+                    + (f"  ·  :gray[{_md_escape(x['on'])}]" if x.get("on") else ""))
+        if role == ROLE_ADMIN and r2.button("Remove", key=f"alrma_{key_base}_{n}", use_container_width=True,
+                                            help="Give this amount back to the advance (it becomes outstanding again)"):
+            try:
+                remove_allocation(service, folder_id, a["id"], x.get("claim_id"), role, actor)
+            except Exception as e:
+                st.error(f"Could not remove the allocation: {e}")
+            else:
+                st.rerun()
+
+
+def render_advance_panel(service, folder_id, c, key_base, actor):
+    """Under a claim that settles an advance (Admin): pick the advance(s) by Voucher No. and enter the amount used."""
+    claims = _all_claims()
+    declared = round(float(c.get("advance") or 0), 2)
+    mine = [(a, x) for a in claims if is_advance(a) for x in (a.get("allocations") or []) if x.get("claim_id") == c["id"]]
+    got = round(sum(float(x.get("amount") or 0) for _, x in mine), 2)
+    todo = round(declared - got, 2)
+    title = (f"💵 Advance in this claim: {_money(declared)} · allocated {_money(got)}"
+             + (f" · {_money(todo)} still to allocate" if todo > 0.004 else " ✓")).replace("$", "\\$")
+    with st.expander(title, expanded=todo > 0.004):
+        for n, (a, x) in enumerate(mine):
+            r1, r2 = st.columns([8, 1.4])
+            no = (a.get("voucher_no") or "").strip()
+            r1.markdown(f"Advance **{_md_escape(no) if no else '(no voucher no.)'}** · {_md_escape(a.get('name', ''))} · "
+                        f"{_md_escape(a.get('event', ''))} — **{_m(float(x.get('amount') or 0))}** used  ·  "
+                        f"{_m(advance_left(a))} outstanding on that advance")
+            if r2.button("Remove", key=f"alrmc_{key_base}_{n}", use_container_width=True):
+                try:
+                    remove_allocation(service, folder_id, a["id"], c["id"], ROLE_ADMIN, actor)
+                except Exception as e:
+                    st.error(f"Could not remove the allocation: {e}")
+                else:
+                    st.rerun()
+        if todo <= 0.004:
+            return
+        others = st.checkbox("Also show advances of other claimants", key=f"aloth_{key_base}")
+        options = eligible_advances(claims, c.get("name"), others)
+        if not options:
+            st.info(f"No fully approved advance with money outstanding for {c.get('name', '')}. An advance can be used once "
+                    "it has a Voucher No. and is approved by the Nazim e Ala, Admin and President (or skipped by the Admin).")
+            return
+        labels = {a["id"]: f"{a.get('voucher_no') or 'no voucher no.'} · {a.get('name', '')} · {a.get('event', '')} · "
+                           f"outstanding ${advance_left(a):,.2f} of ${float(a.get('total_claim') or 0):,.2f}" for a in options}
+        pick_key = f"alpick_{key_base}"
+        if st.session_state.get(pick_key) not in labels:
+            st.session_state.pop(pick_key, None)
+        pick = st.selectbox("Advance (by Voucher No.)", list(labels), format_func=lambda i: labels[i], key=pick_key)
+        chosen = next(a for a in options if a["id"] == pick)
+        room = advance_left(chosen)
+        amt = st.number_input("Amount of this advance used in this claim ($)", min_value=0.0, max_value=float(room),
+                              value=float(round(min(todo, room), 2)), format="%.2f",
+                              key=f"alamt_{key_base}_{pick}_{got}")
+        if st.button("Allocate to this claim", key=f"algo_{key_base}", type="primary"):
+            try:
+                allocate_advance(service, folder_id, c["id"], pick, amt, ROLE_ADMIN, actor)
+            except Exception as e:
+                st.error(f"Could not allocate: {e}".replace("$", "\\$"))
+            else:
+                st.session_state["dash_notice"] = (f"{_money(amt)} of advance {chosen.get('voucher_no') or ''} allocated to the claim "
+                                                   f"from {c.get('name', '')}.").replace("$", "\\$")
+                st.rerun()
+
+
 def render_claim_rows(service, folder_id, claims_subset, auth, tab_key, newest_first=False, show_history=False,
-                      merge_select=False):
+                      merge_select=False, advance_view=False):
     """Draws the table for one tab: search, filters and sort order first (oldest first by default, newest first
     when newest_first is set), then the claims.
     The buttons each role sees come from actions_for(). Everyone can comment; only the Admin gets the
     Voucher No. box, Amend PDF and Delete."""
     if not claims_subset:
-        st.info("No claims in this tab.")
+        st.info("No advances in this tab." if advance_view else "No claims in this tab.")
         return
 
     role = auth["role"]
@@ -1813,7 +2059,7 @@ def render_claim_rows(service, folder_id, claims_subset, auth, tab_key, newest_f
                        "Open claims can still be approved and paid.")
 
     header_cols = st.columns(DASH_WIDTHS)
-    for col, label in zip(header_cols, DASH_HEADERS):
+    for col, label in zip(header_cols, ADV_HEADERS if advance_view else DASH_HEADERS):
         col.markdown(f"**{label}**")
     st.divider()
 
@@ -1827,11 +2073,21 @@ def render_claim_rows(service, folder_id, claims_subset, auth, tab_key, newest_f
         _cell(cols[1], c.get("submitted_on", "") + (f"  \n:gray[Year {c['fy']}]" if c.get("fy") else ""))
         main_line = (f"  \n:gray[Main claim {_md_escape(c['main_no'])}]"
                      if (c.get("main_no") or "").strip() and not c.get("complete") else "")
-        cols[2].markdown(_md_escape(c.get("event", "")) + main_line)
+        adv_row = is_advance(c)
+        cols[2].markdown(_md_escape(c.get("event", "")) + main_line + ("  \n:orange[💵 Advance request]" if adv_row else ""))
         _cell(cols[3], f"${c.get('total_claim', 0):,.2f}")
-        _cell(cols[4], f"${c.get('gst', 0):,.2f}")
-        advance = c.get("advance", 0)
-        _cell(cols[5], f"-${advance:,.2f}" if advance > 0 else "-")
+        if advance_view and adv_row:
+            _cell(cols[4], f"${advance_used(c):,.2f}")
+            _cell(cols[5], f"**${advance_left(c):,.2f}**")
+        else:
+            _cell(cols[4], f"${c.get('gst', 0):,.2f}")
+            advance = c.get("advance", 0)
+            alloc_note = ""
+            if role == ROLE_ADMIN and not adv_row and advance > 0 and stage_key not in ("merged", "rejected"):
+                got_adv = allocated_to_claim(_all_claims(), c["id"])
+                alloc_note = ("  \n:green[✓ advance allocated]" if abs(got_adv - advance) < 0.005
+                              else f"  \n:orange[allocated ${got_adv:,.2f}]")
+            _cell(cols[5], (f"-${advance:,.2f}" if advance > 0 else "-") + alloc_note)
         _cell(cols[6], f"**${c.get('amount_payable', 0):,.2f}**")
         cols[7].markdown(f"**{_md_escape(c['voucher_no'])}**" if c.get("voucher_no") else "-")
         _cell(cols[8], status_text + (" ⚠️" if flags else "") + (" ✅ Complete" if c.get("complete") else ""))
@@ -1879,7 +2135,7 @@ def render_claim_rows(service, folder_id, claims_subset, auth, tab_key, newest_f
             if role == ROLE_ADMIN:
                 is_complete = bool(c.get("complete"))
                 cplt_key = f"cplt_{key_base}_{int(is_complete)}"     # includes the saved state, so the box shows what is saved
-                if stage_key not in ("merged", "rejected") and not merge_select:
+                if stage_key not in ("merged", "rejected") and not merge_select and not adv_row:
                     st.checkbox(
                         "Claim complete. Untick to keep it open for more receipts or claims for the same event "
                         "(you will be asked for a Main Claim Number and the Event). Approval and payment work either way.",
@@ -1927,7 +2183,7 @@ def render_claim_rows(service, folder_id, claims_subset, auth, tab_key, newest_f
                                     help="Enter a Voucher No. first" if needs_voucher else None):
                         _apply({field: value}, voucher_input,
                                fy=fy_pick if (field == "admin_status" and value == STATUS_APPROVED) else None)
-                if row_cols[-2].button("✏️ Amend PDF", key=f"amend_{key_base}", use_container_width=True):
+                if not adv_row and row_cols[-2].button("✏️ Amend PDF", key=f"amend_{key_base}", use_container_width=True):
                     st.session_state["amend_claim_id"] = c["id"]
                     st.session_state["amend_init"] = None
                     st.session_state["admin_view"] = "amend"
@@ -1952,6 +2208,11 @@ def render_claim_rows(service, folder_id, claims_subset, auth, tab_key, newest_f
                     if no_col.button("Cancel", key=f"delno_{key_base}"):
                         st.session_state.pop(f"confirm_del_{c['id']}", None)
                         st.rerun()
+
+                if adv_row and advance_view:
+                    render_advance_usage(service, folder_id, c, key_base, role, actor)
+                elif not adv_row and float(c.get("advance") or 0) > 0 and stage_key not in ("merged", "rejected"):
+                    render_advance_panel(service, folder_id, c, key_base, actor)
             elif actions:
                 row_cols = st.columns([1.4] * len(actions) + [max(0.3, 8.0 - 1.4 * len(actions))])
                 for b_col, (label, field, value) in zip(row_cols, actions):
@@ -1999,6 +2260,7 @@ def load_dashboard_data(role):
     except Exception as e:
         st.error(f"Could not read the claims from Google Drive: {e}")
         return None
+    st.session_state["_all_claims"] = claims
     return service, folder_id, claims
 
 
@@ -2427,6 +2689,35 @@ def render_group_page(auth):
     render_group_body(service, folder_id, items, auth, "group")
 
 
+def render_advances_tab(service, folder_id, sub, auth, tab_key):
+    """Advances tab: every advance request. Outstanding = money not yet used up in claims; Exhausted = fully used."""
+    if not sub:
+        st.info("No advances yet. When someone switches on 'Request for advance' on the claim form and submits it, "
+                "the request appears here.")
+        return
+    live = [a for a in sub if claim_stage(a)[0] != "rejected"]
+    outstanding = [a for a in live if not advance_exhausted(a)]
+    exhausted = [a for a in live if advance_exhausted(a)]
+    rejected = [a for a in sub if claim_stage(a)[0] == "rejected"]
+
+    m1, m2, m3 = st.columns(3)
+    m1.metric("Advances (not rejected)", _money(sum(float(a.get("total_claim") or 0) for a in live)))
+    m2.metric("Used in claims", _money(sum(advance_used(a) for a in live)))
+    m3.metric("Outstanding", _money(sum(advance_left(a) for a in outstanding)))
+
+    t_out, t_ex, t_rej = st.tabs([f"Outstanding ({len(outstanding)})", f"Exhausted ({len(exhausted)})",
+                                  f"Rejected ({len(rejected)})"])
+    with t_out:
+        st.caption("Advances that have not been fully used. To use one, open the claim that settles an advance "
+                   "(its row shows an advance panel), pick the advance by Voucher No. and enter the amount used.")
+        render_claim_rows(service, folder_id, outstanding, auth, f"{tab_key}_out", advance_view=True)
+    with t_ex:
+        render_claim_rows(service, folder_id, exhausted, auth, f"{tab_key}_ex", advance_view=True,
+                          newest_first=True, show_history=True)
+    with t_rej:
+        render_claim_rows(service, folder_id, rejected, auth, f"{tab_key}_rej", advance_view=True)
+
+
 # ---------------------------- ADMIN ----------------------------
 def render_claims_dashboard(auth):
     st.markdown("### 📊 Claims Dashboard")
@@ -2451,7 +2742,7 @@ def render_claims_dashboard(auth):
         return
     service, folder_id, claims = data
 
-    render_tabs(service, folder_id, claims, auth, [
+    claim_tabs = [
         ("Open Claims", is_open_claim, {"wrapper": render_open_tab}),
         ("To Process", _stage_is("to_process"), {"collapse": True}),
         ("Awaiting Nazim", _stage_is("await_nazim"), {"collapse": True}),
@@ -2461,7 +2752,12 @@ def render_claims_dashboard(auth):
         ("Paid", _stage_is("paid"), {"newest_first": True, "show_history": True}),
         ("Rejected", _stage_is("rejected")),
         ("Merged", _stage_is("merged"), {"newest_first": True, "show_history": True}),
-    ], "admin")
+    ]
+    # advance requests live in their own tab, so every other tab shows claims only
+    claims_only = lambda pred: (lambda c: not is_advance(c) and pred(c))
+    render_tabs(service, folder_id, claims, auth,
+                [(label, claims_only(pred), opts) for label, pred, opts in claim_tabs]
+                + [("💵 Advances", is_advance, {"wrapper": render_advances_tab})], "admin")
 
 
 # ------------------------- NAZIM E ALA -------------------------
@@ -2662,9 +2958,12 @@ def compute_balances(entries, claims, heads):
     return out
 
 
-def filter_claims(claims, head="All", region="All", fy="All", state="All"):
+def filter_claims(claims, head="All", region="All", fy="All", state="All", kind="claim"):
+    """kind='claim' (default) leaves advance requests out; kind='advance' returns only them."""
     out = []
     for c in claims:
+        if is_advance(c) != (kind == "advance"):
+            continue
         if claim_stage(c)[0] == "merged":       # counted through the consolidated claim instead
             continue
         if head != "All" and c.get("account") != head:
@@ -2730,6 +3029,8 @@ def build_bas_lines(claims, start, end, basis, include, head="All"):
     """One line per receipt (or per claim, for older claims saved without receipt lines)."""
     lines = []
     for c in claims:
+        if is_advance(c):            # an advance has no receipts; its GST is claimed when the receipts are claimed
+            continue
         stage = claim_stage(c)[0]
         if stage != "paid" and not (include == "Approved and paid" and stage == "approved"):
             continue
@@ -2931,6 +3232,16 @@ def render_summary_page(auth):
         m6.metric("Still in approval", _money(in_pipe))
         m7.metric("Open claims", sum(1 for c in live if is_open_claim(c)))
         m8.metric("Completed claims", sum(1 for c in live if not is_open_claim(c)))
+        adv_live = [a for a in filter_claims(claims, head_f, region_f, fy_f, "All", kind="advance")
+                    if claim_stage(a)[0] != "rejected"]
+        n1, n2, n3 = st.columns(3)
+        n1.metric("Advances paid out", _money(sum(float(a.get("total_claim") or 0) for a in adv_live
+                                                  if claim_stage(a)[0] == "paid")))
+        n2.metric("Advances used in claims", _money(sum(advance_used(a) for a in adv_live)))
+        n3.metric("Advances outstanding", _money(sum(advance_left(a) for a in adv_live
+                                                     if claim_stage(a)[0] in ("approved", "paid"))))
+        st.caption("Advances are not counted in the claim totals above. A paid advance is taken off the account head balance "
+                   "when it is paid, and the claim that uses it is paid net of the advance.")
 
         if head_f != "All":
             b = balances.get(head_f, {})
@@ -2971,7 +3282,8 @@ def render_summary_page(auth):
     # ------------------------------------------------------------ balances
     with tab_bal:
         st.caption("Enter what is in an account head today with **Set balance**. After that, the balance updates by "
-                   "itself: **Money added** goes up, **Other payment out** (for example an advance you handed out) "
+                   "itself: **Money added** goes up, **Other payment out** (for example a payment made outside this app; advances marked "
+                   "Paid in the Advances tab are taken off automatically) "
                    "goes down, and every claim you mark **Paid** after that moment is taken off "
                    "(the amount actually paid, after any advance settled).")
         rows = []
@@ -4178,8 +4490,9 @@ def render_claim_form():
     last_submission = st.session_state.get("last_submission")
     if last_submission:
         if last_submission["saved"]:
-            st.success("🎉 Your claim has been submitted and saved. Download a copy below for your records. "
-                       "The form below has been cleared, ready for a new claim.")
+            st.success(("🎉 Your advance request has been submitted and saved. " if last_submission.get("advance")
+                        else "🎉 Your claim has been submitted and saved. ")
+                       + "Download a copy below for your records. The form below has been cleared, ready for a new claim.")
         else:
             st.error("Your claim PDF was created, but it could NOT be saved for the administrator. "
                      "Please download it below and send it to them directly. "
@@ -4192,6 +4505,15 @@ def render_claim_form():
 
     top_a, _ = st.columns([1.3, 7])
     top_a.button("🧹 Clear form", key="clear_top", on_click=_form_reset, help="Empties every field and removes every receipt")
+
+    _switch = getattr(st, "toggle", st.checkbox)
+    request_advance = bool(_switch(
+        "💵 Request for advance", value=False, key=_K("is_adv"),
+        help="Switch on to ask for an advance before an event. You then enter the amount you need, and uploading a file is optional. "
+             "When you claim for the event later, choose 'settling an advance' on the claim and the Admin will link your advance to it."))
+    if request_advance:
+        st.info("You are requesting an advance (money needed before the event). Enter the amount below. "
+                "Supporting documents (a quote, budget or invitation) are optional.")
 
     col1, col2 = st.columns(2)
     with col1:
@@ -4219,101 +4541,118 @@ def render_claim_form():
                                key=_K(f"account_{region == 'National'}"))
 
     with col2:
-        declared_total_input = st.number_input("Total Declared Claim Amount ($)", min_value=0.0, format="%.2f", key=_K("declared"))
+        declared_total_input = st.number_input("Advance Amount Requested ($)" if request_advance else "Total Declared Claim Amount ($)",
+                                               min_value=0.0, format="%.2f", key=_K("declared"))
 
         st.markdown("**🏦 Direct Reimbursement Bank Segment**")
         bsb = st.text_input("Bank BSB Code (e.g., 000-000)", max_chars=7, key=_K("bsb"))
         acc_num = st.text_input("Account Number", key=_K("accnum"))
-        st.markdown("**💵 Advance Settlement**")
-        settling_advance = st.radio("Are you settling an advance in this claim?", ["No", "Yes"], horizontal=True, key=_K("adv_mode"))
         advance_amount = 0.0
-        if settling_advance == "Yes":
-            advance_amount = st.number_input("Advance Amount Being Settled ($)", min_value=0.0, format="%.2f", key=_K("advance"))
+        if not request_advance:
+            st.markdown("**💵 Advance Settlement**")
+            settling_advance = st.radio("Are you settling an advance in this claim?", ["No", "Yes"], horizontal=True, key=_K("adv_mode"))
+            if settling_advance == "Yes":
+                advance_amount = st.number_input("Advance Amount Being Settled ($)", min_value=0.0, format="%.2f", key=_K("advance"))
 
     st.markdown("---")
-    st.subheader("📎 Receipts")
-    st.caption("Upload each receipt (photo or PDF). The date, amount, GST and details are read automatically and "
-               "you can correct them. A PDF containing many receipts is read page by page and each page becomes its own line. "
-               "Choosing a different file replaces that receipt's values straight away.")
+    if request_advance:
+        st.subheader("📎 Supporting documents (optional)")
+        st.caption("Attach anything that supports the request, such as a quote, a budget or an invitation (photo or PDF). "
+                   "You can submit the request without any file.")
+        adv_files = st.file_uploader("Supporting documents (optional)", type=["png", "jpg", "jpeg", "heic", "heif", "pdf"],
+                                     accept_multiple_files=True, key=_K("adv_files"), label_visibility="collapsed")
+        receipt_records = []
+        if declared_total_input > 0:
+            receipt_records.append({"desc": f"Advance requested: {expense_event_desc}".strip(),
+                                    "date": now_local().strftime("%d/%m/%Y"),
+                                    "amount": round(declared_total_input, 2), "gst": 0.0})
+        upload_files = [(f, n + 1) for n, f in enumerate(adv_files or [])]
+        skip_pages = {}
+        missing_files = 0
+    else:
+        st.subheader("📎 Receipts")
+        st.caption("Upload each receipt (photo or PDF). The date, amount, GST and details are read automatically and "
+                   "you can correct them. A PDF containing many receipts is read page by page and each page becomes its own line. "
+                   "Choosing a different file replaces that receipt's values straight away.")
 
-    rows = st.session_state["rows"]
-    meta = st.session_state["row_meta"]
-    receipt_records = []        # one per receipt line, in order
-    upload_files = []           # (uploaded file or None, first line number it covers)
-    parent_positions = {}       # row id of an uploaded file -> its position in upload_files
-    skip_pages = {}             # file position -> set of page numbers (0-based) left out of the PDF
-    missing_files = 0
-    line_no = 0
-    i = 0
-    while i < len(rows):
-        rid = rows[i]
-        m = meta[rid]
-        i += 1
+        rows = st.session_state["rows"]
+        meta = st.session_state["row_meta"]
+        receipt_records = []        # one per receipt line, in order
+        upload_files = []           # (uploaded file or None, first line number it covers)
+        parent_positions = {}       # row id of an uploaded file -> its position in upload_files
+        skip_pages = {}             # file position -> set of page numbers (0-based) left out of the PDF
+        missing_files = 0
+        line_no = 0
+        i = 0
+        while i < len(rows):
+            rid = rows[i]
+            m = meta[rid]
+            i += 1
 
-        if m["kind"] == "upload":
-            first_line = line_no + 1
-            head_l, head_r = st.columns([6, 1.2])
-            head_l.markdown(f"#### 📄 Receipt file {sum(1 for r in rows[:i] if meta[r]['kind'] == 'upload')}")
-            uploaded = st.file_uploader("Upload receipt (Image or PDF)", type=["png", "jpg", "jpeg", "heic", "heif", "pdf"],
-                                        key=_K("file", rid), label_visibility="collapsed")
-            if len([r for r in rows if meta[r]["kind"] == "upload"]) > 1:
-                head_r.button("🗑 Remove", key=_K("rm", rid), on_click=_remove_receipt_row, args=(rid,))
+            if m["kind"] == "upload":
+                first_line = line_no + 1
+                head_l, head_r = st.columns([6, 1.2])
+                head_l.markdown(f"#### 📄 Receipt file {sum(1 for r in rows[:i] if meta[r]['kind'] == 'upload')}")
+                uploaded = st.file_uploader("Upload receipt (Image or PDF)", type=["png", "jpg", "jpeg", "heic", "heif", "pdf"],
+                                            key=_K("file", rid), label_visibility="collapsed")
+                if len([r for r in rows if meta[r]["kind"] == "upload"]) > 1:
+                    head_r.button("🗑 Remove", key=_K("rm", rid), on_click=_remove_receipt_row, args=(rid,))
 
-            split_key = _K("split", rid)
-            if split_key not in st.session_state:
-                st.session_state[split_key] = True
-            split_now = bool(st.session_state[split_key])
-            stored_sig = st.session_state.get(_K("sig", rid))
-            if uploaded is None:
-                if stored_sig is not None:
-                    _clear_upload_row(rid)
-                    m = meta[rid]
-            else:
-                sig = f"{uploaded.name}_{uploaded.size}_{int(split_now)}"
-                if sig != stored_sig:
-                    _read_upload_into_row(rid, uploaded, split_now)
-                    st.session_state[_K("sig", rid)] = sig
-                    m = meta[rid]
+                split_key = _K("split", rid)
+                if split_key not in st.session_state:
+                    st.session_state[split_key] = True
+                split_now = bool(st.session_state[split_key])
+                stored_sig = st.session_state.get(_K("sig", rid))
+                if uploaded is None:
+                    if stored_sig is not None:
+                        _clear_upload_row(rid)
+                        m = meta[rid]
+                else:
+                    sig = f"{uploaded.name}_{uploaded.size}_{int(split_now)}"
+                    if sig != stored_sig:
+                        _read_upload_into_row(rid, uploaded, split_now)
+                        st.session_state[_K("sig", rid)] = sig
+                        m = meta[rid]
 
-            upload_files.append((uploaded, first_line))
-            parent_positions[rid] = len(upload_files) - 1
-            for problem in st.session_state.get(_K("problems", rid), []):
-                st.warning(f"⚠️ {problem}. Please type that receipt's details in by hand.")
-            if uploaded is None:
-                missing_files += 1
+                upload_files.append((uploaded, first_line))
+                parent_positions[rid] = len(upload_files) - 1
+                for problem in st.session_state.get(_K("problems", rid), []):
+                    st.warning(f"⚠️ {problem}. Please type that receipt's details in by hand.")
+                if uploaded is None:
+                    missing_files += 1
 
-            if m.get("split"):
-                st.info(f"📑 {uploaded.name} has {m['pages']} pages. Choose what each page is below: a separate receipt (default), a continuation of the receipt before it, or a page to skip.")
-                st.checkbox(f"Treat each of the {m['pages']} pages as a separate receipt", key=split_key)
-                if m["pages"] > m["read"]:
-                    st.warning(f"Only the first {m['read']} pages were read. Please split the file or add the rest as another file.")
-            else:
-                if m.get("pages", 1) > 1:
+                if m.get("split"):
+                    st.info(f"📑 {uploaded.name} has {m['pages']} pages. Choose what each page is below: a separate receipt (default), a continuation of the receipt before it, or a page to skip.")
                     st.checkbox(f"Treat each of the {m['pages']} pages as a separate receipt", key=split_key)
-                line_no += 1
-                receipt_records.append(_value_inputs(rid, f"#{line_no}"))
-                if _K("ocr", rid) in st.session_state:
-                    with st.expander(f"Show the text read from receipt #{line_no}"):
-                        st.text(st.session_state[_K("ocr", rid)])
-        else:
-            parent_pos = parent_positions.get(m["parent"], len(upload_files) - 1)
-            mode = st.radio(
-                f"Page {m['page']} of {m['of']} ({m['fname']})", PAGE_MODES, horizontal=True, key=_K("pgmode", rid),
-                help="Choose 'Continues previous receipt' when a bill runs over several pages, or 'Skip' to leave the page out of the PDF.")
-            if mode == PAGE_MODES[2]:
-                skip_pages.setdefault(parent_pos, set()).add(m["page"] - 1)
-            elif mode == PAGE_MODES[0]:
-                line_no += 1
-                receipt_records.append(_value_inputs(rid, f"#{line_no}"))
-                if _K("ocr", rid) in st.session_state:
-                    with st.expander(f"Show the text read from receipt #{line_no} (page {m['page']})"):
-                        st.text(st.session_state[_K("ocr", rid)])
+                    if m["pages"] > m["read"]:
+                        st.warning(f"Only the first {m['read']} pages were read. Please split the file or add the rest as another file.")
+                else:
+                    if m.get("pages", 1) > 1:
+                        st.checkbox(f"Treat each of the {m['pages']} pages as a separate receipt", key=split_key)
+                    line_no += 1
+                    receipt_records.append(_value_inputs(rid, f"#{line_no}"))
+                    if _K("ocr", rid) in st.session_state:
+                        with st.expander(f"Show the text read from receipt #{line_no}"):
+                            st.text(st.session_state[_K("ocr", rid)])
             else:
-                st.caption("This page is attached to the claim PDF after the receipt above it, with no separate line.")
+                parent_pos = parent_positions.get(m["parent"], len(upload_files) - 1)
+                mode = st.radio(
+                    f"Page {m['page']} of {m['of']} ({m['fname']})", PAGE_MODES, horizontal=True, key=_K("pgmode", rid),
+                    help="Choose 'Continues previous receipt' when a bill runs over several pages, or 'Skip' to leave the page out of the PDF.")
+                if mode == PAGE_MODES[2]:
+                    skip_pages.setdefault(parent_pos, set()).add(m["page"] - 1)
+                elif mode == PAGE_MODES[0]:
+                    line_no += 1
+                    receipt_records.append(_value_inputs(rid, f"#{line_no}"))
+                    if _K("ocr", rid) in st.session_state:
+                        with st.expander(f"Show the text read from receipt #{line_no} (page {m['page']})"):
+                            st.text(st.session_state[_K("ocr", rid)])
+                else:
+                    st.caption("This page is attached to the claim PDF after the receipt above it, with no separate line.")
 
-    btn_a, btn_b, _ = st.columns([1.6, 1.3, 6])
-    btn_a.button("➕ Add receipt", key="add_receipt", on_click=_add_receipt_row)
-    btn_b.button("🧹 Clear form", key="clear_bottom", on_click=_form_reset)
+        btn_a, btn_b, _ = st.columns([1.6, 1.3, 6])
+        btn_a.button("➕ Add receipt", key="add_receipt", on_click=_add_receipt_row)
+        btn_b.button("🧹 Clear form", key="clear_bottom", on_click=_form_reset)
 
     calculated_total_claim = round(sum(r["amount"] for r in receipt_records), 2)
     calculated_total_gst = round(sum(r["gst"] for r in receipt_records), 2)
@@ -4328,7 +4667,7 @@ def render_claim_form():
 
     # ---- duplicate receipts ----
     flags = []
-    if any(f for f, _ in upload_files):
+    if not request_advance and any(f for f, _ in upload_files):
         flags = find_duplicate_receipts(receipt_records, _earlier_claims())
     dup_confirmed = True
     if flags:
@@ -4343,17 +4682,20 @@ def render_claim_form():
     block_submission = False
 
     if not receipt_records:
-        st.error("❌ Please upload at least one receipt.")
+        st.error("❌ Please enter the amount of the advance you are requesting." if request_advance
+                 else "❌ Please upload at least one receipt.")
         block_submission = True
     if not is_amount_matching:
         st.error(f"❌ Total Doesn't Match: The sum of your individual row entries (${calculated_total_claim:.2f}) does not match your typed Total Declared Claim Amount (${declared_total_input:.2f}). Please review row values.")
         block_submission = True
-    else:
+    elif not request_advance:
         st.success("✅ Financial balance validation passed: Claim amounts are matching.")
 
     if missing_files > 0:
         st.warning(f"⚠️ {missing_files} receipt file(s) still to upload. Upload a file in each empty receipt box, or remove the box.")
         block_submission = True
+    elif request_advance:
+        st.info("ℹ️ Supporting documents are optional for an advance request.")
     else:
         st.success("✅ Attachment verification passed: every receipt has its file.")
 
@@ -4369,7 +4711,8 @@ def render_claim_form():
     if block_submission:
         st.button("Submit", type="primary", disabled=True, help="Please resolve all structural error/warning notifications above to unlock the submit pipeline.")
         return
-    if not st.button("Finalize and Submit Expense Claims Bundle", type="primary"):
+    if not st.button("Finalize and Submit Advance Request" if request_advance else "Finalize and Submit Expense Claims Bundle",
+                     type="primary"):
         return
 
     if not name or not bsb or not acc_num or not claimant_email or not expense_event_desc:
@@ -4377,7 +4720,7 @@ def render_claim_form():
         return
 
     # Fresh duplicate check against the latest register, so a claim submitted a minute ago is not missed
-    fresh_flags = find_duplicate_receipts(receipt_records, _refresh_earlier_claims())
+    fresh_flags = [] if request_advance else find_duplicate_receipts(receipt_records, _refresh_earlier_claims())
     if fresh_flags and not st.session_state.get(_K("dupok")):
         st.warning("Possible duplicate receipts were found. Please review the warning and tick the confirmation box, then submit again.")
         st.rerun()
@@ -4386,15 +4729,16 @@ def render_claim_form():
     form = {"name": name, "event": expense_event_desc, "region": region, "majlis": majlis, "account": account,
             "bsb": bsb, "acc_num": acc_num, "advance": advance_amount}
     payload = build_voucher_payload(form, receipt_records)
+    payload["is_advance"] = request_advance
 
     stamp = now_local().strftime("%Y%m%d_%H%M%S")
     safe_name = re.sub(r"[^A-Za-z0-9_-]", "", name.replace(" ", "_")) or "Claimant"
-    output_filename = f"Expense_Voucher_{safe_name}_{stamp}.pdf"
+    output_filename = f"{'Advance_Voucher' if request_advance else 'Expense_Voucher'}_{safe_name}_{stamp}.pdf"
     generate_official_voucher_pdf(output_filename, payload, receipt_records)
     voucher_pages = _voucher_page_count(PdfReader(output_filename))
 
     files_in_order = [f for f, _ in upload_files]
-    labels = [f"Receipt #{first}" for _, first in upload_files]
+    labels = [(f"Supporting document {first}" if request_advance else f"Receipt #{first}") for _, first in upload_files]
     with st.spinner("Stitching receipts into the claim PDF..."):
         stitched_ok = stitch_files_to_pdf(output_filename, files_in_order, labels, skip_pages)
     if not stitched_ok:
@@ -4413,12 +4757,15 @@ def render_claim_form():
             if service is None or not folder_id:
                 raise RuntimeError("Google Drive storage has not been set up by the administrator yet.")
 
-            drive_name = build_drive_filename("", name, expense_event_desc, now_local().strftime("%d/%m/%Y"))
+            drive_name = build_drive_filename("", name, ("Advance - " + expense_event_desc) if request_advance else expense_event_desc,
+                                              now_local().strftime("%d/%m/%Y"))
             file_id, file_link = upload_pdf_to_drive(service, folder_id, drive_name, pdf_bytes)
             has_nazim = region_has_nazim_login(region)
             now = now_local()
             record = {
                 "id": uuid.uuid4().hex[:10],
+                "kind": "advance" if request_advance else "claim",
+                "allocations": [],
                 "submitted_on": now.strftime('%d/%m/%Y'),
                 "submitted_ts": now.isoformat(),
                 "name": name,
@@ -4438,7 +4785,7 @@ def render_claim_form():
                 "file_link": file_link,
                 "voucher_no": "",
                 "voucher_pages": voucher_pages,
-                "receipts": [{k: v for k, v in r.items() if k != "text"} for r in receipt_records],
+                "receipts": [] if request_advance else [{k: v for k, v in r.items() if k != "text"} for r in receipt_records],
                 "flags": flags,
                 "comments": [],
                 "paid": False,
@@ -4451,8 +4798,11 @@ def render_claim_form():
                 "president_status": STATUS_PENDING,
                 "history": [],
             }
-            _log(record, name, f"Claim submitted ({len(receipt_records)} receipt{'s' if len(receipt_records) != 1 else ''}, "
-                               f"${calculated_total_claim:,.2f})" + ("; sent straight to Admin (no Nazim e Ala login for this region)" if not has_nazim else ""))
+            _what = (f"Advance request submitted (${calculated_total_claim:,.2f}, {len(upload_files)} supporting "
+                     f"file{'s' if len(upload_files) != 1 else ''})" if request_advance else
+                     f"Claim submitted ({len(receipt_records)} receipt{'s' if len(receipt_records) != 1 else ''}, "
+                     f"${calculated_total_claim:,.2f})")
+            _log(record, name, _what + ("; sent straight to Admin (no Nazim e Ala login for this region)" if not has_nazim else ""))
             if flags:
                 _log(record, "System", f"{len(flags)} possible duplicate receipt(s) flagged")
             add_claim_to_register(service, folder_id, record)
@@ -4464,6 +4814,7 @@ def render_claim_form():
 
     st.session_state["last_submission"] = {
         "saved": saved_to_drive, "error": drive_error, "filename": output_filename, "pdf_bytes": pdf_bytes,
+        "advance": request_advance,
     }
     if saved_to_drive:
         st.session_state["show_balloons"] = True
